@@ -1,7 +1,7 @@
 from functools import update_wrapper, wraps
 from typing import Any, Callable, Dict, List, Optional, TypeVar, Union, overload
 
-from agno.exceptions import RunCancelledException
+from agno.exceptions import RunCancelledException, ToolApprovalRequired, ToolCallDeferred
 from agno.tools.function import Function, get_entrypoint_docstring
 from agno.utils.log import log_error
 
@@ -63,11 +63,13 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     strict: Optional[bool] = None,
+    defer_loading: Optional[bool] = None,
     instructions: Optional[str] = None,
     add_instructions: bool = True,
     show_result: Optional[bool] = None,
     stop_after_tool_call: Optional[bool] = None,
     requires_confirmation: Optional[bool] = None,
+    requires_approval: Optional[bool] = None,
     requires_user_input: Optional[bool] = None,
     user_input_fields: Optional[List[str]] = None,
     external_execution: Optional[bool] = None,
@@ -92,15 +94,17 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
         name: Optional[str] - Override for the function name
         description: Optional[str] - Override for the function description
         strict: Optional[bool] - Flag for strict parameter checking
+        defer_loading: Optional[bool] - If True, provider-side tool search may load the tool lazily
         instructions: Optional[str] - Instructions for using the tool
         add_instructions: bool - If True, add instructions to the system message
         show_result: Optional[bool] - If True, shows the result after function call
         stop_after_tool_call: Optional[bool] - If True, the agent will stop after the function call.
         requires_confirmation: Optional[bool] - If True, the function will require user confirmation before execution
+        requires_approval: Optional[bool] - Alias for requires_confirmation
         requires_user_input: Optional[bool] - If True, the function will require user input before execution
         user_input_fields: Optional[List[str]] - List of fields that will be provided to the function as user input
         external_execution: Optional[bool] - If True, the function will be executed outside of the agent's context
-        external_execution_silent: Optional[bool] - If True (and external_execution=True), suppresses verbose paused messages (e.g., "I have tools to execute...")
+        external_execution_silent: Optional[bool] - If True (and external_execution=True), suppresses verbose paused messages
         pre_hook: Optional[Callable] - Hook that runs before the function is executed.
         post_hook: Optional[Callable] - Hook that runs after the function is executed.
         tool_hooks: Optional[List[Callable]] - List of hooks that run before and after the function is executed.
@@ -130,11 +134,13 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
             "name",
             "description",
             "strict",
+            "defer_loading",
             "instructions",
             "add_instructions",
             "show_result",
             "stop_after_tool_call",
             "requires_confirmation",
+            "requires_approval",
             "requires_user_input",
             "user_input_fields",
             "external_execution",
@@ -155,6 +161,12 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
             f"Invalid tool configuration arguments: {invalid_kwargs}. Valid arguments are: {sorted(VALID_KWARGS)}"
         )
 
+    if "requires_approval" in kwargs:
+        requires_approval = kwargs.pop("requires_approval")
+        if kwargs.get("requires_confirmation") is not None and kwargs.get("requires_confirmation") != requires_approval:
+            raise ValueError("'requires_approval' is an alias for 'requires_confirmation'; their values must match.")
+        kwargs["requires_confirmation"] = requires_approval
+
     # Check that only one of requires_user_input, requires_confirmation, and external_execution is set at the same time
     exclusive_flags = [
         kwargs.get("requires_user_input", False),
@@ -171,11 +183,13 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
     def decorator(func: F) -> Function:
         from inspect import isasyncgenfunction
 
+        tool_kwargs = dict(kwargs)
+
         @wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return func(*args, **kwargs)
-            except RunCancelledException:
+            except (RunCancelledException, ToolApprovalRequired, ToolCallDeferred):
                 raise
             except Exception as e:
                 log_error(
@@ -187,7 +201,7 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return await func(*args, **kwargs)
-            except RunCancelledException:
+            except (RunCancelledException, ToolApprovalRequired, ToolCallDeferred):
                 raise
             except Exception as e:
                 log_error(
@@ -199,7 +213,7 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
         async def async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return func(*args, **kwargs)
-            except RunCancelledException:
+            except (RunCancelledException, ToolApprovalRequired, ToolCallDeferred):
                 raise
             except Exception as e:
                 log_error(
@@ -222,22 +236,22 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
         _approval_type = getattr(func, "_agno_approval_type", None)
         if _approval_type is not None:
             if _approval_type == "required":
-                kwargs["approval_type"] = "required"
+                tool_kwargs["approval_type"] = "required"
                 if not any(
                     [
-                        kwargs.get("requires_user_input"),
-                        kwargs.get("requires_confirmation"),
-                        kwargs.get("external_execution"),
+                        tool_kwargs.get("requires_user_input"),
+                        tool_kwargs.get("requires_confirmation"),
+                        tool_kwargs.get("external_execution"),
                     ]
                 ):
-                    kwargs["requires_confirmation"] = True
+                    tool_kwargs["requires_confirmation"] = True
             elif _approval_type == "audit":
-                kwargs["approval_type"] = "audit"
+                tool_kwargs["approval_type"] = "audit"
                 if not any(
                     [
-                        kwargs.get("requires_user_input"),
-                        kwargs.get("requires_confirmation"),
-                        kwargs.get("external_execution"),
+                        tool_kwargs.get("requires_user_input"),
+                        tool_kwargs.get("requires_confirmation"),
+                        tool_kwargs.get("external_execution"),
                     ]
                 ):
                     raise ValueError(
@@ -246,27 +260,27 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
                         "to be set on @tool()."
                     )
 
-        if kwargs.get("requires_user_input", True):
-            kwargs["user_input_fields"] = kwargs.get("user_input_fields", [])
+        if tool_kwargs.get("requires_user_input", True):
+            tool_kwargs["user_input_fields"] = tool_kwargs.get("user_input_fields", [])
 
-        if kwargs.get("user_input_fields"):
-            kwargs["requires_user_input"] = True
+        if tool_kwargs.get("user_input_fields"):
+            tool_kwargs["requires_user_input"] = True
 
         # Create Function instance with any provided kwargs
         tool_config = {
-            "name": kwargs.get("name", func.__name__),
-            "description": kwargs.get(
+            "name": tool_kwargs.get("name", func.__name__),
+            "description": tool_kwargs.get(
                 "description", get_entrypoint_docstring(wrapper)
             ),  # Get docstring if description not provided
-            "instructions": kwargs.get("instructions"),
-            "add_instructions": kwargs.get("add_instructions", True),
+            "instructions": tool_kwargs.get("instructions"),
+            "add_instructions": tool_kwargs.get("add_instructions", True),
             "entrypoint": wrapper,
-            "cache_results": kwargs.get("cache_results", False),
-            "cache_dir": kwargs.get("cache_dir"),
-            "cache_ttl": kwargs.get("cache_ttl", 3600),
+            "cache_results": tool_kwargs.get("cache_results", False),
+            "cache_dir": tool_kwargs.get("cache_dir"),
+            "cache_ttl": tool_kwargs.get("cache_ttl", 3600),
             **{
                 k: v
-                for k, v in kwargs.items()
+                for k, v in tool_kwargs.items()
                 if k
                 not in [
                     "name",
@@ -282,8 +296,8 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
         }
 
         # Automatically set show_result=True if stop_after_tool_call=True (unless explicitly set to False)
-        if kwargs.get("stop_after_tool_call") is True:
-            if "show_result" not in kwargs or kwargs.get("show_result") is None:
+        if tool_kwargs.get("stop_after_tool_call") is True:
+            if "show_result" not in tool_kwargs or tool_kwargs.get("show_result") is None:
                 tool_config["show_result"] = True
         function = Function(**tool_config)
         # Determine parameters for the function

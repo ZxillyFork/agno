@@ -120,6 +120,19 @@ def test_function_from_callable():
     assert "param2" not in func.parameters["required"]  # Because it has a default value
 
 
+def test_function_from_callable_excludes_function_call_param_from_required():
+    """FunctionCall injection must not leak into the provider JSON schema."""
+
+    def test_func(fc: FunctionCall, value: str) -> str:
+        return value
+
+    func = Function.from_callable(test_func)
+
+    assert "fc" not in func.parameters["properties"]
+    assert "fc" not in func.parameters["required"]
+    assert "value" in func.parameters["required"]
+
+
 def test_wrap_callable():
     """Test wrapping a callable."""
 
