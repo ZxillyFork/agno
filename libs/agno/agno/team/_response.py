@@ -25,7 +25,7 @@ from agno.media import Audio
 from agno.models.base import Model
 from agno.models.fallback import acall_model_stream_with_fallback, call_model_stream_with_fallback
 from agno.models.message import Message
-from agno.models.response import ModelResponse, ModelResponseEvent
+from agno.models.response import ModelResponse, ModelResponseEvent, ToolExecution
 from agno.reasoning.step import NextAction, ReasoningStep, ReasoningSteps
 from agno.run import RunContext
 from agno.run.agent import RunOutput, RunOutputEvent
@@ -52,8 +52,10 @@ from agno.utils.events import (
     create_team_reasoning_started_event,
     create_team_reasoning_step_event,
     create_team_run_output_content_event,
+    create_team_tool_call_args_delta_event,
     create_team_tool_call_completed_event,
     create_team_tool_call_error_event,
+    create_team_tool_call_start_event,
     create_team_tool_call_started_event,
     handle_event,
 )
@@ -75,6 +77,30 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Response format
 # ---------------------------------------------------------------------------
+
+
+def _upsert_tool_executions(run_response: TeamRunOutput, tool_executions: List[ToolExecution]) -> None:
+    if run_response.tools is None:
+        run_response.tools = []
+
+    for tool_execution in tool_executions:
+        if tool_execution.tool_call_id is None:
+            run_response.tools.append(tool_execution)
+            continue
+
+        for index, existing_tool in enumerate(run_response.tools):
+            if existing_tool.tool_call_id == tool_execution.tool_call_id:
+                run_response.tools[index] = tool_execution
+                break
+        else:
+            run_response.tools.append(tool_execution)
+
+
+def _append_paused_requirements(run_response: TeamRunOutput, tool_executions: List[ToolExecution]) -> None:
+    if run_response.requirements is None:
+        run_response.requirements = []
+    for tool_execution in tool_executions:
+        run_response.requirements.append(RunRequirement(tool_execution=tool_execution))
 
 
 def get_response_format(
@@ -963,18 +989,10 @@ def _update_run_response(
     # member-run link) when the incoming entry lacks it, since model_response
     # tool_executions do not carry it.
     if model_response.tool_executions is not None:
-        if run_response.tools is None:
-            run_response.tools = list(model_response.tool_executions)
-        else:
-            existing_by_id = {t.tool_call_id: i for i, t in enumerate(run_response.tools) if t.tool_call_id}
-            for tool in model_response.tool_executions:
-                if tool.tool_call_id and tool.tool_call_id in existing_by_id:
-                    index = existing_by_id[tool.tool_call_id]
-                    if tool.child_run_id is None and run_response.tools[index].child_run_id is not None:
-                        tool.child_run_id = run_response.tools[index].child_run_id
-                    run_response.tools[index] = tool
-                else:
-                    run_response.tools.append(tool)
+        _upsert_tool_executions(run_response, model_response.tool_executions)
+        paused_tool_executions = [tool for tool in model_response.tool_executions if tool.is_paused]
+        if paused_tool_executions:
+            _append_paused_requirements(run_response, paused_tool_executions)
 
     # Update the run_response audio with the model response audio
     if model_response.audio is not None:
@@ -1044,6 +1062,7 @@ def _handle_model_response_stream(
         tool_call_limit=team.tool_call_limit,
         stream_model_response=stream_model_response,
         run_response=run_response,
+        run_context=run_context,
         send_media_to_model=team.send_media_to_model,
         compression_manager=team.compression_manager if team.compress_tool_results else None,
         after_tool_results=build_team_after_tool_results_callback(
@@ -1205,6 +1224,7 @@ async def _ahandle_model_response_stream(
         stream_model_response=stream_model_response,
         send_media_to_model=team.send_media_to_model,
         run_response=run_response,
+        run_context=run_context,
         compression_manager=team.compression_manager if team.compress_tool_results else None,
         after_tool_results=abuild_team_after_tool_results_callback(
             team, run_response, session, run_messages, run_context
@@ -1531,13 +1551,37 @@ def _handle_model_response_chunk(
         elif model_response_event.event == ModelResponseEvent.tool_call_paused.value:
             tool_executions_list = model_response_event.tool_executions
             if tool_executions_list is not None:
-                if run_response.tools is None:
-                    run_response.tools = tool_executions_list
-                else:
-                    run_response.tools.extend(tool_executions_list)
-                if run_response.requirements is None:
-                    run_response.requirements = []
-                run_response.requirements.append(RunRequirement(tool_execution=tool_executions_list[-1]))
+                _upsert_tool_executions(run_response, tool_executions_list)
+                _append_paused_requirements(run_response, tool_executions_list)
+
+        # If the model response is a tool_call_start, emit a ToolCallStart event
+        elif model_response_event.event == ModelResponseEvent.tool_call_start.value:
+            if stream_events:
+                yield handle_event(  # type: ignore
+                    create_team_tool_call_start_event(
+                        from_run_response=run_response,
+                        tool_call_id=model_response_event.tool_call_id,
+                        tool_name=model_response_event.tool_name,
+                    ),
+                    run_response,
+                    events_to_skip=team.events_to_skip,
+                    store_events=team.store_events,
+                )
+
+        # If the model response is a tool_call_args_delta, emit a ToolCallArgsDelta event
+        elif model_response_event.event == ModelResponseEvent.tool_call_args_delta.value:
+            if stream_events:
+                yield handle_event(  # type: ignore
+                    create_team_tool_call_args_delta_event(
+                        from_run_response=run_response,
+                        tool_call_id=model_response_event.tool_call_id,
+                        tool_name=model_response_event.tool_name,
+                        delta=model_response_event.tool_args_delta,
+                    ),
+                    run_response,
+                    events_to_skip=team.events_to_skip,
+                    store_events=team.store_events,
+                )
 
         # If the model response is a tool_call_started, add the tool call to the run_response
         elif model_response_event.event == ModelResponseEvent.tool_call_started.value:
@@ -1545,10 +1589,7 @@ def _handle_model_response_chunk(
             tool_executions_list = model_response_event.tool_executions
             if tool_executions_list is not None:
                 # Add tool calls to the agent.run_response
-                if run_response.tools is None:
-                    run_response.tools = tool_executions_list
-                else:
-                    run_response.tools.extend(tool_executions_list)
+                _upsert_tool_executions(run_response, tool_executions_list)
 
                 for tool in tool_executions_list:
                     if stream_events:
@@ -1602,21 +1643,16 @@ def _handle_model_response_chunk(
             tool_executions_list = model_response_event.tool_executions
             if tool_executions_list is not None:
                 # Update the existing tool call in the run_response
-                if run_response.tools:
-                    # Create a mapping of tool_call_id to index
-                    tool_call_index_map = {
-                        tc.tool_call_id: i for i, tc in enumerate(run_response.tools) if tc.tool_call_id is not None
-                    }
-                    # Process tool calls
-                    for tool_execution in tool_executions_list:
-                        tool_call_id = tool_execution.tool_call_id or ""
-                        index = tool_call_index_map.get(tool_call_id)
-                        if index is not None:
-                            if run_response.tools[index].child_run_id is not None:
-                                tool_execution.child_run_id = run_response.tools[index].child_run_id
-                            run_response.tools[index] = tool_execution
-                else:
-                    run_response.tools = tool_executions_list
+                for tool_execution in tool_executions_list:
+                    if run_response.tools:
+                        for existing_tool in run_response.tools:
+                            if (
+                                existing_tool.tool_call_id == tool_execution.tool_call_id
+                                and existing_tool.child_run_id is not None
+                            ):
+                                tool_execution.child_run_id = existing_tool.child_run_id
+                                break
+                _upsert_tool_executions(run_response, tool_executions_list)
 
                 # Only iterate through new tool calls
                 for tool_call in tool_executions_list:

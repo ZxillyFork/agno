@@ -2,6 +2,7 @@ import asyncio
 import collections.abc
 import json
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from hashlib import md5
 from pathlib import Path
@@ -19,9 +20,11 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Type,
     Union,
+    cast,
     get_args,
 )
 
@@ -37,13 +40,14 @@ from agno.exceptions import (
     ModelProviderError,
     RetryableModelProviderError,
     RunCancelledException,
+    ToolApprovalRequired,
+    ToolCallDeferred,
 )
 from agno.media import Audio, File, Image, Video
 from agno.metrics import MessageMetrics, ModelType, ToolCallMetrics
 from agno.models.message import Citations, Message
 from agno.models.response import ModelResponse, ModelResponseEvent, ToolExecution
 from agno.run.agent import CustomEvent, RunContentEvent, RunOutput, RunOutputEvent
-from agno.run.requirement import RunRequirement
 from agno.run.team import RunContentEvent as TeamRunContentEvent
 from agno.run.team import TeamRunOutput, TeamRunOutputEvent
 from agno.run.workflow import WorkflowRunOutputEvent
@@ -68,6 +72,13 @@ class MessageData:
     response_redacted_reasoning_content: Any = ""
     response_citations: Optional[Citations] = None
     response_tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_call_started_ids: Set[str] = field(default_factory=set)
+    tool_call_direct_args_delta_ids: Set[str] = field(default_factory=set)
+    # Provider-native ordinal -> tool_call_id (e.g. OpenAI Chat `index`,
+    # OpenAI Responses `output_index`, Anthropic content_block `index`).
+    # Lets snapshot synthesis attribute mid-stream args fragments whose chunks
+    # carry only `index` (id only appears on the first chunk).
+    tool_call_provider_index_to_id: Dict[int, str] = field(default_factory=dict)
 
     response_audio: Optional[Audio] = None
     response_image: Optional[Image] = None
@@ -124,6 +135,249 @@ def _handle_agent_exception(a_exc: AgentRunException, additional_input: Optional
     if a_exc.stop_execution:
         for m in additional_input:
             m.stop_after_tool_call = True
+
+
+ToolPauseException = Union[ToolApprovalRequired, ToolCallDeferred]
+_TOOL_CALL_BATCH_SETTLE_TIMEOUT_SECONDS = 10.0
+
+
+def _is_tool_pause_exception(exc: Any) -> bool:
+    return isinstance(exc, (ToolApprovalRequired, ToolCallDeferred))
+
+
+def _create_paused_tool_execution(function_call: FunctionCall, exc: ToolPauseException) -> ToolExecution:
+    """Create a paused ToolExecution from a dynamic HITL exception raised by a tool."""
+
+    metadata = getattr(exc, "metadata", None)
+    func = function_call.function
+
+    if isinstance(exc, ToolApprovalRequired):
+        approval_type = exc.approval_type or func.approval_type or "required"
+        # A dynamic exception inherently aborts the tool and forces a pause. That
+        # is incompatible with approval_type="audit" (a non-blocking audit trail),
+        # so promote to "required" and warn rather than silently producing a
+        # contradictory ToolExecution that would still block while claiming to
+        # be audit-only.
+        if approval_type == "audit":
+            log_warning(
+                f"Tool '{func.name}' raised ToolApprovalRequired with approval_type='audit', "
+                "but a dynamic pause exception always blocks the run; treating as approval_type='required'."
+            )
+            approval_type = "required"
+
+        return ToolExecution(
+            tool_call_id=function_call.call_id,
+            tool_name=func.name,
+            tool_args=function_call.arguments,
+            requires_confirmation=True,
+            approval_type=approval_type,
+            metadata=metadata,
+            external_execution_silent=func.external_execution_silent,
+        )
+
+    return ToolExecution(
+        tool_call_id=function_call.call_id,
+        tool_name=func.name,
+        tool_args=function_call.arguments,
+        external_execution_required=True,
+        approval_type=func.approval_type,
+        metadata=metadata,
+        external_execution_silent=func.external_execution_silent,
+    )
+
+
+def _create_tool_call_paused_response(function_call: FunctionCall, exc: ToolPauseException) -> ModelResponse:
+    return ModelResponse(
+        tool_executions=[_create_paused_tool_execution(function_call, exc)],
+        event=ModelResponseEvent.tool_call_paused.value,
+    )
+
+
+def _create_tool_calls_paused_response(
+    paused_calls: Sequence[Tuple[FunctionCall, ToolPauseException]],
+) -> ModelResponse:
+    return ModelResponse(
+        tool_executions=[_create_paused_tool_execution(function_call, exc) for function_call, exc in paused_calls],
+        event=ModelResponseEvent.tool_call_paused.value,
+    )
+
+
+def _handle_agent_exception_from_tool_call(
+    function_call: FunctionCall,
+    a_exc: AgentRunException,
+    additional_input: Optional[List[Message]] = None,
+) -> bool:
+    _handle_agent_exception(a_exc, additional_input)
+    function_call.error = str(a_exc)
+    return a_exc.stop_execution
+
+
+def _cancelled_tool_call_content(function_call: FunctionCall) -> str:
+    return f"Tool call '{function_call.function.name}' was cancelled before it could complete."
+
+
+def _is_get_user_input_call(function_call: FunctionCall) -> bool:
+    return bool(
+        function_call.function.name == "get_user_input"
+        and function_call.arguments
+        and function_call.arguments.get("user_input_fields")
+    )
+
+
+def _is_ask_user_call(function_call: FunctionCall) -> bool:
+    return bool(
+        function_call.function.name == "ask_user"
+        and function_call.arguments
+        and function_call.arguments.get("questions")
+    )
+
+
+def _is_static_pause_call(function_call: FunctionCall) -> bool:
+    return bool(
+        function_call.function.requires_confirmation
+        or function_call.function.external_execution
+        or (
+            function_call.function.requires_user_input
+            and not (_is_get_user_input_call(function_call) or _is_ask_user_call(function_call))
+        )
+        or _is_get_user_input_call(function_call)
+        or _is_ask_user_call(function_call)
+    )
+
+
+def _create_static_paused_tool_executions(function_call: FunctionCall) -> List[ToolExecution]:
+    paused_tool_execution: Optional[ToolExecution] = None
+
+    def get_paused_tool_execution() -> ToolExecution:
+        nonlocal paused_tool_execution
+        if paused_tool_execution is None:
+            paused_tool_execution = ToolExecution(
+                tool_call_id=function_call.call_id,
+                tool_name=function_call.function.name,
+                tool_args=function_call.arguments,
+                approval_type=function_call.function.approval_type,
+                external_execution_silent=function_call.function.external_execution_silent,
+            )
+        return paused_tool_execution
+
+    if function_call.function.requires_confirmation:
+        get_paused_tool_execution().requires_confirmation = True
+
+    if function_call.function.requires_user_input and not (
+        _is_get_user_input_call(function_call) or _is_ask_user_call(function_call)
+    ):
+        user_input_schema = function_call.function.user_input_schema
+        if function_call.arguments and user_input_schema:
+            for name, value in function_call.arguments.items():
+                for user_input_field in user_input_schema:
+                    if user_input_field.name == name:
+                        user_input_field.value = value
+
+        paused_tool_execution = get_paused_tool_execution()
+        paused_tool_execution.requires_user_input = True
+        paused_tool_execution.user_input_schema = user_input_schema
+
+    if _is_get_user_input_call(function_call):
+        arguments = function_call.arguments or {}
+        user_input_schema = []
+        for input_field in arguments.get("user_input_fields", []):
+            field_type = input_field.get("field_type")
+            if isinstance(field_type, str):
+                type_mapping = {
+                    "str": str,
+                    "int": int,
+                    "float": float,
+                    "bool": bool,
+                    "list": list,
+                    "dict": dict,
+                }
+                python_type = type_mapping.get(field_type, str)
+            elif isinstance(field_type, type):
+                python_type = field_type
+            else:
+                python_type = str
+            user_input_schema.append(
+                UserInputField(
+                    name=input_field.get("field_name"),
+                    field_type=python_type,
+                    description=input_field.get("field_description"),
+                )
+            )
+
+        paused_tool_execution = get_paused_tool_execution()
+        paused_tool_execution.requires_user_input = True
+        paused_tool_execution.user_input_schema = user_input_schema
+
+    if _is_ask_user_call(function_call):
+        arguments = function_call.arguments or {}
+        user_feedback_schema = []
+        for question in arguments.get("questions", []):
+            options = None
+            if question.get("options"):
+                options = [
+                    UserFeedbackOption(label=option.get("label", ""), description=option.get("description"))
+                    for option in question["options"]
+                ]
+            user_feedback_schema.append(
+                UserFeedbackQuestion(
+                    question=question.get("question", ""),
+                    header=question.get("header"),
+                    options=options,
+                    multi_select=question.get("multi_select", False),
+                )
+            )
+
+        paused_tool_execution = get_paused_tool_execution()
+        paused_tool_execution.requires_user_input = True
+        paused_tool_execution.user_feedback_schema = user_feedback_schema
+
+    if function_call.function.external_execution:
+        get_paused_tool_execution().external_execution_required = True
+
+    return [paused_tool_execution] if paused_tool_execution is not None else []
+
+
+def _function_call_uses_thread(function_call: FunctionCall) -> bool:
+    from inspect import isasyncgenfunction, iscoroutine, iscoroutinefunction
+
+    entrypoint = function_call.function.entrypoint
+    return not (
+        iscoroutinefunction(entrypoint)
+        or isasyncgenfunction(entrypoint)
+        or iscoroutine(entrypoint)
+        or function_call._requires_async_execution()
+    )
+
+
+def _function_call_has_async_entrypoint(function_call: FunctionCall) -> bool:
+    from inspect import isasyncgenfunction, iscoroutine, iscoroutinefunction
+
+    entrypoint = function_call.function.entrypoint
+    return bool(iscoroutinefunction(entrypoint) or isasyncgenfunction(entrypoint) or iscoroutine(entrypoint))
+
+
+def _function_call_has_sync_entrypoint(function_call: FunctionCall) -> bool:
+    return not _function_call_has_async_entrypoint(function_call)
+
+
+def _function_call_is_sync_generator(function_call: FunctionCall) -> bool:
+    from inspect import isgeneratorfunction, unwrap
+
+    entrypoint = function_call.function.entrypoint
+    if entrypoint is None:
+        return False
+
+    return bool(isgeneratorfunction(entrypoint) or isgeneratorfunction(unwrap(entrypoint)))
+
+
+def _has_executable_tools(tools: Optional[List[Union[Function, dict]]]) -> bool:
+    return bool(tools)
+
+
+# Per-call run context, stored in a ContextVar so a single Model instance shared
+# across concurrent runs (asyncio tasks / threads) never leaks one run's context
+# into another. Each task/thread gets its own value; sync save/restore uses tokens.
+_CURRENT_RUN_CONTEXT_VAR: ContextVar[Optional[Any]] = ContextVar("agno_current_run_context", default=None)
 
 
 @dataclass
@@ -591,18 +845,28 @@ class Model(ABC):
         pass
 
     @staticmethod
-    def _tool_name(t: Dict[str, Any]) -> str:
+    def _tool_name(t: Any) -> str:
         """Extract a tool's name for deterministic sorting."""
-        fn = t.get("function")
-        if isinstance(fn, dict):
-            return str(fn.get("name", ""))
-        return str(t.get("name", ""))
+        if isinstance(t, dict):
+            fn = t.get("function")
+            if isinstance(fn, dict):
+                return str(fn.get("name", ""))
+            return str(t.get("name", ""))
+        # Non-dict objects (e.g. provider tool configs) — sort by name/type attribute.
+        return str(getattr(t, "name", None) or getattr(t, "type", "") or "")
 
     def _format_tools(self, tools: Optional[List[Union[Function, dict]]]) -> List[Dict[str, Any]]:
         _tool_dicts = []
         for tool in tools or []:
             if isinstance(tool, Function):
                 _tool_dicts.append({"type": "function", "function": tool.to_dict()})
+            elif getattr(tool, "type", None) in {"namespace", "tool_search"} and not isinstance(tool, dict):
+                # ToolSearch / ToolNamespace are OpenAI Responses-specific helpers. Reaching the
+                # base formatter means they were passed to a provider that cannot consume them.
+                raise ValueError(
+                    f"Tool of type '{getattr(tool, 'type', None)}' ({type(tool).__name__}) is only "
+                    f"supported by the OpenAIResponses model; it cannot be used with {self.name or type(self).__name__}."
+                )
             else:
                 # If a dict is passed, it is a builtin tool
                 _tool_dicts.append(tool)
@@ -611,6 +875,16 @@ class Model(ABC):
         # caching all require stable request prefixes.
         _tool_dicts.sort(key=self._tool_name)
         return _tool_dicts
+
+    @property
+    def _current_run_context(self) -> Optional[Any]:
+        """The run context for the in-flight model call (per task/thread, never shared)."""
+        return _CURRENT_RUN_CONTEXT_VAR.get()
+
+    def _get_functions_from_tools(
+        self, tools: Optional[List[Union[Function, dict]]], include_dynamic_functions: bool = False
+    ) -> Dict[str, Function]:
+        return {tool.name: tool for tool in tools if isinstance(tool, Function)} if tools is not None else {}
 
     def _ensure_message_metrics_initialized(self, assistant_message: Message) -> None:
         """
@@ -658,6 +932,7 @@ class Model(ABC):
         send_media_to_model: bool = True,
         compression_manager: Optional["CompressionManager"] = None,
         after_tool_results: Optional[Callable[["ModelResponse"], None]] = None,
+        run_context: Optional[Any] = None,
     ) -> ModelResponse:
         """
         Generate a response from the model.
@@ -677,204 +952,189 @@ class Model(ABC):
                 (``checkpoint="tool-batch"``) to persist mid-run state. Exceptions are caught and
                 logged — a failed callback must not kill the run.
         """
-        # Check cache if enabled
-        if self.cache_response:
-            cache_key = self._get_model_cache_key(messages, stream=False, response_format=response_format, tools=tools)
-            cached_data = self._get_cached_model_response(cache_key)
-
-            if cached_data:
-                log_info("Cache hit for model response")
-                return self._model_response_from_cache(cached_data)
-
-        log_debug(f"{self.get_provider()} Response Start", center=True, symbol="-")
-        log_debug(f"Model: {self.id}", center=True, symbol="-")
-
-        _log_messages(messages)
-        model_response = ModelResponse()
-
-        function_call_count = 0
-
-        _tool_dicts = self._format_tools(tools) if tools is not None else []
-        _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)} if tools is not None else {}
-
-        _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
-        _compression_manager = compression_manager if _compress_tool_results else None
-
-        while True:
-            # Compress tool results if compression is enabled and threshold is met
-            if _compression_manager is not None and _compression_manager.should_compress(
-                messages, tools, model=self, response_format=response_format
-            ):
-                _compression_manager.compress(
-                    messages, run_metrics=run_response.metrics if run_response is not None else None
+        _run_context_token = _CURRENT_RUN_CONTEXT_VAR.set(run_context)
+        try:
+            # Check cache if enabled
+            cache_key = None
+            cache_model_response = self.cache_response and not _has_executable_tools(tools)
+            if cache_model_response:
+                cache_key = self._get_model_cache_key(
+                    messages, stream=False, response_format=response_format, tools=tools
                 )
+                cached_data = self._get_cached_model_response(cache_key)
 
-            # Get response from model
-            assistant_message = Message(role=self.assistant_message_role)
-            # Initialize message metrics and start timer before model call
-            self._ensure_message_metrics_initialized(assistant_message)
-            self._process_model_response(
-                messages=messages,
-                assistant_message=assistant_message,
-                model_response=model_response,
-                response_format=response_format,
-                tools=_tool_dicts,
-                tool_choice=tool_choice or self._tool_choice,
-                run_response=run_response,
-                compress_tool_results=_compress_tool_results,
-            )
+                if cached_data:
+                    log_info("Cache hit for model response")
+                    return self._model_response_from_cache(cached_data)
 
-            # Accumulate metrics for non-stream responses
-            if run_response is not None and model_response.response_usage is not None:
-                from agno.metrics import accumulate_model_metrics
+            log_debug(f"{self.get_provider()} Response Start", center=True, symbol="-")
+            log_debug(f"Model: {self.id}", center=True, symbol="-")
 
-                accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
+            _log_messages(messages)
+            model_response = ModelResponse()
 
-            # Add assistant message to messages
-            messages.append(assistant_message)
+            function_call_count = 0
 
-            # Log response and metrics
-            assistant_message.log(metrics=True, use_compressed_content=_compress_tool_results)
+            _tool_dicts = self._format_tools(tools) if tools is not None else []
+            _functions = self._get_functions_from_tools(tools)
 
-            # Handle tool calls if present
-            if assistant_message.tool_calls:
-                # Prepare function calls
-                function_calls_to_run = self._prepare_function_calls(
-                    assistant_message=assistant_message,
-                    messages=messages,
-                    model_response=model_response,
-                    functions=_functions,
-                )
-                function_call_results: List[Message] = []
+            _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
+            _compression_manager = compression_manager if _compress_tool_results else None
 
-                # Execute function calls
-                for function_call_response in self.run_function_calls(
-                    function_calls=function_calls_to_run,
-                    function_call_results=function_call_results,
-                    current_function_call_count=function_call_count,
-                    function_call_limit=tool_call_limit,
+            while True:
+                if _compression_manager is not None and _compression_manager.should_compress(
+                    messages, tools, model=self, response_format=response_format
                 ):
-                    if isinstance(function_call_response, ModelResponse):
-                        # The session state is updated by the function call
-                        if function_call_response.updated_session_state is not None:
-                            model_response.updated_session_state = function_call_response.updated_session_state
-
-                        # Media artifacts are generated by the function call
-                        if function_call_response.images is not None:
-                            if model_response.images is None:
-                                model_response.images = []
-                            model_response.images.extend(function_call_response.images)
-
-                        if function_call_response.audios is not None:
-                            if model_response.audios is None:
-                                model_response.audios = []
-                            model_response.audios.extend(function_call_response.audios)
-
-                        if function_call_response.videos is not None:
-                            if model_response.videos is None:
-                                model_response.videos = []
-                            model_response.videos.extend(function_call_response.videos)
-
-                        if function_call_response.files is not None:
-                            if model_response.files is None:
-                                model_response.files = []
-                            model_response.files.extend(function_call_response.files)
-
-                        if (
-                            function_call_response.event
-                            in [
-                                ModelResponseEvent.tool_call_completed.value,
-                                ModelResponseEvent.tool_call_paused.value,
-                            ]
-                            and function_call_response.tool_executions is not None
-                        ):
-                            # Record the tool execution in the model response
-                            if model_response.tool_executions is None:
-                                model_response.tool_executions = []
-                            model_response.tool_executions.extend(function_call_response.tool_executions)
-
-                            # If the tool is currently paused (HITL flow), add the requirement to the run response
-                            if (
-                                function_call_response.event == ModelResponseEvent.tool_call_paused.value
-                                and run_response is not None
-                            ):
-                                current_tool_execution = function_call_response.tool_executions[-1]
-                                if run_response.requirements is None:
-                                    run_response.requirements = []
-                                run_response.requirements.append(RunRequirement(tool_execution=current_tool_execution))
-
-                        elif function_call_response.event not in [
-                            ModelResponseEvent.tool_call_started.value,
-                            ModelResponseEvent.tool_call_completed.value,
-                        ]:
-                            if function_call_response.content:
-                                model_response.content += function_call_response.content  # type: ignore
-
-                # Add a function call for each successful execution
-                function_call_count += len(function_call_results)
-
-                # Format and add results to messages
-                self.format_function_call_results(
-                    messages=messages,
-                    function_call_results=function_call_results,
-                    compress_tool_results=_compress_tool_results,
-                    **model_response.extra or {},
-                )
-
-                if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
-                    # Handle function call media
-                    self._handle_function_call_media(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        send_media_to_model=send_media_to_model,
+                    _compression_manager.compress(
+                        messages, run_metrics=run_response.metrics if run_response is not None else None
                     )
 
-                for function_call_result in function_call_results:
-                    function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
+                assistant_message = Message(role=self.assistant_message_role)
+                self._ensure_message_metrics_initialized(assistant_message)
+                self._process_model_response(
+                    messages=messages,
+                    assistant_message=assistant_message,
+                    model_response=model_response,
+                    response_format=response_format,
+                    tools=_tool_dicts,
+                    tool_choice=tool_choice or self._tool_choice,
+                    run_response=run_response,
+                    compress_tool_results=_compress_tool_results,
+                )
 
-                # Check if we should stop after tool calls
-                if any(m.stop_after_tool_call for m in function_call_results):
-                    break
+                if run_response is not None and model_response.response_usage is not None:
+                    from agno.metrics import accumulate_model_metrics
 
-                # Per-turn checkpoint hook: post-gather barrier. Tool results have been
-                # appended to messages; fire the hook before deciding whether to loop or break.
-                # Failure to checkpoint must not kill a working run — log and continue.
-                if after_tool_results is not None:
-                    try:
-                        after_tool_results(model_response)
-                    except Exception as e:
-                        log_error(f"after_tool_results callback failed: {e}")
+                    accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
 
-                # If we have any tool calls that require confirmation, break the loop
-                if any(tc.requires_confirmation for tc in model_response.tool_executions or []):
-                    break
+                messages.append(assistant_message)
+                assistant_message.log(metrics=True, use_compressed_content=_compress_tool_results)
 
-                # If we have any tool calls that require external execution, break the loop
-                if any(tc.external_execution_required for tc in model_response.tool_executions or []):
-                    break
+                if assistant_message.tool_calls:
+                    function_calls_to_run = self._prepare_function_calls(
+                        assistant_message=assistant_message,
+                        messages=messages,
+                        model_response=model_response,
+                        functions=_functions,
+                    )
+                    function_call_results: List[Message] = []
+                    tool_call_paused = False
 
-                # If we have any tool calls that require user input, break the loop
-                if any(tc.requires_user_input for tc in model_response.tool_executions or []):
-                    break
+                    for function_call_response in self.run_function_calls(
+                        function_calls=function_calls_to_run,
+                        function_call_results=function_call_results,
+                        current_function_call_count=function_call_count,
+                        function_call_limit=tool_call_limit,
+                    ):
+                        if isinstance(function_call_response, ModelResponse):
+                            if function_call_response.updated_session_state is not None:
+                                model_response.updated_session_state = function_call_response.updated_session_state
 
-                # Check if run_response has requirements (e.g., from member agent HITL)
-                # This handles cases where a tool (like delegate_task_to_member) propagates
-                # HITL requirements from a member agent to the team's run_response
-                if run_response is not None and run_response.requirements:
-                    if any(not req.is_resolved() for req in run_response.requirements):
+                            if function_call_response.images is not None:
+                                if model_response.images is None:
+                                    model_response.images = []
+                                model_response.images.extend(function_call_response.images)
+
+                            if function_call_response.audios is not None:
+                                if model_response.audios is None:
+                                    model_response.audios = []
+                                model_response.audios.extend(function_call_response.audios)
+
+                            if function_call_response.videos is not None:
+                                if model_response.videos is None:
+                                    model_response.videos = []
+                                model_response.videos.extend(function_call_response.videos)
+
+                            if function_call_response.files is not None:
+                                if model_response.files is None:
+                                    model_response.files = []
+                                model_response.files.extend(function_call_response.files)
+
+                            if (
+                                function_call_response.event
+                                in [
+                                    ModelResponseEvent.tool_call_completed.value,
+                                    ModelResponseEvent.tool_call_paused.value,
+                                ]
+                                and function_call_response.tool_executions is not None
+                            ):
+                                if model_response.tool_executions is None:
+                                    model_response.tool_executions = []
+                                model_response.tool_executions.extend(function_call_response.tool_executions)
+
+                                if function_call_response.event == ModelResponseEvent.tool_call_paused.value:
+                                    tool_call_paused = True
+
+                            elif function_call_response.event not in [
+                                ModelResponseEvent.tool_call_started.value,
+                                ModelResponseEvent.tool_call_completed.value,
+                            ]:
+                                if function_call_response.content:
+                                    model_response.content += function_call_response.content  # type: ignore
+
+                    function_call_count += len(function_call_results)
+
+                    self.format_function_call_results(
+                        messages=messages,
+                        function_call_results=function_call_results,
+                        compress_tool_results=_compress_tool_results,
+                        **model_response.extra or {},
+                    )
+
+                    if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
+                        self._handle_function_call_media(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            send_media_to_model=send_media_to_model,
+                        )
+
+                    for function_call_result in function_call_results:
+                        function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
+
+                    if any(m.stop_after_tool_call for m in function_call_results):
                         break
 
-                # Continue loop to get next response
-                continue
+                    if after_tool_results is not None:
+                        try:
+                            after_tool_results(model_response)
+                        except Exception as e:
+                            log_error(f"after_tool_results callback failed: {e}")
 
-            # No tool calls or finished processing them
-            break
+                    if tool_call_paused:
+                        break
 
-        log_debug(f"{self.get_provider()} Response End", center=True, symbol="-")
+                    if any(tc.requires_confirmation for tc in model_response.tool_executions or []):
+                        break
 
-        # Save to cache if enabled
-        if self.cache_response:
-            self._save_model_response_to_cache(cache_key, model_response, is_streaming=False)
+                    if any(tc.external_execution_required for tc in model_response.tool_executions or []):
+                        break
+
+                    if any(tc.requires_user_input for tc in model_response.tool_executions or []):
+                        break
+
+                    if run_response is not None and run_response.requirements:
+                        if any(not req.is_resolved() for req in run_response.requirements):
+                            break
+
+                    continue
+
+                break
+
+            log_debug(f"{self.get_provider()} Response End", center=True, symbol="-")
+
+            if cache_model_response and cache_key is not None:
+                self._save_model_response_to_cache(cache_key, model_response, is_streaming=False)
+        finally:
+            _CURRENT_RUN_CONTEXT_VAR.reset(_run_context_token)
+            if self.__class__.__name__ == "Gemini" and self.client is not None:  # type: ignore
+                try:
+                    self.client.close()  # type: ignore
+                    self.client = None
+                except AttributeError as e:
+                    log_warning(
+                        f"Your Gemini client is outdated. For Agno to properly handle the lifecycle of the client,: {e}"
+                        f" please upgrade Gemini to the latest version: pip install -U google-genai: {e}",
+                    )
 
         return model_response
 
@@ -889,6 +1149,7 @@ class Model(ABC):
         send_media_to_model: bool = True,
         compression_manager: Optional["CompressionManager"] = None,
         after_tool_results: Optional[Callable[["ModelResponse"], Awaitable[None]]] = None,
+        run_context: Optional[Any] = None,
     ) -> ModelResponse:
         """
         Generate an asynchronous response from the model.
@@ -900,202 +1161,189 @@ class Model(ABC):
         mid-run state. Exceptions are caught and logged — a failed callback must not kill the run.
         """
 
-        # Check cache if enabled
-        if self.cache_response:
-            cache_key = self._get_model_cache_key(messages, stream=False, response_format=response_format, tools=tools)
-            cached_data = self._get_cached_model_response(cache_key)
-
-            if cached_data:
-                log_info("Cache hit for model response")
-                return self._model_response_from_cache(cached_data)
-
-        log_debug(f"{self.get_provider()} Async Response Start", center=True, symbol="-")
-        log_debug(f"Model: {self.id}", center=True, symbol="-")
-        _log_messages(messages)
-        model_response = ModelResponse()
-
-        _tool_dicts = self._format_tools(tools) if tools is not None else []
-        _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)} if tools is not None else {}
-
-        _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
-        _compression_manager = compression_manager if _compress_tool_results else None
-
-        function_call_count = 0
-
-        while True:
-            # Compress existing tool results BEFORE making API call to avoid context overflow
-            if _compression_manager is not None and await _compression_manager.ashould_compress(
-                messages, tools, model=self, response_format=response_format
-            ):
-                await _compression_manager.acompress(
-                    messages, run_metrics=run_response.metrics if run_response is not None else None
+        _run_context_token = _CURRENT_RUN_CONTEXT_VAR.set(run_context)
+        try:
+            # Check cache if enabled
+            cache_key = None
+            cache_model_response = self.cache_response and not _has_executable_tools(tools)
+            if cache_model_response:
+                cache_key = self._get_model_cache_key(
+                    messages, stream=False, response_format=response_format, tools=tools
                 )
+                cached_data = self._get_cached_model_response(cache_key)
 
-            # Get response from model
-            assistant_message = Message(role=self.assistant_message_role)
-            # Initialize message metrics and start timer before model call
-            self._ensure_message_metrics_initialized(assistant_message)
-            await self._aprocess_model_response(
-                messages=messages,
-                assistant_message=assistant_message,
-                model_response=model_response,
-                response_format=response_format,
-                tools=_tool_dicts,
-                tool_choice=tool_choice or self._tool_choice,
-                run_response=run_response,
-                compress_tool_results=_compress_tool_results,
-            )
+                if cached_data:
+                    log_info("Cache hit for model response")
+                    return self._model_response_from_cache(cached_data)
 
-            # Accumulate metrics for non-stream responses
-            if run_response is not None and model_response.response_usage is not None:
-                from agno.metrics import accumulate_model_metrics
+            log_debug(f"{self.get_provider()} Async Response Start", center=True, symbol="-")
+            log_debug(f"Model: {self.id}", center=True, symbol="-")
+            _log_messages(messages)
+            model_response = ModelResponse()
 
-                accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
+            _tool_dicts = self._format_tools(tools) if tools is not None else []
+            _functions = self._get_functions_from_tools(tools)
 
-            # Add assistant message to messages
-            messages.append(assistant_message)
+            _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
+            _compression_manager = compression_manager if _compress_tool_results else None
 
-            # Log response and metrics
-            assistant_message.log(metrics=True)
+            function_call_count = 0
 
-            # Handle tool calls if present
-            if assistant_message.tool_calls:
-                # Prepare function calls
-                function_calls_to_run = self._prepare_function_calls(
-                    assistant_message=assistant_message,
-                    messages=messages,
-                    model_response=model_response,
-                    functions=_functions,
-                )
-                function_call_results: List[Message] = []
-
-                # Execute function calls
-                async for function_call_response in self.arun_function_calls(
-                    function_calls=function_calls_to_run,
-                    function_call_results=function_call_results,
-                    current_function_call_count=function_call_count,
-                    function_call_limit=tool_call_limit,
+            while True:
+                if _compression_manager is not None and await _compression_manager.ashould_compress(
+                    messages, tools, model=self, response_format=response_format
                 ):
-                    if isinstance(function_call_response, ModelResponse):
-                        # The session state is updated by the function call
-                        if function_call_response.updated_session_state is not None:
-                            model_response.updated_session_state = function_call_response.updated_session_state
-
-                        # Media artifacts are generated by the function call
-                        if function_call_response.images is not None:
-                            if model_response.images is None:
-                                model_response.images = []
-                            model_response.images.extend(function_call_response.images)
-
-                        if function_call_response.audios is not None:
-                            if model_response.audios is None:
-                                model_response.audios = []
-                            model_response.audios.extend(function_call_response.audios)
-
-                        if function_call_response.videos is not None:
-                            if model_response.videos is None:
-                                model_response.videos = []
-                            model_response.videos.extend(function_call_response.videos)
-
-                        if function_call_response.files is not None:
-                            if model_response.files is None:
-                                model_response.files = []
-                            model_response.files.extend(function_call_response.files)
-
-                        if (
-                            function_call_response.event
-                            in [
-                                ModelResponseEvent.tool_call_completed.value,
-                                ModelResponseEvent.tool_call_paused.value,
-                            ]
-                            and function_call_response.tool_executions is not None
-                        ):
-                            if model_response.tool_executions is None:
-                                model_response.tool_executions = []
-                            model_response.tool_executions.extend(function_call_response.tool_executions)
-
-                            # If the tool is currently paused (HITL flow), add the requirement to the run response
-                            if (
-                                function_call_response.event == ModelResponseEvent.tool_call_paused.value
-                                and run_response is not None
-                            ):
-                                current_tool_execution = function_call_response.tool_executions[-1]
-                                if run_response.requirements is None:
-                                    run_response.requirements = []
-                                run_response.requirements.append(RunRequirement(tool_execution=current_tool_execution))
-
-                        elif function_call_response.event not in [
-                            ModelResponseEvent.tool_call_started.value,
-                            ModelResponseEvent.tool_call_completed.value,
-                        ]:
-                            if function_call_response.content:
-                                model_response.content += function_call_response.content  # type: ignore
-
-                # Add a function call for each successful execution
-                function_call_count += len(function_call_results)
-
-                # Format and add results to messages
-                self.format_function_call_results(
-                    messages=messages,
-                    function_call_results=function_call_results,
-                    compress_tool_results=_compress_tool_results,
-                    **model_response.extra or {},
-                )
-
-                if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
-                    # Handle function call media
-                    self._handle_function_call_media(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        send_media_to_model=send_media_to_model,
+                    await _compression_manager.acompress(
+                        messages, run_metrics=run_response.metrics if run_response is not None else None
                     )
 
-                for function_call_result in function_call_results:
-                    function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
+                assistant_message = Message(role=self.assistant_message_role)
+                self._ensure_message_metrics_initialized(assistant_message)
+                await self._aprocess_model_response(
+                    messages=messages,
+                    assistant_message=assistant_message,
+                    model_response=model_response,
+                    response_format=response_format,
+                    tools=_tool_dicts,
+                    tool_choice=tool_choice or self._tool_choice,
+                    run_response=run_response,
+                    compress_tool_results=_compress_tool_results,
+                )
 
-                # Check if we should stop after tool calls
-                if any(m.stop_after_tool_call for m in function_call_results):
-                    break
+                if run_response is not None and model_response.response_usage is not None:
+                    from agno.metrics import accumulate_model_metrics
 
-                # Per-turn checkpoint hook: post-gather barrier. Tool results have been
-                # appended to messages; fire the hook before deciding whether to loop or break.
-                # Failure to checkpoint must not kill a working run — log and continue.
-                if after_tool_results is not None:
-                    try:
-                        await after_tool_results(model_response)
-                    except Exception as e:
-                        log_error(f"after_tool_results callback failed: {e}")
+                    accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
 
-                # If we have any tool calls that require confirmation, break the loop
-                if any(tc.requires_confirmation for tc in model_response.tool_executions or []):
-                    break
+                messages.append(assistant_message)
+                assistant_message.log(metrics=True)
 
-                # If we have any tool calls that require external execution, break the loop
-                if any(tc.external_execution_required for tc in model_response.tool_executions or []):
-                    break
+                if assistant_message.tool_calls:
+                    function_calls_to_run = self._prepare_function_calls(
+                        assistant_message=assistant_message,
+                        messages=messages,
+                        model_response=model_response,
+                        functions=_functions,
+                    )
+                    function_call_results: List[Message] = []
+                    tool_call_paused = False
 
-                # If we have any tool calls that require user input, break the loop
-                if any(tc.requires_user_input for tc in model_response.tool_executions or []):
-                    break
+                    async for function_call_response in self.arun_function_calls(
+                        function_calls=function_calls_to_run,
+                        function_call_results=function_call_results,
+                        current_function_call_count=function_call_count,
+                        function_call_limit=tool_call_limit,
+                        run_id=run_response.run_id if run_response else None,
+                    ):
+                        if isinstance(function_call_response, ModelResponse):
+                            if function_call_response.updated_session_state is not None:
+                                model_response.updated_session_state = function_call_response.updated_session_state
 
-                # Check if run_response has requirements (e.g., from member agent HITL)
-                # This handles cases where a tool (like delegate_task_to_member) propagates
-                # HITL requirements from a member agent to the team's run_response
-                if run_response is not None and run_response.requirements:
-                    if any(not req.is_resolved() for req in run_response.requirements):
+                            if function_call_response.images is not None:
+                                if model_response.images is None:
+                                    model_response.images = []
+                                model_response.images.extend(function_call_response.images)
+
+                            if function_call_response.audios is not None:
+                                if model_response.audios is None:
+                                    model_response.audios = []
+                                model_response.audios.extend(function_call_response.audios)
+
+                            if function_call_response.videos is not None:
+                                if model_response.videos is None:
+                                    model_response.videos = []
+                                model_response.videos.extend(function_call_response.videos)
+
+                            if function_call_response.files is not None:
+                                if model_response.files is None:
+                                    model_response.files = []
+                                model_response.files.extend(function_call_response.files)
+
+                            if (
+                                function_call_response.event
+                                in [
+                                    ModelResponseEvent.tool_call_completed.value,
+                                    ModelResponseEvent.tool_call_paused.value,
+                                ]
+                                and function_call_response.tool_executions is not None
+                            ):
+                                if model_response.tool_executions is None:
+                                    model_response.tool_executions = []
+                                model_response.tool_executions.extend(function_call_response.tool_executions)
+
+                                if function_call_response.event == ModelResponseEvent.tool_call_paused.value:
+                                    tool_call_paused = True
+
+                            elif function_call_response.event not in [
+                                ModelResponseEvent.tool_call_started.value,
+                                ModelResponseEvent.tool_call_completed.value,
+                            ]:
+                                if function_call_response.content:
+                                    model_response.content += function_call_response.content  # type: ignore
+
+                    function_call_count += len(function_call_results)
+
+                    self.format_function_call_results(
+                        messages=messages,
+                        function_call_results=function_call_results,
+                        compress_tool_results=_compress_tool_results,
+                        **model_response.extra or {},
+                    )
+
+                    if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
+                        self._handle_function_call_media(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            send_media_to_model=send_media_to_model,
+                        )
+
+                    for function_call_result in function_call_results:
+                        function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
+
+                    if any(m.stop_after_tool_call for m in function_call_results):
                         break
 
-                # Continue loop to get next response
-                continue
+                    if after_tool_results is not None:
+                        try:
+                            await after_tool_results(model_response)
+                        except Exception as e:
+                            log_error(f"after_tool_results callback failed: {e}")
 
-            # No tool calls or finished processing them
-            break
+                    if tool_call_paused:
+                        break
 
-        log_debug(f"{self.get_provider()} Async Response End", center=True, symbol="-")
+                    if any(tc.requires_confirmation for tc in model_response.tool_executions or []):
+                        break
 
-        # Save to cache if enabled
-        if self.cache_response:
-            self._save_model_response_to_cache(cache_key, model_response, is_streaming=False)
+                    if any(tc.external_execution_required for tc in model_response.tool_executions or []):
+                        break
+
+                    if any(tc.requires_user_input for tc in model_response.tool_executions or []):
+                        break
+
+                    if run_response is not None and run_response.requirements:
+                        if any(not req.is_resolved() for req in run_response.requirements):
+                            break
+
+                    continue
+
+                break
+
+            log_debug(f"{self.get_provider()} Async Response End", center=True, symbol="-")
+
+            if cache_model_response and cache_key is not None:
+                self._save_model_response_to_cache(cache_key, model_response, is_streaming=False)
+        finally:
+            _CURRENT_RUN_CONTEXT_VAR.reset(_run_context_token)
+            if self.__class__.__name__ == "Gemini" and self.client is not None:
+                try:
+                    await self.client.aio.aclose()  # type: ignore
+                    self.client = None
+                except AttributeError as e:
+                    log_warning(
+                        f"Your Gemini client is outdated. For Agno to properly handle the lifecycle of the client,: {e}"
+                        f" please upgrade Gemini to the latest version: pip install -U google-genai: {e}",
+                    )
 
         return model_response
 
@@ -1371,6 +1619,7 @@ class Model(ABC):
         send_media_to_model: bool = True,
         compression_manager: Optional["CompressionManager"] = None,
         after_tool_results: Optional[Callable[["ModelResponse"], None]] = None,
+        run_context: Optional[Any] = None,
     ) -> Iterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
         """
         Generate a streaming response from the model.
@@ -1381,227 +1630,220 @@ class Model(ABC):
         argument. Used by Agent-level checkpointing (``checkpoint="tool-batch"``) to persist mid-run
         state. Exceptions are caught and logged — a failed callback must not kill the run.
         """
-        # Check cache if enabled - capture key BEFORE streaming to avoid mismatch
-        cache_key = None
-        if self.cache_response:
-            cache_key = self._get_model_cache_key(messages, stream=True, response_format=response_format, tools=tools)
-            cached_data = self._get_cached_model_response(cache_key)
-
-            if cached_data:
-                log_info("Cache hit for streaming model response")
-                # Yield cached responses
-                for response in self._streaming_responses_from_cache(cached_data["streaming_responses"]):
-                    yield response
-                return
-
-            log_info("Cache miss for streaming model response")
-
-        # Track streaming responses for caching
-        streaming_responses: List[ModelResponse] = []
-
-        log_debug(f"{self.get_provider()} Response Stream Start", center=True, symbol="-")
-        log_debug(f"Model: {self.id}", center=True, symbol="-")
-        _log_messages(messages)
-
-        _tool_dicts = self._format_tools(tools) if tools is not None else []
-        _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)} if tools is not None else {}
-
-        _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
-        _compression_manager = compression_manager if _compress_tool_results else None
-
-        function_call_count = 0
-
-        while True:
-            # Compress existing tool results BEFORE invoke
-            if _compression_manager is not None and _compression_manager.should_compress(
-                messages, tools, model=self, response_format=response_format
-            ):
-                # Emit compression started event
-                yield ModelResponse(event=ModelResponseEvent.compression_started.value)
-                _compression_manager.compress(
-                    messages, run_metrics=run_response.metrics if run_response is not None else None
+        _run_context_token = _CURRENT_RUN_CONTEXT_VAR.set(run_context)
+        try:
+            # Check cache if enabled - capture key BEFORE streaming to avoid mismatch
+            cache_key = None
+            cache_streaming_response = self.cache_response and not _has_executable_tools(tools)
+            if cache_streaming_response:
+                cache_key = self._get_model_cache_key(
+                    messages, stream=True, response_format=response_format, tools=tools
                 )
-                # Emit compression completed event with stats
-                yield ModelResponse(
-                    event=ModelResponseEvent.compression_completed.value,
-                    compression_stats=_compression_manager.stats.copy(),
-                )
+                cached_data = self._get_cached_model_response(cache_key)
 
-            assistant_message = Message(role=self.assistant_message_role)
-            # Create assistant message and stream data
-            stream_data = MessageData()
-            model_response = ModelResponse()
+                if cached_data:
+                    log_info("Cache hit for streaming model response")
+                    for response in self._streaming_responses_from_cache(cached_data["streaming_responses"]):
+                        yield response
+                    return
 
-            # Emit LLM request started event
-            yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
+                log_info("Cache miss for streaming model response")
 
-            if stream_model_response:
-                # Initialize message metrics and start timer before model call
-                stream_data.response_metrics = MessageMetrics()
-                stream_data.response_metrics.start_timer()
-                # Initialize assistant_message.metrics for provider invoke_stream calls
-                self._ensure_message_metrics_initialized(assistant_message)
-                # Generate response
-                try:
-                    for response in self.process_response_stream(
+            streaming_responses: List[ModelResponse] = []
+
+            log_debug(f"{self.get_provider()} Response Stream Start", center=True, symbol="-")
+            log_debug(f"Model: {self.id}", center=True, symbol="-")
+            _log_messages(messages)
+
+            _tool_dicts = self._format_tools(tools) if tools is not None else []
+            _functions = self._get_functions_from_tools(tools)
+
+            _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
+            _compression_manager = compression_manager if _compress_tool_results else None
+
+            function_call_count = 0
+
+            while True:
+                if _compression_manager is not None and _compression_manager.should_compress(
+                    messages, tools, model=self, response_format=response_format
+                ):
+                    yield ModelResponse(event=ModelResponseEvent.compression_started.value)
+                    _compression_manager.compress(
+                        messages, run_metrics=run_response.metrics if run_response is not None else None
+                    )
+                    yield ModelResponse(
+                        event=ModelResponseEvent.compression_completed.value,
+                        compression_stats=_compression_manager.stats.copy(),
+                    )
+
+                assistant_message = Message(role=self.assistant_message_role)
+                stream_data = MessageData()
+                model_response = ModelResponse()
+
+                yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
+
+                if stream_model_response:
+                    stream_data.response_metrics = MessageMetrics()
+                    stream_data.response_metrics.start_timer()
+                    self._ensure_message_metrics_initialized(assistant_message)
+                    try:
+                        for response in self.process_response_stream(
+                            messages=messages,
+                            assistant_message=assistant_message,
+                            stream_data=stream_data,
+                            response_format=response_format,
+                            tools=_tool_dicts,
+                            tool_choice=tool_choice or self._tool_choice,
+                            run_response=run_response,
+                            compress_tool_results=_compress_tool_results,
+                        ):
+                            if cache_streaming_response and isinstance(response, ModelResponse):
+                                streaming_responses.append(response)
+                            yield response
+                    finally:
+                        if run_response is not None and assistant_message.metrics is not None:
+                            from agno.metrics import accumulate_model_metrics
+
+                            _stream_model_response = ModelResponse()
+                            _stream_model_response.response_usage = assistant_message.metrics
+                            accumulate_model_metrics(
+                                _stream_model_response, self, self.model_type, run_response.metrics
+                            )
+
+                else:
+                    self._ensure_message_metrics_initialized(assistant_message)
+                    self._process_model_response(
                         messages=messages,
                         assistant_message=assistant_message,
-                        stream_data=stream_data,
+                        model_response=model_response,
                         response_format=response_format,
                         tools=_tool_dicts,
                         tool_choice=tool_choice or self._tool_choice,
                         run_response=run_response,
                         compress_tool_results=_compress_tool_results,
-                    ):
-                        if self.cache_response and isinstance(response, ModelResponse):
-                            streaming_responses.append(response)
-                        yield response
-                finally:
-                    # Accumulate metrics for this streamed iteration (also on cancel)
-                    if run_response is not None and assistant_message.metrics is not None:
+                    )
+                    if run_response is not None and model_response.response_usage is not None:
                         from agno.metrics import accumulate_model_metrics
 
-                        _stream_model_response = ModelResponse()
-                        _stream_model_response.response_usage = assistant_message.metrics
-                        accumulate_model_metrics(_stream_model_response, self, self.model_type, run_response.metrics)
+                        accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
+                    if cache_streaming_response:
+                        streaming_responses.append(model_response)
+                    yield model_response
 
-            else:
-                # Initialize message metrics and start timer before model call
-                self._ensure_message_metrics_initialized(assistant_message)
-                self._process_model_response(
-                    messages=messages,
-                    assistant_message=assistant_message,
-                    model_response=model_response,
-                    response_format=response_format,
-                    tools=_tool_dicts,
-                    tool_choice=tool_choice or self._tool_choice,
-                    run_response=run_response,
-                    compress_tool_results=_compress_tool_results,
+                messages.append(assistant_message)
+                assistant_message.log(metrics=True)
+
+                llm_metrics = assistant_message.metrics
+                yield ModelResponse(
+                    event=ModelResponseEvent.model_request_completed.value,
+                    input_tokens=llm_metrics.input_tokens if llm_metrics else None,
+                    output_tokens=llm_metrics.output_tokens if llm_metrics else None,
+                    total_tokens=llm_metrics.total_tokens if llm_metrics else None,
+                    time_to_first_token=llm_metrics.time_to_first_token if llm_metrics else None,
+                    reasoning_tokens=llm_metrics.reasoning_tokens if llm_metrics else None,
+                    cache_read_tokens=llm_metrics.cache_read_tokens if llm_metrics else None,
+                    cache_write_tokens=llm_metrics.cache_write_tokens if llm_metrics else None,
                 )
-                # Accumulate metrics for non-streamed response within stream
-                if run_response is not None and model_response.response_usage is not None:
-                    from agno.metrics import accumulate_model_metrics
 
-                    accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
-                if self.cache_response:
-                    streaming_responses.append(model_response)
-                yield model_response
-
-            # Add assistant message to messages
-            messages.append(assistant_message)
-            assistant_message.log(metrics=True)
-
-            # Emit LLM request completed event with metrics
-            llm_metrics = assistant_message.metrics
-            yield ModelResponse(
-                event=ModelResponseEvent.model_request_completed.value,
-                input_tokens=llm_metrics.input_tokens if llm_metrics else None,
-                output_tokens=llm_metrics.output_tokens if llm_metrics else None,
-                total_tokens=llm_metrics.total_tokens if llm_metrics else None,
-                time_to_first_token=llm_metrics.time_to_first_token if llm_metrics else None,
-                reasoning_tokens=llm_metrics.reasoning_tokens if llm_metrics else None,
-                cache_read_tokens=llm_metrics.cache_read_tokens if llm_metrics else None,
-                cache_write_tokens=llm_metrics.cache_write_tokens if llm_metrics else None,
-            )
-
-            # Handle tool calls if present
-            if assistant_message.tool_calls is not None:
-                # Prepare function calls
-                function_calls_to_run: List[FunctionCall] = self.get_function_calls_to_run(
-                    assistant_message=assistant_message, messages=messages, functions=_functions
-                )
-                function_call_results: List[Message] = []
-
-                # Execute function calls
-                for function_call_response in self.run_function_calls(
-                    function_calls=function_calls_to_run,
-                    function_call_results=function_call_results,
-                    current_function_call_count=function_call_count,
-                    function_call_limit=tool_call_limit,
-                ):
-                    if self.cache_response and isinstance(function_call_response, ModelResponse):
-                        streaming_responses.append(function_call_response)
-                    yield function_call_response
-
-                # Add a function call for each successful execution
-                function_call_count += len(function_call_results)
-
-                # Format and add results to messages
-                if stream_data and stream_data.extra is not None:
-                    self.format_function_call_results(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        compress_tool_results=_compress_tool_results,
-                        **stream_data.extra,
+                if assistant_message.tool_calls is not None:
+                    function_calls_to_run: List[FunctionCall] = self.get_function_calls_to_run(
+                        assistant_message=assistant_message, messages=messages, functions=_functions
                     )
-                elif model_response and model_response.extra is not None:
-                    self.format_function_call_results(
-                        messages=messages,
+                    function_call_results: List[Message] = []
+                    tool_call_paused = False
+
+                    for function_call_response in self.run_function_calls(
+                        function_calls=function_calls_to_run,
                         function_call_results=function_call_results,
-                        compress_tool_results=_compress_tool_results,
-                        **model_response.extra,
-                    )
-                else:
-                    self.format_function_call_results(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        compress_tool_results=_compress_tool_results,
-                    )
+                        current_function_call_count=function_call_count,
+                        function_call_limit=tool_call_limit,
+                    ):
+                        if (
+                            isinstance(function_call_response, ModelResponse)
+                            and function_call_response.event == ModelResponseEvent.tool_call_paused.value
+                        ):
+                            tool_call_paused = True
+                        if cache_streaming_response and isinstance(function_call_response, ModelResponse):
+                            streaming_responses.append(function_call_response)
+                        yield function_call_response
 
-                # Handle function call media
-                if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
-                    self._handle_function_call_media(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        send_media_to_model=send_media_to_model,
-                    )
+                    function_call_count += len(function_call_results)
 
-                for function_call_result in function_call_results:
-                    function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
+                    if stream_data and stream_data.extra is not None:
+                        self.format_function_call_results(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            compress_tool_results=_compress_tool_results,
+                            **stream_data.extra,
+                        )
+                    elif model_response and model_response.extra is not None:
+                        self.format_function_call_results(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            compress_tool_results=_compress_tool_results,
+                            **model_response.extra,
+                        )
+                    else:
+                        self.format_function_call_results(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            compress_tool_results=_compress_tool_results,
+                        )
 
-                # Check if we should stop after tool calls
-                if any(m.stop_after_tool_call for m in function_call_results):
-                    break
+                    if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
+                        self._handle_function_call_media(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            send_media_to_model=send_media_to_model,
+                        )
 
-                # Per-turn checkpoint hook: post-gather barrier. Tool results have been
-                # appended to messages; fire the hook before deciding whether to loop or break.
-                # Failure to checkpoint must not kill a working run — log and continue.
-                if after_tool_results is not None:
-                    try:
-                        after_tool_results(model_response)
-                    except Exception as e:
-                        log_error(f"after_tool_results callback failed: {e}")
+                    for function_call_result in function_call_results:
+                        function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
 
-                # If we have any tool calls that require confirmation, break the loop
-                if any(fc.function.requires_confirmation for fc in function_calls_to_run):
-                    break
-
-                # If we have any tool calls that require external execution, break the loop
-                if any(fc.function.external_execution for fc in function_calls_to_run):
-                    break
-
-                # If we have any tool calls that require user input, break the loop
-                if any(fc.function.requires_user_input for fc in function_calls_to_run):
-                    break
-
-                # Check if run_response has requirements (e.g., from member agent HITL)
-                # This handles cases where a tool (like delegate_task_to_member) propagates
-                # HITL requirements from a member agent to the team's run_response
-                if run_response is not None and run_response.requirements:
-                    if any(not req.is_resolved() for req in run_response.requirements):
+                    if any(m.stop_after_tool_call for m in function_call_results):
                         break
 
-                # Continue loop to get next response
-                continue
+                    if after_tool_results is not None:
+                        try:
+                            after_tool_results(model_response)
+                        except Exception as e:
+                            log_error(f"after_tool_results callback failed: {e}")
 
-            # No tool calls or finished processing them
-            break
+                    if tool_call_paused:
+                        break
 
-        log_debug(f"{self.get_provider()} Response Stream End", center=True, symbol="-")
+                    if any(fc.function.requires_confirmation for fc in function_calls_to_run):
+                        break
 
-        # Save streaming responses to cache if enabled
-        if self.cache_response and cache_key and streaming_responses:
-            self._save_streaming_responses_to_cache(cache_key, streaming_responses)
+                    if any(fc.function.external_execution for fc in function_calls_to_run):
+                        break
+
+                    if any(fc.function.requires_user_input for fc in function_calls_to_run):
+                        break
+
+                    if run_response is not None and run_response.requirements:
+                        if any(not req.is_resolved() for req in run_response.requirements):
+                            break
+
+                    continue
+
+                break
+
+            log_debug(f"{self.get_provider()} Response Stream End", center=True, symbol="-")
+
+            if cache_streaming_response and cache_key and streaming_responses:
+                self._save_streaming_responses_to_cache(cache_key, streaming_responses)
+        finally:
+            _CURRENT_RUN_CONTEXT_VAR.reset(_run_context_token)
+            if self.__class__.__name__ == "Gemini" and self.client is not None:
+                try:
+                    self.client.close()  # type: ignore
+                    self.client = None
+                except AttributeError as e:
+                    log_warning(
+                        f"Your Gemini client is outdated. For Agno to properly handle the lifecycle of the client,: {e}"
+                        f" please upgrade Gemini to the latest version: pip install -U google-genai: {e}",
+                    )
 
     async def aprocess_response_stream(
         self,
@@ -1617,26 +1859,32 @@ class Model(ABC):
         """
         Process a streaming response from the model with retry logic for ModelProviderError.
         """
-        async for response_delta in self._ainvoke_stream_with_retry(
-            messages=messages,
-            assistant_message=assistant_message,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=tool_choice or self._tool_choice,
-            run_response=run_response,
-            compress_tool_results=compress_tool_results,
-        ):
-            # Set TTFT when first chunk arrives (guard ensures first-call-wins)
-            if run_response and run_response.metrics:
-                run_response.metrics.set_time_to_first_token()
-            for model_response_delta in self._populate_stream_data(
-                stream_data=stream_data,
-                model_response_delta=response_delta,
+        try:
+            async for response_delta in self._ainvoke_stream_with_retry(
+                messages=messages,
+                assistant_message=assistant_message,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice or self._tool_choice,
+                run_response=run_response,
+                compress_tool_results=compress_tool_results,
             ):
-                yield model_response_delta
+                if run_response and run_response.metrics:
+                    run_response.metrics.set_time_to_first_token()
+                for model_response_delta in self._populate_stream_data(
+                    stream_data=stream_data,
+                    model_response_delta=response_delta,
+                ):
+                    yield model_response_delta
 
-        # Populate assistant message from stream data after the stream ends
-        self._populate_assistant_message_from_stream_data(assistant_message=assistant_message, stream_data=stream_data)
+            self._populate_assistant_message_from_stream_data(
+                assistant_message=assistant_message, stream_data=stream_data
+            )
+        except BaseException:
+            self._populate_assistant_message_from_stream_data(
+                assistant_message=assistant_message, stream_data=stream_data
+            )
+            raise
 
     async def aresponse_stream(
         self,
@@ -1650,6 +1898,7 @@ class Model(ABC):
         send_media_to_model: bool = True,
         compression_manager: Optional["CompressionManager"] = None,
         after_tool_results: Optional[Callable[["ModelResponse"], Awaitable[None]]] = None,
+        run_context: Optional[Any] = None,
     ) -> AsyncIterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
         """
         Generate an asynchronous streaming response from the model.
@@ -1660,227 +1909,256 @@ class Model(ABC):
         single argument. Used by Agent-level checkpointing (``checkpoint="tool-batch"``) to persist
         mid-run state. Exceptions are caught and logged — a failed callback must not kill the run.
         """
-        # Check cache if enabled - capture key BEFORE streaming to avoid mismatch
-        cache_key = None
-        if self.cache_response:
-            cache_key = self._get_model_cache_key(messages, stream=True, response_format=response_format, tools=tools)
-            cached_data = self._get_cached_model_response(cache_key)
-
-            if cached_data:
-                log_info("Cache hit for async streaming model response")
-                # Yield cached responses
-                for response in self._streaming_responses_from_cache(cached_data["streaming_responses"]):
-                    yield response
-                return
-
-            log_info("Cache miss for async streaming model response")
-
-        # Track streaming responses for caching
-        streaming_responses: List[ModelResponse] = []
-
-        log_debug(f"{self.get_provider()} Async Response Stream Start", center=True, symbol="-")
-        log_debug(f"Model: {self.id}", center=True, symbol="-")
-        _log_messages(messages)
-
-        _tool_dicts = self._format_tools(tools) if tools is not None else []
-        _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)} if tools is not None else {}
-
-        _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
-        _compression_manager = compression_manager if _compress_tool_results else None
-
-        function_call_count = 0
-
-        while True:
-            # Compress existing tool results BEFORE making API call to avoid context overflow
-            if _compression_manager is not None and await _compression_manager.ashould_compress(
-                messages, tools, model=self, response_format=response_format
-            ):
-                # Emit compression started event
-                yield ModelResponse(event=ModelResponseEvent.compression_started.value)
-                await _compression_manager.acompress(
-                    messages, run_metrics=run_response.metrics if run_response is not None else None
+        _run_context_token = _CURRENT_RUN_CONTEXT_VAR.set(run_context)
+        try:
+            # Check cache if enabled - capture key BEFORE streaming to avoid mismatch
+            cache_key = None
+            cache_streaming_response = self.cache_response and not _has_executable_tools(tools)
+            if cache_streaming_response:
+                cache_key = self._get_model_cache_key(
+                    messages, stream=True, response_format=response_format, tools=tools
                 )
-                # Emit compression completed event with stats
-                yield ModelResponse(
-                    event=ModelResponseEvent.compression_completed.value,
-                    compression_stats=_compression_manager.stats.copy(),
-                )
+                cached_data = self._get_cached_model_response(cache_key)
 
-            # Create assistant message and stream data
-            assistant_message = Message(role=self.assistant_message_role)
-            stream_data = MessageData()
-            model_response = ModelResponse()
+                if cached_data:
+                    log_info("Cache hit for async streaming model response")
+                    for response in self._streaming_responses_from_cache(cached_data["streaming_responses"]):
+                        yield response
+                    return
 
-            # Emit LLM request started event
-            yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
+                log_info("Cache miss for async streaming model response")
 
-            if stream_model_response:
-                # Initialize message metrics and start timer before model call
-                stream_data.response_metrics = MessageMetrics()
-                stream_data.response_metrics.start_timer()
-                # Initialize assistant_message.metrics for provider ainvoke_stream calls
-                self._ensure_message_metrics_initialized(assistant_message)
-                # Generate response
-                try:
-                    async for model_response_delta in self.aprocess_response_stream(
-                        messages=messages,
-                        assistant_message=assistant_message,
-                        stream_data=stream_data,
-                        response_format=response_format,
-                        tools=_tool_dicts,
-                        tool_choice=tool_choice or self._tool_choice,
-                        run_response=run_response,
-                        compress_tool_results=_compress_tool_results,
-                    ):
-                        if self.cache_response and isinstance(model_response_delta, ModelResponse):
-                            streaming_responses.append(model_response_delta)
-                        yield model_response_delta
-                finally:
-                    # Accumulate metrics for this streamed iteration (also on cancel)
-                    if run_response is not None and assistant_message.metrics is not None:
-                        from agno.metrics import accumulate_model_metrics
+            # Track streaming responses for caching
+            streaming_responses: List[ModelResponse] = []
 
-                        _stream_model_response = ModelResponse()
-                        _stream_model_response.response_usage = assistant_message.metrics
-                        accumulate_model_metrics(_stream_model_response, self, self.model_type, run_response.metrics)
+            log_debug(f"{self.get_provider()} Async Response Stream Start", center=True, symbol="-")
+            log_debug(f"Model: {self.id}", center=True, symbol="-")
+            _log_messages(messages)
 
-            else:
-                # Initialize message metrics and start timer before model call
-                self._ensure_message_metrics_initialized(assistant_message)
-                await self._aprocess_model_response(
-                    messages=messages,
-                    assistant_message=assistant_message,
-                    model_response=model_response,
-                    response_format=response_format,
-                    tools=_tool_dicts,
-                    tool_choice=tool_choice or self._tool_choice,
-                    run_response=run_response,
-                    compress_tool_results=_compress_tool_results,
-                )
-                # Accumulate metrics for non-streamed response within stream
-                if run_response is not None and model_response.response_usage is not None:
-                    from agno.metrics import accumulate_model_metrics
+            _tool_dicts = self._format_tools(tools) if tools is not None else []
+            _functions = self._get_functions_from_tools(tools)
 
-                    accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
-                if self.cache_response:
-                    streaming_responses.append(model_response)
-                yield model_response
+            _compress_tool_results = compression_manager is not None and compression_manager.compress_tool_results
+            _compression_manager = compression_manager if _compress_tool_results else None
 
-            # Add assistant message to messages
-            messages.append(assistant_message)
-            assistant_message.log(metrics=True)
+            function_call_count = 0
 
-            # Emit LLM request completed event with metrics
-            llm_metrics = assistant_message.metrics
-            yield ModelResponse(
-                event=ModelResponseEvent.model_request_completed.value,
-                input_tokens=llm_metrics.input_tokens if llm_metrics else None,
-                output_tokens=llm_metrics.output_tokens if llm_metrics else None,
-                total_tokens=llm_metrics.total_tokens if llm_metrics else None,
-                time_to_first_token=llm_metrics.time_to_first_token if llm_metrics else None,
-                reasoning_tokens=llm_metrics.reasoning_tokens if llm_metrics else None,
-                cache_read_tokens=llm_metrics.cache_read_tokens if llm_metrics else None,
-                cache_write_tokens=llm_metrics.cache_write_tokens if llm_metrics else None,
-            )
-
-            # Handle tool calls if present
-            if assistant_message.tool_calls is not None:
-                # Prepare function calls
-                function_calls_to_run: List[FunctionCall] = self.get_function_calls_to_run(
-                    assistant_message=assistant_message, messages=messages, functions=_functions
-                )
-                function_call_results: List[Message] = []
-
-                # Execute function calls
-                async for function_call_response in self.arun_function_calls(
-                    function_calls=function_calls_to_run,
-                    function_call_results=function_call_results,
-                    current_function_call_count=function_call_count,
-                    function_call_limit=tool_call_limit,
+            while True:
+                # Compress existing tool results BEFORE making API call to avoid context overflow
+                if _compression_manager is not None and await _compression_manager.ashould_compress(
+                    messages, tools, model=self, response_format=response_format
                 ):
-                    if self.cache_response and isinstance(function_call_response, ModelResponse):
-                        streaming_responses.append(function_call_response)
-                    yield function_call_response
-
-                # Add a function call for each successful execution
-                function_call_count += len(function_call_results)
-
-                # Format and add results to messages
-                if stream_data and stream_data.extra is not None:
-                    self.format_function_call_results(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        compress_tool_results=_compress_tool_results,
-                        **stream_data.extra,
+                    # Emit compression started event
+                    yield ModelResponse(event=ModelResponseEvent.compression_started.value)
+                    await _compression_manager.acompress(
+                        messages, run_metrics=run_response.metrics if run_response is not None else None
                     )
-                elif model_response and model_response.extra is not None:
-                    self.format_function_call_results(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        compress_tool_results=_compress_tool_results,
-                        **model_response.extra or {},
-                    )
-                else:
-                    self.format_function_call_results(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        compress_tool_results=_compress_tool_results,
+                    # Emit compression completed event with stats
+                    yield ModelResponse(
+                        event=ModelResponseEvent.compression_completed.value,
+                        compression_stats=_compression_manager.stats.copy(),
                     )
 
-                # Handle function call media
-                if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
-                    self._handle_function_call_media(
-                        messages=messages,
-                        function_call_results=function_call_results,
-                        send_media_to_model=send_media_to_model,
+                # Create assistant message and stream data
+                assistant_message = Message(role=self.assistant_message_role)
+                stream_data = MessageData()
+                model_response = ModelResponse()
+                _assistant_message_appended = False
+
+                # Emit LLM request started event
+                yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
+
+                try:
+                    if stream_model_response:
+                        stream_data.response_metrics = MessageMetrics()
+                        stream_data.response_metrics.start_timer()
+                        self._ensure_message_metrics_initialized(assistant_message)
+                        async for model_response_delta in self.aprocess_response_stream(
+                            messages=messages,
+                            assistant_message=assistant_message,
+                            stream_data=stream_data,
+                            response_format=response_format,
+                            tools=_tool_dicts,
+                            tool_choice=tool_choice or self._tool_choice,
+                            run_response=run_response,
+                            compress_tool_results=_compress_tool_results,
+                        ):
+                            if cache_streaming_response and isinstance(model_response_delta, ModelResponse):
+                                streaming_responses.append(model_response_delta)
+                            yield model_response_delta
+
+                        if run_response is not None and assistant_message.metrics is not None:
+                            from agno.metrics import accumulate_model_metrics
+
+                            _stream_model_response = ModelResponse()
+                            _stream_model_response.response_usage = assistant_message.metrics
+                            accumulate_model_metrics(
+                                _stream_model_response, self, self.model_type, run_response.metrics
+                            )
+
+                    else:
+                        self._ensure_message_metrics_initialized(assistant_message)
+                        await self._aprocess_model_response(
+                            messages=messages,
+                            assistant_message=assistant_message,
+                            model_response=model_response,
+                            response_format=response_format,
+                            tools=_tool_dicts,
+                            tool_choice=tool_choice or self._tool_choice,
+                            run_response=run_response,
+                            compress_tool_results=_compress_tool_results,
+                        )
+                        if run_response is not None and model_response.response_usage is not None:
+                            from agno.metrics import accumulate_model_metrics
+
+                            accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
+                        if cache_streaming_response:
+                            streaming_responses.append(model_response)
+                        yield model_response
+
+                    messages.append(assistant_message)
+                    _assistant_message_appended = True
+                except BaseException:
+                    if not _assistant_message_appended:
+                        self._populate_assistant_message_from_stream_data(
+                            assistant_message=assistant_message, stream_data=stream_data
+                        )
+                        if assistant_message.content:
+                            messages.append(assistant_message)
+                    raise
+                assistant_message.log(metrics=True)
+
+                # Emit LLM request completed event with metrics
+                llm_metrics = assistant_message.metrics
+                yield ModelResponse(
+                    event=ModelResponseEvent.model_request_completed.value,
+                    input_tokens=llm_metrics.input_tokens if llm_metrics else None,
+                    output_tokens=llm_metrics.output_tokens if llm_metrics else None,
+                    total_tokens=llm_metrics.total_tokens if llm_metrics else None,
+                    time_to_first_token=llm_metrics.time_to_first_token if llm_metrics else None,
+                    reasoning_tokens=llm_metrics.reasoning_tokens if llm_metrics else None,
+                    cache_read_tokens=llm_metrics.cache_read_tokens if llm_metrics else None,
+                    cache_write_tokens=llm_metrics.cache_write_tokens if llm_metrics else None,
+                )
+
+                # Handle tool calls if present
+                if assistant_message.tool_calls is not None:
+                    # Prepare function calls
+                    function_calls_to_run: List[FunctionCall] = self.get_function_calls_to_run(
+                        assistant_message=assistant_message, messages=messages, functions=_functions
                     )
+                    function_call_results: List[Message] = []
+                    tool_call_paused = False
 
-                for function_call_result in function_call_results:
-                    function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
+                    # Execute function calls
+                    async for function_call_response in self.arun_function_calls(
+                        function_calls=function_calls_to_run,
+                        function_call_results=function_call_results,
+                        current_function_call_count=function_call_count,
+                        function_call_limit=tool_call_limit,
+                        run_id=run_response.run_id if run_response else None,
+                    ):
+                        if (
+                            isinstance(function_call_response, ModelResponse)
+                            and function_call_response.event == ModelResponseEvent.tool_call_paused.value
+                        ):
+                            tool_call_paused = True
+                        if cache_streaming_response and isinstance(function_call_response, ModelResponse):
+                            streaming_responses.append(function_call_response)
+                        yield function_call_response
 
-                # Check if we should stop after tool calls
-                if any(m.stop_after_tool_call for m in function_call_results):
-                    break
+                    # Add a function call for each successful execution
+                    function_call_count += len(function_call_results)
 
-                # Per-turn checkpoint hook: post-gather barrier. Tool results have been
-                # appended to messages; fire the hook before deciding whether to loop or break.
-                # Failure to checkpoint must not kill a working run — log and continue.
-                if after_tool_results is not None:
-                    try:
-                        await after_tool_results(model_response)
-                    except Exception as e:
-                        log_error(f"after_tool_results callback failed: {e}")
+                    # Format and add results to messages
+                    if stream_data and stream_data.extra is not None:
+                        self.format_function_call_results(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            compress_tool_results=_compress_tool_results,
+                            **stream_data.extra,
+                        )
+                    elif model_response and model_response.extra is not None:
+                        self.format_function_call_results(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            compress_tool_results=_compress_tool_results,
+                            **model_response.extra or {},
+                        )
+                    else:
+                        self.format_function_call_results(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            compress_tool_results=_compress_tool_results,
+                        )
 
-                # If we have any tool calls that require confirmation, break the loop
-                if any(fc.function.requires_confirmation for fc in function_calls_to_run):
-                    break
+                    # Handle function call media
+                    if any(msg.images or msg.videos or msg.audio or msg.files for msg in function_call_results):
+                        self._handle_function_call_media(
+                            messages=messages,
+                            function_call_results=function_call_results,
+                            send_media_to_model=send_media_to_model,
+                        )
 
-                # If we have any tool calls that require external execution, break the loop
-                if any(fc.function.external_execution for fc in function_calls_to_run):
-                    break
+                    for function_call_result in function_call_results:
+                        function_call_result.log(metrics=True, use_compressed_content=_compress_tool_results)
 
-                # If we have any tool calls that require user input, break the loop
-                if any(fc.function.requires_user_input for fc in function_calls_to_run):
-                    break
-
-                # Check if run_response has requirements (e.g., from member agent HITL)
-                # This handles cases where a tool (like delegate_task_to_member) propagates
-                # HITL requirements from a member agent to the team's run_response
-                if run_response is not None and run_response.requirements:
-                    if any(not req.is_resolved() for req in run_response.requirements):
+                    # Check if we should stop after tool calls
+                    if any(m.stop_after_tool_call for m in function_call_results):
                         break
 
-                # Continue loop to get next response
-                continue
+                    if after_tool_results is not None:
+                        try:
+                            await after_tool_results(model_response)
+                        except Exception as e:
+                            log_error(f"after_tool_results callback failed: {e}")
 
-            # No tool calls or finished processing them
-            break
+                    if tool_call_paused:
+                        break
 
-        log_debug(f"{self.get_provider()} Async Response Stream End", center=True, symbol="-")
+                    # If we have any tool calls that require confirmation, break the loop
+                    if any(fc.function.requires_confirmation for fc in function_calls_to_run):
+                        break
 
-        # Save streaming responses to cache if enabled
-        if self.cache_response and cache_key and streaming_responses:
-            self._save_streaming_responses_to_cache(cache_key, streaming_responses)
+                    # If we have any tool calls that require external execution, break the loop
+                    if any(fc.function.external_execution for fc in function_calls_to_run):
+                        break
+
+                    # If we have any tool calls that require user input, break the loop
+                    if any(fc.function.requires_user_input for fc in function_calls_to_run):
+                        break
+
+                    # Check if run_response has requirements (e.g., from member agent HITL)
+                    # This handles cases where a tool (like delegate_task_to_member) propagates
+                    # HITL requirements from a member agent to the team's run_response
+                    if run_response is not None and run_response.requirements:
+                        if any(not req.is_resolved() for req in run_response.requirements):
+                            break
+
+                    # Continue loop to get next response
+                    continue
+
+                # No tool calls or finished processing them
+                break
+
+            log_debug(f"{self.get_provider()} Async Response Stream End", center=True, symbol="-")
+
+            # Save streaming responses to cache if enabled
+            if cache_streaming_response and cache_key and streaming_responses:
+                self._save_streaming_responses_to_cache(cache_key, streaming_responses)
+
+        finally:
+            _CURRENT_RUN_CONTEXT_VAR.reset(_run_context_token)
+            # Close the Gemini client
+            if self.__class__.__name__ == "Gemini" and self.client is not None:
+                try:
+                    await self.client.aio.aclose()  # type: ignore
+                    self.client = None
+                except AttributeError as e:
+                    log_warning(
+                        f"Your Gemini client is outdated. For Agno to properly handle the lifecycle of the client,: {e}"
+                        f" please upgrade Gemini to the latest version: pip install -U google-genai: {e}",
+                    )
 
     def _populate_assistant_message_from_stream_data(
         self, assistant_message: Message, stream_data: MessageData
@@ -1922,6 +2200,22 @@ class Model(ABC):
         self, stream_data: MessageData, model_response_delta: ModelResponse
     ) -> Iterator[ModelResponse]:
         """Update the stream data and assistant message with the model response."""
+
+        if model_response_delta.event == ModelResponseEvent.tool_call_args_delta.value:
+            if model_response_delta.tool_call_id is not None:
+                stream_data.tool_call_direct_args_delta_ids.add(model_response_delta.tool_call_id)
+            if (
+                model_response_delta.tool_call_id
+                and model_response_delta.tool_call_id not in stream_data.tool_call_started_ids
+            ):
+                stream_data.tool_call_started_ids.add(model_response_delta.tool_call_id)
+                yield ModelResponse(
+                    event=ModelResponseEvent.tool_call_start.value,
+                    tool_call_id=model_response_delta.tool_call_id,
+                    tool_name=model_response_delta.tool_name,
+                )
+            yield model_response_delta
+            return
 
         should_yield = False
         if model_response_delta.role is not None:
@@ -1969,7 +2263,72 @@ class Model(ABC):
                     stream_data.response_provider_data[key] = value
 
         # Update stream_data tool calls
-        if model_response_delta.tool_calls is not None:
+        if model_response_delta.tool_calls is not None and len(model_response_delta.tool_calls) > 0:
+            # When a provider delivers a tool call as a snapshot (e.g. OpenAI Responses
+            # `response.output_item.done` with full arguments and no preceding args
+            # deltas), no `tool_call_args_delta` event ever fires for this id, so the
+            # paired `tool_call_start` is never emitted by the args-delta branch above.
+            # Synthesize them here for any tool_call_id we have not seen yet so that
+            # streaming consumers receive the same start + args-delta pair on both
+            # delta and one-shot delivery paths.
+            #
+            # `ModelResponse.tool_calls` is declared `List[Dict[str, Any]]` and the
+            # OpenAI Chat / OpenAILike providers now honour that contract. A handful
+            # of other providers (Groq, Meta Llama, HuggingFace, Azure AI Foundry)
+            # still inject pydantic chunk objects here, and their `parse_tool_calls`
+            # implementations depend on receiving them verbatim for per-chunk
+            # `function.arguments` concatenation. Be tolerant of both element shapes
+            # so this loop never crashes on those providers, and do not coerce the
+            # elements before extending `response_tool_calls` below, or those
+            # fragment-concat paths break. Each remaining provider should migrate
+            # to the dict contract in a follow-up.
+            #
+            # Mid-stream fragments (OpenAI Chat / Groq / Azure / HF) carry only an
+            # `index` after the first chunk; we look up the previously cached
+            # id from `tool_call_provider_index_to_id` so subsequent args fragments
+            # can still be emitted as `tool_call_args_delta` events instead of
+            # being dropped.
+            for tc in model_response_delta.tool_calls:
+                if isinstance(tc, dict):
+                    tc_id = tc.get("call_id") or tc.get("id")
+                    tc_index = tc.get("index")
+                    tc_function = tc.get("function") if isinstance(tc.get("function"), dict) else None
+                    tc_name = tc_function.get("name") if tc_function else None
+                    tc_args = tc_function.get("arguments") if tc_function else None
+                else:
+                    tc_id = getattr(tc, "call_id", None) or getattr(tc, "id", None)
+                    tc_index = getattr(tc, "index", None)
+                    tc_function = getattr(tc, "function", None)
+                    tc_name = getattr(tc_function, "name", None) if tc_function is not None else None
+                    tc_args = getattr(tc_function, "arguments", None) if tc_function is not None else None
+
+                # If this is the first chunk for an `index`, remember the (index -> id)
+                # mapping so that subsequent fragments with id=None can still be routed.
+                if tc_index is not None and tc_id and tc_index not in stream_data.tool_call_provider_index_to_id:
+                    stream_data.tool_call_provider_index_to_id[tc_index] = tc_id
+
+                # Fragment chunks (post-first) typically have id=None; recover the id
+                # from the previously cached mapping so we can still emit args_delta.
+                if not tc_id and tc_index is not None:
+                    tc_id = stream_data.tool_call_provider_index_to_id.get(tc_index)
+
+                if not tc_id:
+                    continue
+
+                if tc_id not in stream_data.tool_call_started_ids:
+                    stream_data.tool_call_started_ids.add(tc_id)
+                    yield ModelResponse(
+                        event=ModelResponseEvent.tool_call_start.value,
+                        tool_call_id=tc_id,
+                        tool_name=tc_name,
+                    )
+                if tc_args and tc_id not in stream_data.tool_call_direct_args_delta_ids:
+                    yield ModelResponse(
+                        event=ModelResponseEvent.tool_call_args_delta.value,
+                        tool_call_id=tc_id,
+                        tool_name=tc_name,
+                        tool_args_delta=tc_args,
+                    )
             if stream_data.response_tool_calls is None:
                 stream_data.response_tool_calls = []
             stream_data.response_tool_calls.extend(model_response_delta.tool_calls)
@@ -2054,7 +2413,7 @@ class Model(ABC):
         function_calls_to_run: List[FunctionCall] = []
         if assistant_message.tool_calls is not None:
             for tool_call in assistant_message.tool_calls:
-                _tool_call_id = tool_call.get("id")
+                _tool_call_id = tool_call.get("call_id") or tool_call.get("id")
                 _tool_call_name = tool_call.get("function", {}).get("name")
                 _function_call = get_function_call_for_tool_call(tool_call, functions)
                 if _function_call is None:
@@ -2157,13 +2516,14 @@ class Model(ABC):
         stop_after_tool_call_from_exception = False
         try:
             function_execution_result = function_call.execute()
+        except (ToolApprovalRequired, ToolCallDeferred) as pause_exc:
+            function_call_timer.stop()
+            yield _create_tool_call_paused_response(function_call, pause_exc)
+            return
         except AgentRunException as a_exc:
-            # Update additional messages from function call
-            _handle_agent_exception(a_exc, additional_input)
-            # If stop_execution is True, mark that we should stop after this tool call
-            if a_exc.stop_execution:
-                stop_after_tool_call_from_exception = True
-            # Set function call success to False if an exception occurred
+            stop_after_tool_call_from_exception = _handle_agent_exception_from_tool_call(
+                function_call, a_exc, additional_input
+            )
         except RunCancelledException:
             raise
         except Exception as e:
@@ -2221,6 +2581,14 @@ class Model(ABC):
                             yield ModelResponse(content=str(item))
             except RunCancelledException:
                 raise
+            except (ToolApprovalRequired, ToolCallDeferred) as pause_exc:
+                yield _create_tool_call_paused_response(function_call, pause_exc)
+                return
+            except AgentRunException as a_exc:
+                stop_after_tool_call_from_exception = _handle_agent_exception_from_tool_call(
+                    function_call, a_exc, additional_input
+                )
+                function_call_success = False
             except Exception as e:
                 log_error(
                     f"Error while iterating function result generator for {function_call.function.name}: {str(e)}"
@@ -2328,132 +2696,38 @@ class Model(ABC):
                     function_call_results.append(self.create_tool_call_limit_error_result(fc))
                     continue
 
-            paused_tool_executions = []
-
-            # The function requires user confirmation (HITL)
-            if fc.function.requires_confirmation:
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_confirmation=True,
-                        approval_type=fc.function.approval_type,
-                        external_execution_silent=fc.function.external_execution_silent,
-                    )
-                )
-
-            # The function requires user input (HITL)
-            if fc.function.requires_user_input:
-                user_input_schema = fc.function.user_input_schema
-                if fc.arguments and user_input_schema:
-                    for name, value in fc.arguments.items():
-                        for user_input_field in user_input_schema:
-                            if user_input_field.name == name:
-                                user_input_field.value = value
-
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_user_input=True,
-                        approval_type=fc.function.approval_type,
-                        user_input_schema=user_input_schema,
-                        external_execution_silent=fc.function.external_execution_silent,
-                    )
-                )
-
-            # If the function is from the user control flow (HITL) tools, we handle it here
-            if fc.function.name == "get_user_input" and fc.arguments and fc.arguments.get("user_input_fields"):
-                user_input_schema = []
-                for input_field in fc.arguments.get("user_input_fields", []):
-                    field_type = input_field.get("field_type")
-                    if isinstance(field_type, str):
-                        type_mapping = {
-                            "str": str,
-                            "int": int,
-                            "float": float,
-                            "bool": bool,
-                            "list": list,
-                            "dict": dict,
-                        }
-                        python_type = type_mapping.get(field_type, str)
-                    elif isinstance(field_type, type):
-                        python_type = field_type
-                    else:
-                        python_type = str
-                    user_input_schema.append(
-                        UserInputField(
-                            name=input_field.get("field_name"),
-                            field_type=python_type,
-                            description=input_field.get("field_description"),
-                        )
-                    )
-
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_user_input=True,
-                        user_input_schema=user_input_schema,
-                    )
-                )
-
-            # If the function is from the user feedback tools, we handle it here
-            if fc.function.name == "ask_user" and fc.arguments and fc.arguments.get("questions"):
-                user_feedback_schema = []
-                for q in fc.arguments.get("questions", []):
-                    options = None
-                    if q.get("options"):
-                        options = [
-                            UserFeedbackOption(label=opt.get("label", ""), description=opt.get("description"))
-                            for opt in q["options"]
-                        ]
-                    user_feedback_schema.append(
-                        UserFeedbackQuestion(
-                            question=q.get("question", ""),
-                            header=q.get("header"),
-                            options=options,
-                            multi_select=q.get("multi_select", False),
-                        )
-                    )
-
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_user_input=True,
-                        user_feedback_schema=user_feedback_schema,
-                    )
-                )
-
-            # The function requires external execution (HITL)
-            if fc.function.external_execution:
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        external_execution_required=True,
-                        approval_type=fc.function.approval_type,
-                        external_execution_silent=fc.function.external_execution_silent,
-                    )
-                )
-
+            paused_tool_executions = _create_static_paused_tool_executions(fc)
             if paused_tool_executions:
+                # Mirror the dynamic-pause sequence: emit tool_call_started before
+                # tool_call_paused so downstream SSE consumers see a uniform
+                # "started → paused" pair regardless of pause origin.
+                yield ModelResponse(
+                    content=fc.get_call_str(),
+                    tool_executions=[
+                        ToolExecution(
+                            tool_call_id=fc.call_id,
+                            tool_name=fc.function.name,
+                            tool_args=fc.arguments,
+                        )
+                    ],
+                    event=ModelResponseEvent.tool_call_started.value,
+                )
                 yield ModelResponse(
                     tool_executions=paused_tool_executions,
                     event=ModelResponseEvent.tool_call_paused.value,
                 )
-                # We don't execute the function calls here
-                continue
+                if additional_input:
+                    function_call_results.extend(additional_input)
+                return
 
-            yield from self.run_function_call(
+            for response in self.run_function_call(
                 function_call=fc, function_call_results=function_call_results, additional_input=additional_input
-            )
+            ):
+                yield response
+                if isinstance(response, ModelResponse) and response.event == ModelResponseEvent.tool_call_paused.value:
+                    if additional_input:
+                        function_call_results.extend(additional_input)
+                    return
 
         # Add any additional messages at the end
         if additional_input:
@@ -2462,13 +2736,18 @@ class Model(ABC):
     async def arun_function_call(
         self,
         function_call: FunctionCall,
-    ) -> Tuple[Union[bool, AgentRunException], Timer, FunctionCall, FunctionExecutionResult]:
+    ) -> Tuple[
+        Union[bool, AgentRunException, ToolApprovalRequired, ToolCallDeferred],
+        Timer,
+        FunctionCall,
+        FunctionExecutionResult,
+    ]:
         """Run a single function call and return its success status, timer, and the FunctionCall object."""
         from inspect import isasyncgenfunction, iscoroutine, iscoroutinefunction
 
         function_call_timer = Timer()
         function_call_timer.start()
-        success: Union[bool, AgentRunException] = False
+        success: Union[bool, AgentRunException, ToolApprovalRequired, ToolCallDeferred] = False
         result: FunctionExecutionResult = FunctionExecutionResult(status="failure")
 
         try:
@@ -2481,14 +2760,15 @@ class Model(ABC):
                 success = result.status == "success"
 
             # If any of the hooks are async, we need to run the function call asynchronously
-            elif function_call.function.tool_hooks is not None and any(
-                iscoroutinefunction(f) for f in function_call.function.tool_hooks
-            ):
+            elif function_call._requires_async_execution():
                 result = await function_call.aexecute()
                 success = result.status == "success"
             else:
-                result = await asyncio.to_thread(function_call.execute)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, function_call.execute)
                 success = result.status == "success"
+        except (ToolApprovalRequired, ToolCallDeferred) as e:
+            success = e
         except AgentRunException as e:
             success = e
         except RunCancelledException:
@@ -2509,6 +2789,7 @@ class Model(ABC):
         current_function_call_count: int = 0,
         function_call_limit: Optional[int] = None,
         skip_pause_check: bool = False,
+        run_id: Optional[str] = None,
     ) -> AsyncIterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
         # Additional messages from function calls that will be added to the function call results
         if additional_input is None:
@@ -2525,138 +2806,196 @@ class Model(ABC):
                     continue
             function_calls_to_run.append(fc)
 
-        # Yield tool_call_started events for all function calls or pause them
+        if any(_function_call_uses_thread(fc) for fc in function_calls_to_run):
+            thread_function_calls = []
+            # For each statically-paused call, remember the started + paused responses
+            # so we can emit "started → paused" together, matching the dynamic flow.
+            static_pause_responses: Dict[str, Tuple[ModelResponse, ModelResponse]] = {}
+
+            for fc in function_calls_to_run:
+                if not skip_pause_check:
+                    paused_tool_executions = _create_static_paused_tool_executions(fc)
+                    if paused_tool_executions:
+                        response_key = fc.call_id or fc.function.name or str(id(fc))
+                        started_response = ModelResponse(
+                            content=fc.get_call_str(),
+                            tool_executions=[
+                                ToolExecution(
+                                    tool_call_id=fc.call_id,
+                                    tool_name=fc.function.name,
+                                    tool_args=fc.arguments,
+                                )
+                            ],
+                            event=ModelResponseEvent.tool_call_started.value,
+                        )
+                        paused_response = ModelResponse(
+                            tool_executions=paused_tool_executions,
+                            event=ModelResponseEvent.tool_call_paused.value,
+                        )
+                        static_pause_responses[response_key] = (started_response, paused_response)
+                        continue
+
+                if _function_call_uses_thread(fc):
+                    thread_function_calls.append(fc)
+
+            async def _yield_sync_function_call(
+                fc: FunctionCall,
+            ) -> AsyncIterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue[Any] = asyncio.Queue()
+                done_marker = object()
+                local_function_call_results: List[Message] = []
+
+                def _run_sync_function_call() -> List[Message]:
+                    try:
+                        for response in self.run_function_call(
+                            function_call=fc,
+                            function_call_results=local_function_call_results,
+                            additional_input=None,
+                        ):
+                            loop.call_soon_threadsafe(queue.put_nowait, response)
+                    except BaseException as exc:
+                        loop.call_soon_threadsafe(queue.put_nowait, exc)
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, done_marker)
+                    return local_function_call_results
+
+                sync_future = loop.run_in_executor(None, _run_sync_function_call)
+                try:
+                    while True:
+                        if run_id:
+                            try:
+                                item = await asyncio.wait_for(queue.get(), timeout=0.1)
+                            except asyncio.TimeoutError:
+                                from agno.run.cancel import ais_cancelled
+
+                                if await ais_cancelled(run_id):
+                                    raise RunCancelledException("Run cancelled while executing tool calls")
+                                continue
+                        else:
+                            item = await queue.get()
+
+                        if item is done_marker:
+                            break
+                        if isinstance(item, BaseException):
+                            raise item
+                        yield item
+                    completed_results = await sync_future
+                    function_call_results.extend(completed_results)
+                except (asyncio.CancelledError, RunCancelledException):
+                    sync_future.cancel()
+                    raise
+
+            thread_call_ids = {fc.call_id for fc in thread_function_calls}
+            pending_non_thread_function_calls: List[FunctionCall] = []
+
+            async def _flush_pending_non_thread_function_calls() -> AsyncIterator[
+                Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]
+            ]:
+                if not pending_non_thread_function_calls:
+                    return
+
+                batch = list(pending_non_thread_function_calls)
+                pending_non_thread_function_calls.clear()
+                async for response in self.arun_function_calls(
+                    batch,
+                    function_call_results,
+                    skip_pause_check=True,
+                    run_id=run_id,
+                ):
+                    yield response
+                    if (
+                        isinstance(response, ModelResponse)
+                        and response.event == ModelResponseEvent.tool_call_paused.value
+                    ):
+                        return
+                return
+
+            for fc in function_calls_to_run:
+                response_key = fc.call_id or fc.function.name or str(id(fc))
+                static_pause_pair = static_pause_responses.get(response_key)
+                if static_pause_pair is not None:
+                    async for response in _flush_pending_non_thread_function_calls():
+                        yield response
+                        if (
+                            isinstance(response, ModelResponse)
+                            and response.event == ModelResponseEvent.tool_call_paused.value
+                        ):
+                            if additional_input:
+                                function_call_results.extend(additional_input)
+                            return
+                    started_response, paused_response = static_pause_pair
+                    yield started_response
+                    yield paused_response
+                    if additional_input:
+                        function_call_results.extend(additional_input)
+                    return
+
+                if fc.call_id not in thread_call_ids:
+                    pending_non_thread_function_calls.append(fc)
+                    continue
+
+                async for response in _flush_pending_non_thread_function_calls():
+                    yield response
+                    if (
+                        isinstance(response, ModelResponse)
+                        and response.event == ModelResponseEvent.tool_call_paused.value
+                    ):
+                        if additional_input:
+                            function_call_results.extend(additional_input)
+                        return
+
+                async for response in _yield_sync_function_call(fc):
+                    yield response
+                    if (
+                        isinstance(response, ModelResponse)
+                        and response.event == ModelResponseEvent.tool_call_paused.value
+                    ):
+                        if additional_input:
+                            function_call_results.extend(additional_input)
+                        return
+
+            async for response in _flush_pending_non_thread_function_calls():
+                yield response
+                if isinstance(response, ModelResponse) and response.event == ModelResponseEvent.tool_call_paused.value:
+                    if additional_input:
+                        function_call_results.extend(additional_input)
+                    return
+
+            if additional_input:
+                function_call_results.extend(additional_input)
+            return
+
+        first_static_pause_response: Optional[ModelResponse] = None
+        first_static_pause_started: Optional[ModelResponse] = None
+        if not skip_pause_check:
+            runnable_function_calls = []
+            for fc in function_calls_to_run:
+                paused_tool_executions = _create_static_paused_tool_executions(fc)
+                if paused_tool_executions:
+                    # Build the paired started event so we emit the same
+                    # "started → paused" sequence dynamic pauses produce.
+                    first_static_pause_started = ModelResponse(
+                        content=fc.get_call_str(),
+                        tool_executions=[
+                            ToolExecution(
+                                tool_call_id=fc.call_id,
+                                tool_name=fc.function.name,
+                                tool_args=fc.arguments,
+                            )
+                        ],
+                        event=ModelResponseEvent.tool_call_started.value,
+                    )
+                    first_static_pause_response = ModelResponse(
+                        tool_executions=paused_tool_executions,
+                        event=ModelResponseEvent.tool_call_paused.value,
+                    )
+                    break
+                runnable_function_calls.append(fc)
+            function_calls_to_run = runnable_function_calls
+
+        # Yield tool_call_started events for all calls that can run before the first static pause.
         for fc in function_calls_to_run:
-            paused_tool_executions = []
-            # The function cannot be executed without user confirmation
-            if fc.function.requires_confirmation and not skip_pause_check:
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_confirmation=True,
-                        approval_type=fc.function.approval_type,
-                        external_execution_silent=fc.function.external_execution_silent,
-                    )
-                )
-            # If the function requires user input, we yield a message to the user
-            if fc.function.requires_user_input and not skip_pause_check:
-                user_input_schema = fc.function.user_input_schema
-                if fc.arguments and user_input_schema:
-                    for name, value in fc.arguments.items():
-                        for user_input_field in user_input_schema:
-                            if user_input_field.name == name:
-                                user_input_field.value = value
-
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_user_input=True,
-                        approval_type=fc.function.approval_type,
-                        user_input_schema=user_input_schema,
-                        external_execution_silent=fc.function.external_execution_silent,
-                    )
-                )
-            # If the function is from the user control flow tools, we handle it here
-            if (
-                fc.function.name == "get_user_input"
-                and fc.arguments
-                and fc.arguments.get("user_input_fields")
-                and not skip_pause_check
-            ):
-                fc.function.requires_user_input = True
-                user_input_schema = []
-                for input_field in fc.arguments.get("user_input_fields", []):
-                    field_type = input_field.get("field_type")
-                    if isinstance(field_type, str):
-                        type_mapping = {
-                            "str": str,
-                            "int": int,
-                            "float": float,
-                            "bool": bool,
-                            "list": list,
-                            "dict": dict,
-                        }
-                        python_type = type_mapping.get(field_type, str)
-                    elif isinstance(field_type, type):
-                        python_type = field_type
-                    else:
-                        python_type = str
-                    user_input_schema.append(
-                        UserInputField(
-                            name=input_field.get("field_name"),
-                            field_type=python_type,
-                            description=input_field.get("field_description"),
-                        )
-                    )
-
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_user_input=True,
-                        user_input_schema=user_input_schema,
-                    )
-                )
-            # If the function is from the user feedback tools, we handle it here
-            if (
-                fc.function.name == "ask_user"
-                and fc.arguments
-                and fc.arguments.get("questions")
-                and not skip_pause_check
-            ):
-                fc.function.requires_user_input = True
-                user_feedback_schema = []
-                for q in fc.arguments.get("questions", []):
-                    options = None
-                    if q.get("options"):
-                        options = [
-                            UserFeedbackOption(label=opt.get("label", ""), description=opt.get("description"))
-                            for opt in q["options"]
-                        ]
-                    user_feedback_schema.append(
-                        UserFeedbackQuestion(
-                            question=q.get("question", ""),
-                            header=q.get("header"),
-                            options=options,
-                            multi_select=q.get("multi_select", False),
-                        )
-                    )
-
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        requires_user_input=True,
-                        user_feedback_schema=user_feedback_schema,
-                    )
-                )
-            # If the function requires external execution, we yield a message to the user
-            if fc.function.external_execution and not skip_pause_check:
-                paused_tool_executions.append(
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                        external_execution_required=True,
-                        approval_type=fc.function.approval_type,
-                        external_execution_silent=fc.function.external_execution_silent,
-                    )
-                )
-
-            if paused_tool_executions:
-                yield ModelResponse(
-                    tool_executions=paused_tool_executions,
-                    event=ModelResponseEvent.tool_call_paused.value,
-                )
-                # We don't execute the function calls here
-                continue
-
             yield ModelResponse(
                 content=fc.get_call_str(),
                 tool_executions=[
@@ -2669,53 +3008,31 @@ class Model(ABC):
                 event=ModelResponseEvent.tool_call_started.value,
             )
 
-        # Create and run all function calls in parallel (skip ones that need confirmation)
-        if skip_pause_check:
-            function_calls_to_run = function_calls_to_run
-        else:
-            function_calls_to_run = [
-                fc
-                for fc in function_calls_to_run
-                if not (
-                    fc.function.requires_confirmation
-                    or fc.function.external_execution
-                    or fc.function.requires_user_input
-                )
-            ]
-
-        results = await asyncio.gather(
-            *(self.arun_function_call(fc) for fc in function_calls_to_run), return_exceptions=True
-        )
-
-        # Separate async generators from other results for concurrent processing
+        # Create and run all function calls in parallel.
+        results: List[Any] = [None] * len(function_calls_to_run)
+        paused_function_calls: List[Tuple[int, FunctionCall, ToolPauseException]] = []
+        paused_generator_calls: List[Tuple[int, FunctionCall, ToolPauseException]] = []
+        paused_generator_ids: Set[int] = set()
         async_generator_results: List[Any] = []
-        non_async_generator_results: List[Any] = []
-
-        for result in results:
-            if isinstance(result, BaseException):
-                non_async_generator_results.append(result)
-                continue
-
-            function_call_success, function_call_timer, function_call, function_execution_result = result
-
-            # Check if this result contains an async generator
-            if isinstance(function_call.result, (AsyncGeneratorType, AsyncIterator)):
-                async_generator_results.append(result)
-            else:
-                non_async_generator_results.append(result)
-
-        # Process async generators with real-time event streaming using asyncio.Queue
         async_generator_outputs: Dict[int, Tuple[Any, str, Optional[BaseException]]] = {}
+        async_generator_result_ids: Dict[int, int] = {}
         event_queue: asyncio.Queue = asyncio.Queue()
-        active_generators_count: int = len(async_generator_results)
+        active_generators_count = 0
+        completed_generators_count = 0
+        child_run_ids: Dict[int, str] = {}
+        generator_tasks: List[asyncio.Task] = []
+        generator_task_ids: Dict[asyncio.Task, int] = {}
+        cancelled_generator_result_ids: Set[int] = set()
+        function_call_indices = {id(fc): index for index, fc in enumerate(function_calls_to_run)}
 
-        # Create background tasks for each async generator
         async def process_async_generator(result, generator_id):
             function_call_success, function_call_timer, function_call, function_execution_result = result
             function_call_output = ""
 
             try:
                 async for item in function_call.result:
+                    if generator_id not in child_run_ids and hasattr(item, "run_id") and item.run_id:
+                        child_run_ids[generator_id] = item.run_id
                     # This function yields agent/team/workflow run events
                     if isinstance(
                         item,
@@ -2761,36 +3078,321 @@ class Model(ABC):
                 # Store the final output for this generator
                 async_generator_outputs[generator_id] = (result, function_call_output, None)
 
+            except (ToolApprovalRequired, ToolCallDeferred) as e:
+                # Pause exceptions are control-flow signals, not errors: don't poison function_call.error
+                async_generator_outputs[generator_id] = (result, "", e)
             except Exception as e:
-                # Store the exception
+                function_call.error = str(e)
                 async_generator_outputs[generator_id] = (result, "", e)
 
             # Signal that this generator is done
             await event_queue.put(("GENERATOR_DONE", generator_id))
 
-        # Start all async generator tasks
-        generator_tasks = []
-        for i, result in enumerate(async_generator_results):
-            task = asyncio.create_task(process_async_generator(result, i))
+        def _start_async_generator(result) -> None:
+            nonlocal active_generators_count
+
+            generator_id = len(async_generator_results)
+            async_generator_results.append(result)
+            async_generator_result_ids[id(result)] = generator_id
+            active_generators_count += 1
+            task = asyncio.create_task(process_async_generator(result, generator_id))
             generator_tasks.append(task)
+            generator_task_ids[task] = generator_id
 
-        # Stream events from the queue as they arrive
-        completed_generators_count = 0
-        while completed_generators_count < active_generators_count:
+        def _record_generator_pause(generator_id: int) -> bool:
+            if generator_id in paused_generator_ids or generator_id not in async_generator_outputs:
+                return False
+
+            result, _, error = async_generator_outputs[generator_id]
+            if not _is_tool_pause_exception(error):
+                return False
+
+            _, _, function_call, _ = result
+            paused_generator_calls.append(
+                (
+                    function_call_indices[id(function_call)],
+                    function_call,
+                    cast(ToolPauseException, error),
+                )
+            )
+            paused_generator_ids.add(generator_id)
+            return True
+
+        _CHILD_CANCEL_TIMEOUT_SECONDS = 10.0
+
+        async def _cancel_pending_child_tasks(
+            tasks: List[asyncio.Task],
+            child_ids: Dict[int, str],
+        ) -> None:
+            from agno.run.cancel import acancel_run
+
+            for task in tasks:
+                task.cancel()
+
+            for c_run_id in child_ids.values():
+                try:
+                    await acancel_run(c_run_id)
+                except Exception:
+                    pass
+
             try:
-                event = await event_queue.get()
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_CHILD_CANCEL_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                log_warning(
+                    f"Child agent tasks did not finish within {_CHILD_CANCEL_TIMEOUT_SECONDS}s "
+                    "after cancellation signal; they will continue running in the background."
+                )
 
-                # Check if this is a completion signal
-                if isinstance(event, tuple) and event[0] == "GENERATOR_DONE":
-                    completed_generators_count += 1
+        async def _cancel_remaining_generators() -> None:
+            pending_tasks = [task for task in generator_tasks if not task.done()]
+            if not pending_tasks:
+                return
+
+            cancelled_generator_ids = [generator_task_ids[task] for task in pending_tasks]
+            await _cancel_pending_child_tasks(pending_tasks, child_run_ids)
+            await asyncio.sleep(0)
+            for generator_id in cancelled_generator_ids:
+                if generator_id in async_generator_outputs:
                     continue
 
-                # Yield the actual event
-                yield event
+                original_result = async_generator_results[generator_id]
+                _, function_call_timer, function_call, function_execution_result = original_result
+                function_call.error = _cancelled_tool_call_content(function_call)
+                cancelled_result = (False, function_call_timer, function_call, function_execution_result)
+                async_generator_results[generator_id] = cancelled_result
+                async_generator_result_ids.pop(id(original_result), None)
+                async_generator_result_ids[id(cancelled_result)] = generator_id
+                cancelled_generator_result_ids.add(id(cancelled_result))
+                for result_index, result in enumerate(results):
+                    if result is original_result:
+                        results[result_index] = cancelled_result
+                        break
 
-            except Exception as e:
-                log_error(f"Error processing async generator event: {str(e)}")
-                break
+        if function_calls_to_run:
+            task_to_index = {
+                asyncio.create_task(self.arun_function_call(fc)): index
+                for index, fc in enumerate(function_calls_to_run)
+            }
+            pending_function_tasks: Set[asyncio.Task] = set(task_to_index.keys())
+            event_get_task: Optional[asyncio.Task] = None
+
+            async def _drain_cancelled_function_tasks(tasks: List[asyncio.Task]) -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            async def _settle_pending_tasks_after_pause(tasks: List[asyncio.Task]) -> None:
+                ordered_tasks = sorted(tasks, key=lambda task: task_to_index[task])
+                pending_tasks = set(ordered_tasks)
+                task_results: Dict[asyncio.Task, Any] = {}
+                settle_deadline = asyncio.get_running_loop().time() + _TOOL_CALL_BATCH_SETTLE_TIMEOUT_SECONDS
+
+                while pending_tasks:
+                    timeout_remaining = settle_deadline - asyncio.get_running_loop().time()
+                    if timeout_remaining <= 0:
+                        break
+
+                    wait_timeout = min(0.1, timeout_remaining) if run_id else timeout_remaining
+                    done_tasks, pending_tasks = await asyncio.wait(
+                        pending_tasks,
+                        timeout=wait_timeout,
+                        return_when=asyncio.ALL_COMPLETED,
+                    )
+                    for settled_task in done_tasks:
+                        try:
+                            task_results[settled_task] = settled_task.result()
+                        except BaseException as exc:
+                            task_results[settled_task] = exc
+
+                    if pending_tasks and run_id:
+                        from agno.run.cancel import ais_cancelled
+
+                        if await ais_cancelled(run_id):
+                            raise RunCancelledException("Run cancelled while executing tool calls")
+
+                if pending_tasks:
+                    log_warning(
+                        f"Tool calls did not finish within {_TOOL_CALL_BATCH_SETTLE_TIMEOUT_SECONDS}s after a dynamic pause; "
+                        "unfinished calls will continue in the background."
+                    )
+
+                for settled_task in ordered_tasks:
+                    if settled_task in task_results:
+                        settled_result = task_results[settled_task]
+                    elif settled_task.done():
+                        try:
+                            settled_result = settled_task.result()
+                        except BaseException as exc:
+                            settled_result = exc
+                    elif settled_task.cancelled():
+                        settled_result = asyncio.CancelledError()
+                    else:
+                        settled_result = asyncio.CancelledError()
+
+                    result_index = task_to_index[settled_task]
+                    results[result_index] = settled_result
+                    if not isinstance(settled_result, BaseException) and isinstance(
+                        settled_result[0], (ToolApprovalRequired, ToolCallDeferred)
+                    ):
+                        _, _, function_call, _ = settled_result
+                        paused_function_calls.append((result_index, function_call, settled_result[0]))
+                        continue
+                    if not isinstance(settled_result, BaseException) and isinstance(
+                        settled_result[2].result, (AsyncGeneratorType, collections.abc.AsyncIterator)
+                    ):
+                        _start_async_generator(settled_result)
+
+            try:
+                while pending_function_tasks or completed_generators_count < active_generators_count:
+                    wait_tasks: Set[asyncio.Task] = set(pending_function_tasks)
+                    if completed_generators_count < active_generators_count:
+                        if event_get_task is None:
+                            event_get_task = asyncio.create_task(event_queue.get())
+                        wait_tasks.add(event_get_task)
+
+                    if not wait_tasks:
+                        break
+
+                    if run_id:
+                        done_tasks, _ = await asyncio.wait(wait_tasks, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                        if not done_tasks:
+                            from agno.run.cancel import ais_cancelled
+
+                            if await ais_cancelled(run_id):
+                                for pending_task in pending_function_tasks:
+                                    pending_task.cancel()
+                                if pending_function_tasks:
+                                    await _drain_cancelled_function_tasks(list(pending_function_tasks))
+                                    pending_function_tasks = set()
+                                await _cancel_remaining_generators()
+                                raise RunCancelledException("Run cancelled while executing tool calls")
+                            continue
+                    else:
+                        done_tasks, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                    pause_seen = False
+                    if event_get_task is not None and event_get_task in done_tasks:
+                        event = event_get_task.result()
+                        event_get_task = None
+                        if isinstance(event, tuple) and event[0] == "GENERATOR_DONE":
+                            completed_generators_count += 1
+                            generator_id = event[1]
+                            pause_seen = _record_generator_pause(generator_id) or pause_seen
+                        else:
+                            yield event
+
+                    done_function_tasks = done_tasks & pending_function_tasks
+                    pending_function_tasks -= done_function_tasks
+                    for task in sorted(done_function_tasks, key=lambda done_task: task_to_index[done_task]):
+                        result_index = task_to_index[task]
+                        try:
+                            result = task.result()
+                        except BaseException as exc:
+                            results[result_index] = exc
+                            continue
+
+                        results[result_index] = result
+                        function_call_success, _, function_call, _ = result
+                        if isinstance(function_call_success, (ToolApprovalRequired, ToolCallDeferred)):
+                            paused_function_calls.append((result_index, function_call, function_call_success))
+                            pause_seen = True
+                        elif isinstance(function_call.result, (AsyncGeneratorType, collections.abc.AsyncIterator)):
+                            _start_async_generator(result)
+
+                    if pause_seen:
+                        while not event_queue.empty():
+                            event = event_queue.get_nowait()
+                            if isinstance(event, tuple) and event[0] == "GENERATOR_DONE":
+                                completed_generators_count += 1
+                                generator_id = event[1]
+                                _record_generator_pause(generator_id)
+                            else:
+                                yield event
+
+                        if pending_function_tasks:
+                            await _settle_pending_tasks_after_pause(list(pending_function_tasks))
+                            pending_function_tasks = set()
+                        await _cancel_remaining_generators()
+                        await asyncio.sleep(0)
+                        break
+
+                    if run_id:
+                        from agno.run.cancel import ais_cancelled
+
+                        if await ais_cancelled(run_id):
+                            for pending_task in pending_function_tasks:
+                                pending_task.cancel()
+                            if pending_function_tasks:
+                                await _drain_cancelled_function_tasks(list(pending_function_tasks))
+                                pending_function_tasks = set()
+                            await _cancel_remaining_generators()
+                            raise RunCancelledException("Run cancelled while executing tool calls")
+            finally:
+                if event_get_task is not None:
+                    event_get_task.cancel()
+                    await asyncio.gather(event_get_task, return_exceptions=True)
+                if pending_function_tasks:
+                    for pending_task in pending_function_tasks:
+                        pending_task.cancel()
+                    await _drain_cancelled_function_tasks(list(pending_function_tasks))
+                await _cancel_remaining_generators()
+
+        for generator_id in list(async_generator_outputs):
+            _record_generator_pause(generator_id)
+
+        if paused_function_calls or paused_generator_calls:
+            for index, result in enumerate(results):
+                if isinstance(result, asyncio.CancelledError):
+                    cancelled_function_call = function_calls_to_run[index]
+                    cancelled_content = _cancelled_tool_call_content(cancelled_function_call)
+                    cancelled_function_call.error = cancelled_content
+                    cancelled_timer = Timer()
+                    cancelled_timer.start()
+                    cancelled_timer.stop()
+                    results[index] = (
+                        False,
+                        cancelled_timer,
+                        cancelled_function_call,
+                        FunctionExecutionResult(status="failure"),
+                    )
+
+        if paused_function_calls:
+            results = [
+                result
+                for result in results
+                if result is not None
+                and not isinstance(result, BaseException)
+                and not isinstance(result[0], (ToolApprovalRequired, ToolCallDeferred))
+            ]
+
+        if paused_generator_calls:
+            filtered_results = []
+            paused_results = []
+            for result in results:
+                if isinstance(result, BaseException):
+                    filtered_results.append(result)
+                    continue
+
+                _, _, function_call, _ = result
+                if isinstance(function_call.result, (AsyncGeneratorType, collections.abc.AsyncIterator)):
+                    generator_id = async_generator_result_ids.get(id(result))
+                    if generator_id is None:
+                        continue
+                    if generator_id not in async_generator_outputs:
+                        if id(result) in cancelled_generator_result_ids:
+                            filtered_results.append(result)
+                        continue
+
+                    _, _, error = async_generator_outputs[generator_id]
+                    if _is_tool_pause_exception(error):
+                        paused_results.append(result)
+                        continue
+
+                filtered_results.append(result)
+
+            filtered_results.extend(paused_results)
+            results = filtered_results
 
         # Now process all results (non-async generators and completed async generators)
         for i, original_result in enumerate(results):
@@ -2808,40 +3410,35 @@ class Model(ABC):
             # Check if this was an async generator that was already processed
             async_function_call_output = None
             if isinstance(function_call.result, (AsyncGeneratorType, collections.abc.AsyncIterator)):
-                # Find the corresponding processed result
-                async_gen_index = 0
-                for j, result in enumerate(results[: i + 1]):
-                    if not isinstance(result, BaseException):
-                        _, _, fc, _ = result
-                        if isinstance(fc.result, (AsyncGeneratorType, collections.abc.AsyncIterator)):
-                            if j == i:  # This is our async generator
-                                if async_gen_index in async_generator_outputs:
-                                    _, async_function_call_output, error = async_generator_outputs[async_gen_index]
-                                    if error:
-                                        # Re-raise cancellation — it is not an error
-                                        if isinstance(error, RunCancelledException):
-                                            raise error
-                                        # Handle async generator exceptions gracefully like sync generators
-                                        log_error(
-                                            f"Error while iterating async generator for {function_call.function.name}: {error}"
-                                        )
-                                        function_call.error = str(error)
-                                        function_call_success = False
-                                break
-                            async_gen_index += 1
+                generator_id = async_generator_result_ids.get(id(original_result))
+                if generator_id is not None and generator_id in async_generator_outputs:
+                    _, async_function_call_output, error = async_generator_outputs[generator_id]
+                    if error:
+                        if isinstance(error, RunCancelledException):
+                            raise error
+                        if _is_tool_pause_exception(error):
+                            function_call_success = error
+                        elif isinstance(error, AgentRunException):
+                            function_call_success = error
+                        else:
+                            # Handle async generator exceptions gracefully like sync generators
+                            log_error(
+                                f"Error while iterating async generator for {function_call.function.name}: {error}"
+                            )
+                            function_call.error = str(error)
+                            function_call_success = False
 
             updated_session_state = function_execution_result.updated_session_state
 
             # Handle AgentRunException
             stop_after_tool_call_from_exception = False
+            if isinstance(function_call_success, (ToolApprovalRequired, ToolCallDeferred)):
+                continue
+
             if isinstance(function_call_success, AgentRunException):
-                a_exc = function_call_success
-                # Update additional messages from function call
-                _handle_agent_exception(a_exc, additional_input)
-                # If stop_execution is True, mark that we should stop after this tool call
-                if a_exc.stop_execution:
-                    stop_after_tool_call_from_exception = True
-                # Set function call success to False if an exception occurred
+                stop_after_tool_call_from_exception = _handle_agent_exception_from_tool_call(
+                    function_call, function_call_success, additional_input
+                )
                 function_call_success = False
 
             # Process function call output
@@ -2885,6 +3482,14 @@ class Model(ABC):
                                 yield ModelResponse(content=str(item))
                 except RunCancelledException:
                     raise
+                except (ToolApprovalRequired, ToolCallDeferred) as pause_exc:
+                    yield _create_tool_call_paused_response(function_call, pause_exc)
+                    return
+                except AgentRunException as a_exc:
+                    stop_after_tool_call_from_exception = _handle_agent_exception_from_tool_call(
+                        function_call, a_exc, additional_input
+                    )
+                    function_call_success = False
                 except Exception as e:
                     log_error(
                         f"Error while iterating function result generator for {function_call.function.name}: {str(e)}"
@@ -2980,6 +3585,21 @@ class Model(ABC):
             # Add function call result to function call results
             function_call_results.append(function_call_result)
 
+        indexed_paused_calls = paused_function_calls + paused_generator_calls
+        if indexed_paused_calls:
+            paused_calls = [
+                (function_call, pause_exc)
+                for _, function_call, pause_exc in sorted(indexed_paused_calls, key=lambda item: item[0])
+            ]
+            yield _create_tool_calls_paused_response(paused_calls)
+            return
+
+        if first_static_pause_response is not None:
+            if first_static_pause_started is not None:
+                yield first_static_pause_started
+            yield first_static_pause_response
+            return
+
         # Add any additional messages at the end
         if additional_input:
             function_call_results.extend(additional_input)
@@ -3056,7 +3676,7 @@ class Model(ABC):
             # message with the media artifacts which throws error for some models
             media_message = Message(
                 role="user",
-                content="Take note of the following content",
+                content="[Tool output media attached]",
                 images=all_images if all_images else None,
                 videos=all_videos if all_videos else None,
                 audio=all_audio if all_audio else None,

@@ -7,7 +7,12 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel
 
-from agno.exceptions import ContextWindowExceededError, ModelAuthenticationError, ModelProviderError
+from agno.exceptions import (
+    ContextWindowExceededError,
+    ModelAuthenticationError,
+    ModelProviderError,
+    _describe_exception,
+)
 from agno.media import Audio
 from agno.models.base import Model
 from agno.models.message import Citations, Message, UrlCitation
@@ -25,7 +30,7 @@ try:
     from openai import OpenAI as OpenAIClient
     from openai.types import CompletionUsage
     from openai.types.chat import ChatCompletion, ChatCompletionAudio, ChatCompletionChunk
-    from openai.types.chat.chat_completion_chunk import ChoiceDelta, ChoiceDeltaToolCall
+    from openai.types.chat.chat_completion_chunk import ChoiceDelta
 except (ImportError, ModuleNotFoundError):
     raise ImportError("`openai` not installed. Please install using `pip install openai`")
 
@@ -447,8 +452,9 @@ class OpenAIChat(Model):
                 model_id=self.id,
             ) from e
         except APIConnectionError as e:
-            log_error(f"API connection error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
         except APIStatusError as e:
             log_error(f"API status error from OpenAI API: {str(e)}")
             try:
@@ -476,8 +482,9 @@ class OpenAIChat(Model):
             log_error(f"Model authentication error from OpenAI API: {str(e)}")
             raise e
         except Exception as e:
-            log_error(f"Error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke(
         self,
@@ -537,8 +544,9 @@ class OpenAIChat(Model):
                 model_id=self.id,
             ) from e
         except APIConnectionError as e:
-            log_error(f"API connection error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
         except APIStatusError as e:
             log_error(f"API status error from OpenAI API: {str(e)}")
             try:
@@ -566,8 +574,9 @@ class OpenAIChat(Model):
             log_error(f"Model authentication error from OpenAI API: {str(e)}")
             raise e
         except Exception as e:
-            log_error(f"Error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def invoke_stream(
         self,
@@ -624,8 +633,9 @@ class OpenAIChat(Model):
                 model_id=self.id,
             ) from e
         except APIConnectionError as e:
-            log_error(f"API connection error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
         except APIStatusError as e:
             log_error(f"API status error from OpenAI API: {str(e)}")
             try:
@@ -653,8 +663,9 @@ class OpenAIChat(Model):
             log_error(f"Model authentication error from OpenAI API: {str(e)}")
             raise e
         except Exception as e:
-            log_error(f"Error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke_stream(
         self,
@@ -713,8 +724,9 @@ class OpenAIChat(Model):
                 model_id=self.id,
             ) from e
         except APIConnectionError as e:
-            log_error(f"API connection error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
         except APIStatusError as e:
             log_error(f"API status error from OpenAI API: {str(e)}")
             try:
@@ -742,38 +754,74 @@ class OpenAIChat(Model):
             log_error(f"Model authentication error from OpenAI API: {str(e)}")
             raise e
         except Exception as e:
-            log_error(f"Error from OpenAI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     @staticmethod
-    def parse_tool_calls(tool_calls_data: List[ChoiceDeltaToolCall]) -> List[Dict[str, Any]]:
+    def parse_tool_calls(tool_calls_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Build tool calls from streamed tool call data.
 
-        Args:
-            tool_calls_data (List[ChoiceDeltaToolCall]): The tool call data to build from.
+        Each `tool_calls_data` element is either:
+          - a `ChoiceDeltaToolCall.model_dump()` dict (`_parse_provider_response_delta`
+            in this class), or
+          - a raw pydantic `ChoiceDeltaToolCall` (some `OpenAILike` subclasses still
+            assign `choice_delta.tool_calls` straight through — accept both so a
+            subclass override doesn't break the post-stream finalizer).
 
-        Returns:
-            List[Dict[str, Any]]: The built tool calls.
+        OpenAI emits each tool call as multiple chunks per `index`: the first chunk
+        carries `id`/`type` plus the initial slice of `function.arguments`; subsequent
+        chunks carry only the next `function.arguments` slice. We aggregate by
+        `index`, concatenating `function.arguments` across chunks. When the first
+        observed `index` is > 0 (rare — e.g. content moderation suppressed index=0)
+        internal padding entries are still well-formed (with an empty `function`
+        dict), then filtered out before returning so skipped indexes don't become
+        executable placeholder tool calls.
+
+        Returns one assembled tool call per `index`.
         """
+
+        def _extract(tc: Any) -> tuple[int, Optional[str], Optional[str], Optional[str], Optional[str]]:
+            if isinstance(tc, dict):
+                _idx = tc.get("index") or 0
+                _id = tc.get("id")
+                _type = tc.get("type")
+                _fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+                _name = _fn.get("name") if _fn else None
+                _args = _fn.get("arguments") if _fn else None
+            else:
+                _idx = getattr(tc, "index", None) or 0
+                _id = getattr(tc, "id", None)
+                _type = getattr(tc, "type", None)
+                _fn = getattr(tc, "function", None)
+                _name = getattr(_fn, "name", None) if _fn is not None else None
+                _args = getattr(_fn, "arguments", None) if _fn is not None else None
+            return _idx, _id, _type, _name, _args
+
+        def _empty_entry() -> Dict[str, Any]:
+            return {"id": None, "type": None, "function": {"name": "", "arguments": ""}}
+
         tool_calls: List[Dict[str, Any]] = []
         for _tool_call in tool_calls_data:
-            _index = _tool_call.index or 0
-            _tool_call_id = _tool_call.id
-            _tool_call_type = _tool_call.type
-            _function_name = _tool_call.function.name if _tool_call.function else None
-            _function_arguments = _tool_call.function.arguments if _tool_call.function else None
+            _index, _tool_call_id, _tool_call_type, _function_name, _function_arguments = _extract(_tool_call)
 
-            if len(tool_calls) <= _index:
-                tool_calls.extend([{} for _ in range(_index - len(tool_calls) + 1)])
+            # Pad with well-formed placeholders (not bare {}) so downstream access of
+            # `tc["function"]["name"]` works for skipped indexes too.
+            while len(tool_calls) <= _index:
+                tool_calls.append(_empty_entry())
+
             tool_call_entry = tool_calls[_index]
-            if not tool_call_entry:
+            if (
+                tool_call_entry["id"] is None
+                and tool_call_entry["type"] is None
+                and not tool_call_entry["function"]["name"]
+            ):
+                # First fragment for this index — populate base fields.
                 tool_call_entry["id"] = _tool_call_id
                 tool_call_entry["type"] = _tool_call_type
-                tool_call_entry["function"] = {
-                    "name": _function_name or "",
-                    "arguments": _function_arguments or "",
-                }
+                tool_call_entry["function"]["name"] = _function_name or ""
+                tool_call_entry["function"]["arguments"] = _function_arguments or ""
             else:
                 if _function_name:
                     tool_call_entry["function"]["name"] = _function_name
@@ -783,7 +831,11 @@ class OpenAIChat(Model):
                     tool_call_entry["id"] = _tool_call_id
                 if _tool_call_type:
                     tool_call_entry["type"] = _tool_call_type
-        return tool_calls
+        return [
+            tool_call
+            for tool_call in tool_calls
+            if tool_call.get("id") or tool_call.get("type") or tool_call.get("function", {}).get("name")
+        ]
 
     def _should_collect_metrics(self, response: ChatCompletionChunk) -> bool:
         """
@@ -932,8 +984,17 @@ class OpenAIChat(Model):
                         model_response.provider_data["model_extra"] = response_delta.model_extra
 
                 # Add tool calls
+                # Convert pydantic `ChoiceDeltaToolCall` chunks to plain dicts up-front
+                # so the rest of the pipeline (base.py snapshot synthesis,
+                # `parse_tool_calls` accumulation, downstream consumers) can operate
+                # against the documented `ModelResponse.tool_calls: List[Dict[str, Any]]`
+                # contract without per-call isinstance branching. Defensively pass
+                # already-dict items through so third-party shims / mocks / future
+                # SDK versions that emit dicts don't crash on `.model_dump()`.
                 if choice_delta.tool_calls is not None:
-                    model_response.tool_calls = choice_delta.tool_calls  # type: ignore
+                    model_response.tool_calls = [
+                        t if isinstance(t, dict) else t.model_dump() for t in choice_delta.tool_calls
+                    ]
 
                 # Add citations (streaming deltas surface annotations as dicts via model_extra)
                 annotations = getattr(choice_delta, "annotations", None)

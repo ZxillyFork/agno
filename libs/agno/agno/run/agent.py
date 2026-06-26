@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from time import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union, cast
 
 from pydantic import BaseModel, Field
 
@@ -160,9 +160,11 @@ class RunEvent(str, Enum):
     post_hook_started = "PostHookStarted"
     post_hook_completed = "PostHookCompleted"
 
+    tool_call_start = "ToolCallStart"
     tool_call_started = "ToolCallStarted"
     tool_call_completed = "ToolCallCompleted"
     tool_call_error = "ToolCallError"
+    tool_call_args_delta = "ToolCallArgsDelta"
 
     reasoning_started = "ReasoningStarted"
     reasoning_step = "ReasoningStep"
@@ -413,9 +415,24 @@ class ReasoningCompletedEvent(BaseAgentRunEvent):
 
 
 @dataclass
+class ToolCallStartEvent(BaseAgentRunEvent):
+    event: str = RunEvent.tool_call_start.value
+    tool_call_id: Optional[str] = None
+    tool_name: Optional[str] = None
+
+
+@dataclass
 class ToolCallStartedEvent(BaseAgentRunEvent):
     event: str = RunEvent.tool_call_started.value
     tool: Optional[ToolExecution] = None
+
+
+@dataclass
+class ToolCallArgsDeltaEvent(BaseAgentRunEvent):
+    event: str = RunEvent.tool_call_args_delta.value
+    tool_call_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    delta: Optional[str] = None
 
 
 @dataclass
@@ -543,7 +560,9 @@ RunOutputEvent = Union[
     MemoryUpdateCompletedEvent,
     SessionSummaryStartedEvent,
     SessionSummaryCompletedEvent,
+    ToolCallStartEvent,
     ToolCallStartedEvent,
+    ToolCallArgsDeltaEvent,
     ToolCallCompletedEvent,
     ToolCallErrorEvent,
     ParserModelResponseStartedEvent,
@@ -583,7 +602,9 @@ RUN_EVENT_TYPE_REGISTRY = {
     RunEvent.memory_update_completed.value: MemoryUpdateCompletedEvent,
     RunEvent.session_summary_started.value: SessionSummaryStartedEvent,
     RunEvent.session_summary_completed.value: SessionSummaryCompletedEvent,
+    RunEvent.tool_call_start.value: ToolCallStartEvent,
     RunEvent.tool_call_started.value: ToolCallStartedEvent,
+    RunEvent.tool_call_args_delta.value: ToolCallArgsDeltaEvent,
     RunEvent.tool_call_completed.value: ToolCallCompletedEvent,
     RunEvent.tool_call_error.value: ToolCallErrorEvent,
     RunEvent.parser_model_response_started.value: ParserModelResponseStartedEvent,
@@ -848,12 +869,15 @@ class RunOutput:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunOutput":
-        if "run" in data:
-            data = data.pop("run")
+        inner = data.get("run")
+        data = dict(inner) if isinstance(inner, dict) else dict(data)
 
         events = data.pop("events", None)
-        final_events = []
+        final_events: List[RunOutputEvent] = []
         for event in events or []:
+            if isinstance(event, BaseRunOutputEvent):
+                final_events.append(cast(RunOutputEvent, event))
+                continue
             if "agent_id" in event:
                 event = run_output_event_from_dict(event)
             else:
@@ -870,8 +894,10 @@ class RunOutput:
         citations = data.pop("citations", None)
         citations = Citations.model_validate(citations) if citations else None
 
-        tools = data.pop("tools", [])
-        tools = [ToolExecution.from_dict(tool) for tool in tools] if tools else None
+        tools_data = data.pop("tools", None)
+        tools = None
+        if tools_data is not None:
+            tools = [tool if isinstance(tool, ToolExecution) else ToolExecution.from_dict(tool) for tool in tools_data]
 
         # Handle requirements
         requirements_data = data.pop("requirements", None)
@@ -883,7 +909,7 @@ class RunOutput:
                     requirements_list.append(item)
                 elif isinstance(item, dict):
                     requirements_list.append(RunRequirement.from_dict(item))
-            requirements = requirements_list if requirements_list else None
+            requirements = requirements_list
 
         images = reconstruct_images(data.pop("images", []))
         videos = reconstruct_videos(data.pop("videos", []))

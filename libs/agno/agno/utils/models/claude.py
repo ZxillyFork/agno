@@ -720,5 +720,10 @@ def format_tools_for_model(tools: Optional[List[Dict[str, Any]]] = None) -> Opti
         if strict_mode is True:
             tool["strict"] = True
 
+        # Enable fine-grained tool streaming so that large tool parameters (e.g. file
+        # contents) are streamed incrementally instead of buffered server-side until
+        # the entire value is generated.
+        tool["eager_input_streaming"] = True
+
         parsed_tools.append(tool)
     return parsed_tools

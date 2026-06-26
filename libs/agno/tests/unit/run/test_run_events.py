@@ -87,6 +87,32 @@ def test_workflow_run_events():
     assert json.loads(event.to_json(indent=None)) == expected_json_dict
 
 
+def test_tool_call_events_from_dict_accept_hydrated_tool_execution():
+    from agno.models.response import ToolExecution
+    from agno.run.agent import ToolCallCompletedEvent, ToolCallStartedEvent
+
+    started_tool = ToolExecution(tool_call_id="call-1", tool_name="lookup")
+    completed_tool = ToolExecution(tool_call_id="call-1", tool_name="lookup", result="done")
+
+    started = ToolCallStartedEvent.from_dict(
+        {
+            "event": "ToolCallStarted",
+            "run_id": "run-1",
+            "tool": started_tool,
+        }
+    )
+    completed = ToolCallCompletedEvent.from_dict(
+        {
+            "event": "ToolCallCompleted",
+            "run_id": "run-1",
+            "tool": completed_tool,
+        }
+    )
+
+    assert started.tool is started_tool
+    assert completed.tool is completed_tool
+
+
 def test_agent_session_state_in_run_output():
     """Test that RunOutput includes session_state field."""
     from agno.run.agent import RunOutput
@@ -213,6 +239,20 @@ def test_team_session_state_in_run_output():
     assert reconstructed.session_state == {"phase": "planning", "tasks": 3}
 
 
+def test_run_outputs_from_dict_handle_null_run_wrapper():
+    """Run payloads may include a null run wrapper while keeping fields at the top level."""
+    from agno.run.agent import RunOutput
+    from agno.run.team import TeamRunOutput
+
+    run_output = RunOutput.from_dict({"run": None, "run_id": "run_123", "content": "done"})
+    team_output = TeamRunOutput.from_dict({"run": None, "run_id": "team_123", "team_id": "team_456"})
+
+    assert run_output.run_id == "run_123"
+    assert run_output.content == "done"
+    assert team_output.run_id == "team_123"
+    assert team_output.team_id == "team_456"
+
+
 def test_team_session_state_in_completed_event():
     """Test that TeamRunCompletedEvent includes session_state field."""
     from agno.run.team import TeamRunOutput
@@ -280,6 +320,202 @@ def test_api_schema_session_state():
     team_api_response = team_schema.model_dump(exclude_none=True)
     assert "session_state" in team_api_response
     assert team_api_response["session_state"] == {"team_api_data": "value"}
+
+
+def test_api_schemas_include_requirements():
+    """Paused run API schemas preserve requirements for continue_run clients."""
+    from agno.models.response import ToolExecution
+    from agno.os.schema import RunSchema, TeamRunSchema
+    from agno.run.agent import RunOutput
+    from agno.run.requirement import RunRequirement
+    from agno.run.team import TeamRunOutput
+
+    requirement = RunRequirement(
+        tool_execution=ToolExecution(
+            tool_call_id="call-1",
+            tool_name="approve_me",
+            tool_args={"x": 1},
+            approval_type="required",
+            requires_confirmation=True,
+        )
+    )
+    requirement.confirm(metadata={"approver": "admin"})
+
+    run_schema = RunSchema.from_dict(RunOutput(run_id="run-1", requirements=[requirement]).to_dict())
+    team_schema = TeamRunSchema.from_dict(TeamRunOutput(run_id="team-run-1", requirements=[requirement]).to_dict())
+    hydrated_run_schema = RunSchema.from_dict({"run_id": "run-2", "requirements": [requirement]})
+    hydrated_team_schema = TeamRunSchema.from_dict({"run_id": "team-run-2", "requirements": [requirement]})
+
+    assert run_schema.requirements is not None
+    assert run_schema.requirements[0]["approval_metadata"] == {"approver": "admin"}
+    assert team_schema.requirements is not None
+    assert team_schema.requirements[0]["approval_metadata"] == {"approver": "admin"}
+    assert hydrated_run_schema.requirements is not None
+    assert hydrated_run_schema.requirements[0]["approval_metadata"] == {"approver": "admin"}
+    assert hydrated_team_schema.requirements is not None
+    assert hydrated_team_schema.requirements[0]["approval_metadata"] == {"approver": "admin"}
+
+
+def test_run_output_from_dict_is_idempotent_and_accepts_hydrated_tools_and_events():
+    from agno.models.response import ToolExecution
+    from agno.run.agent import RunContinuedEvent, RunOutput
+    from agno.run.requirement import RunRequirement
+
+    tool_execution = ToolExecution(tool_call_id="call-1", tool_name="lookup", result="ok")
+    requirement = RunRequirement(tool_execution=tool_execution)
+    event = RunContinuedEvent(run_id="run-1", agent_id="agent-1")
+    payload = {
+        "run_id": "run-1",
+        "agent_id": "agent-1",
+        "tools": [tool_execution],
+        "requirements": [requirement],
+        "events": [event],
+    }
+
+    first = RunOutput.from_dict(payload)
+    second = RunOutput.from_dict(payload)
+
+    assert payload["tools"] == [tool_execution]
+    assert payload["requirements"] == [requirement]
+    assert payload["events"] == [event]
+    assert first.tools[0] is tool_execution
+    assert second.tools[0] is tool_execution
+    assert first.events[0] is event
+
+
+def test_team_run_output_from_dict_is_idempotent_and_accepts_hydrated_nested_objects():
+    from agno.models.response import ToolExecution
+    from agno.run.agent import RunOutput
+    from agno.run.requirement import RunRequirement
+    from agno.run.team import RunCompletedEvent, TeamRunOutput
+
+    tool_execution = ToolExecution(tool_call_id="call-1", tool_name="lookup", result="ok")
+    requirement = RunRequirement(tool_execution=tool_execution)
+    member_run = RunOutput(run_id="member-run-1", agent_id="agent-1", content="done")
+    event = RunCompletedEvent(run_id="team-run-1", team_id="team-1", member_responses=[member_run])
+    payload = {
+        "run_id": "team-run-1",
+        "team_id": "team-1",
+        "tools": [tool_execution],
+        "requirements": [requirement],
+        "member_responses": [member_run],
+        "events": [event],
+    }
+
+    first = TeamRunOutput.from_dict(payload)
+    second = TeamRunOutput.from_dict(payload)
+
+    assert payload["tools"] == [tool_execution]
+    assert payload["requirements"] == [requirement]
+    assert payload["member_responses"] == [member_run]
+    assert payload["events"] == [event]
+    assert first.tools[0] is tool_execution
+    assert second.member_responses[0] is member_run
+    assert first.events[0] is event
+
+
+def test_team_run_output_from_dict_unwraps_run_payload():
+    from agno.run.team import TeamRunOutput
+
+    payload = {"run": TeamRunOutput(run_id="team-run-1", team_id="team-1", content="done").to_dict()}
+
+    restored = TeamRunOutput.from_dict(payload)
+
+    assert restored.run_id == "team-run-1"
+    assert restored.team_id == "team-1"
+    assert restored.content == "done"
+
+
+def test_team_run_output_from_dict_parses_wrapped_agent_member_response():
+    from agno.run.agent import RunOutput
+    from agno.run.team import TeamRunOutput
+
+    member_run = RunOutput(run_id="member-run-1", agent_id="agent-1", content="done")
+    restored = TeamRunOutput.from_dict(
+        {
+            "run_id": "team-run-1",
+            "session_id": "session-1",
+            "member_responses": [{"run": member_run.to_dict()}],
+        }
+    )
+
+    assert isinstance(restored.member_responses[0], RunOutput)
+    assert restored.member_responses[0].agent_id == "agent-1"
+
+
+def test_team_run_output_from_dict_parses_anonymous_agent_member_response():
+    from agno.run.agent import RunOutput
+    from agno.run.team import TeamRunOutput
+
+    member_run = RunOutput(run_id="member-run-1", content="done")
+    restored = TeamRunOutput.from_dict(
+        {
+            "run_id": "team-run-1",
+            "session_id": "session-1",
+            "member_responses": [member_run.to_dict()],
+        }
+    )
+
+    assert isinstance(restored.member_responses[0], RunOutput)
+    assert restored.member_responses[0].run_id == "member-run-1"
+
+
+def test_team_run_output_from_dict_preserves_anonymous_team_member_response():
+    from agno.run.team import TeamRunOutput
+
+    member_run = TeamRunOutput(run_id="member-team-run", content="done")
+    restored = TeamRunOutput.from_dict(
+        {
+            "run_id": "team-run-1",
+            "team_id": "team-1",
+            "member_responses": [member_run.to_dict()],
+        }
+    )
+
+    assert isinstance(restored.member_responses[0], TeamRunOutput)
+    assert restored.member_responses[0].run_id == "member-team-run"
+
+
+def test_run_output_from_dict_preserves_explicit_empty_requirements():
+    from agno.run.agent import RunOutput
+    from agno.run.team import TeamRunOutput
+
+    restored = RunOutput.from_dict(RunOutput(run_id="run-1", requirements=[]).to_dict())
+    restored_team = TeamRunOutput.from_dict(TeamRunOutput(run_id="team-run-1", requirements=[]).to_dict())
+
+    assert restored.requirements == []
+    assert restored_team.requirements == []
+
+
+def test_run_output_from_dict_preserves_explicit_empty_tools():
+    from agno.run.agent import RunOutput
+    from agno.run.team import TeamRunOutput
+
+    restored = RunOutput.from_dict(RunOutput(run_id="run-1", tools=[]).to_dict())
+    restored_team = TeamRunOutput.from_dict(TeamRunOutput(run_id="team-run-1", tools=[]).to_dict())
+
+    assert restored.tools == []
+    assert restored_team.tools == []
+
+
+def test_team_event_from_dict_accepts_hydrated_member_responses_without_mutating_payload():
+    from agno.run.agent import RunOutput
+    from agno.run.team import RunCompletedEvent
+
+    member_run = RunOutput(run_id="member-run-1", agent_id="agent-1")
+    payload = {
+        "event": "TeamRunCompleted",
+        "run_id": "team-run-1",
+        "team_id": "team-1",
+        "member_responses": [member_run],
+    }
+
+    restored = RunCompletedEvent.from_dict(payload)
+    restored_again = RunCompletedEvent.from_dict(payload)
+
+    assert payload["member_responses"] == [member_run]
+    assert restored.member_responses[0] is member_run
+    assert restored_again.member_responses[0] is member_run
 
 
 def test_custom_event_subclass_serialization():
@@ -463,3 +699,17 @@ def test_requirements_in_run_paused_event():
     assert reconstructed.requirements[0].tool_execution.tool_name == "get_the_weather"
     assert reconstructed.requirements[0].tool_execution.requires_confirmation is True
     assert reconstructed.requirements[0].needs_confirmation is True
+
+
+def test_os_run_schemas_preserve_empty_requirements_and_tools():
+    from agno.os.schema import RunSchema, TeamRunSchema
+    from agno.run.agent import RunOutput
+    from agno.run.team import TeamRunOutput
+
+    run_output = RunOutput(run_id="run-1", requirements=[], tools=[])
+    team_run_output = TeamRunOutput(run_id="team-run-1", requirements=[], tools=[])
+
+    assert RunSchema.from_dict(run_output.to_dict()).requirements == []
+    assert RunSchema.from_dict(run_output.to_dict()).tools == []
+    assert TeamRunSchema.from_dict(team_run_output.to_dict()).requirements == []
+    assert TeamRunSchema.from_dict(team_run_output.to_dict()).tools == []

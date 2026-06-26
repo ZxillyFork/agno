@@ -18,6 +18,8 @@ Test cases per provider:
   5. Empty strings don't overwrite valid names (LiteLLM/Claude specific)
 """
 
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -61,13 +63,7 @@ class _MockHFFunction:
 
 
 class _MockHFToolCall:
-    """
-    Minimal mock for huggingface ChatCompletionStreamOutputDeltaToolCall.
-
-    HuggingFace's parse_tool_calls receives List[ChatCompletionStreamOutputDeltaToolCall]
-    where each element is *itself* iterable/subscriptable — the code does tool_call[0]
-    at line ~385, so each item in tool_calls_data must be a list wrapping the real object.
-    """
+    """Minimal mock for huggingface ChatCompletionStreamOutputDeltaToolCall."""
 
     def __init__(
         self,
@@ -89,9 +85,8 @@ def _hf_chunk(
     type: Optional[str] = None,
     name: Optional[str] = None,
     arguments: Optional[str] = None,
-) -> List[_MockHFToolCall]:
-    """Wrap a mock HF tool call in the list that parse_tool_calls expects as one element."""
-    return [_MockHFToolCall(index=index, id=id, type=type, name=name, arguments=arguments)]
+) -> _MockHFToolCall:
+    return _MockHFToolCall(index=index, id=id, type=type, name=name, arguments=arguments)
 
 
 def _cerebras_chunk(
@@ -162,6 +157,8 @@ def _groq_parse(chunks):
 
 
 def _huggingface_parse(chunks):
+    _ensure_fake_huggingface_hub()
+
     from agno.models.huggingface.huggingface import HuggingFace
 
     return HuggingFace.parse_tool_calls(chunks)
@@ -185,6 +182,30 @@ def _litellm_parse(chunks):
     from agno.models.litellm.chat import LiteLLM
 
     return LiteLLM.parse_tool_calls(chunks)
+
+
+def _ensure_fake_huggingface_hub() -> None:
+    if "huggingface_hub" in sys.modules:
+        return
+
+    fake_hub = ModuleType("huggingface_hub")
+    for name in [
+        "AsyncInferenceClient",
+        "ChatCompletionInputStreamOptions",
+        "ChatCompletionOutput",
+        "ChatCompletionOutputMessage",
+        "ChatCompletionStreamOutput",
+        "ChatCompletionStreamOutputDelta",
+        "ChatCompletionStreamOutputDeltaToolCall",
+        "InferenceClient",
+    ]:
+        setattr(fake_hub, name, type(name, (), {}))
+
+    fake_errors = ModuleType("huggingface_hub.errors")
+    fake_errors.InferenceTimeoutError = type("InferenceTimeoutError", (Exception,), {})
+
+    sys.modules["huggingface_hub"] = fake_hub
+    sys.modules["huggingface_hub.errors"] = fake_errors
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +257,30 @@ def _parse(provider: str, chunks: List[Any]) -> List[Dict[str, Any]]:
         "litellm": _litellm_parse,
     }
     return dispatch[provider](chunks)
+
+
+def test_huggingface_stream_delta_tool_calls_are_single_layer() -> None:
+    _ensure_fake_huggingface_hub()
+
+    from agno.models.huggingface.huggingface import HuggingFace
+
+    tool_calls = [
+        _MockHFToolCall(
+            index=0,
+            id="call_1",
+            type="function",
+            name="get_weather",
+            arguments='{"city":"Paris"}',
+        )
+    ]
+    response_delta = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(role="assistant", content=None, tool_calls=tool_calls))],
+        usage=None,
+    )
+
+    model_response = HuggingFace.__new__(HuggingFace)._parse_provider_response_delta(response_delta)
+
+    assert model_response.tool_calls == tool_calls
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from time import time
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union, cast
 
 from pydantic import BaseModel
 
@@ -21,6 +21,18 @@ from agno.utils.media import (
     reconstruct_response_audio,
     reconstruct_videos,
 )
+
+
+def _parse_member_run_response(response: Any):
+    if isinstance(response, (RunOutput, TeamRunOutput)):
+        return response
+    if isinstance(response, dict):
+        wrapped_response = response.get("run")
+        response_data = wrapped_response if isinstance(wrapped_response, dict) else response
+        if "team_id" not in response_data:
+            return RunOutput.from_dict(response)
+        return TeamRunOutput.from_dict(response)
+    raise TypeError(f"Unsupported member response type: {type(response).__name__}")
 
 
 @dataclass
@@ -144,9 +156,11 @@ class TeamRunEvent(str, Enum):
     post_hook_started = "TeamPostHookStarted"
     post_hook_completed = "TeamPostHookCompleted"
 
+    tool_call_start = "TeamToolCallStart"
     tool_call_started = "TeamToolCallStarted"
     tool_call_completed = "TeamToolCallCompleted"
     tool_call_error = "TeamToolCallError"
+    tool_call_args_delta = "TeamToolCallArgsDelta"
 
     reasoning_started = "TeamReasoningStarted"
     reasoning_step = "TeamReasoningStep"
@@ -210,16 +224,13 @@ class BaseTeamRunEvent(BaseRunOutputEvent):
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BaseTeamRunEvent":
+        data = dict(data)
         member_responses = data.pop("member_responses", None)
         event = super().from_dict(data)
 
         member_responses_final = []
         for response in member_responses or []:
-            if "agent_id" in response:
-                run_response_parsed = RunOutput.from_dict(response)
-            else:
-                run_response_parsed = TeamRunOutput.from_dict(response)  # type: ignore
-            member_responses_final.append(run_response_parsed)
+            member_responses_final.append(_parse_member_run_response(response))
 
         if member_responses_final:
             event.member_responses = member_responses_final
@@ -413,9 +424,24 @@ class ReasoningCompletedEvent(BaseTeamRunEvent):
 
 
 @dataclass
+class ToolCallStartEvent(BaseTeamRunEvent):
+    event: str = TeamRunEvent.tool_call_start.value
+    tool_call_id: Optional[str] = None
+    tool_name: Optional[str] = None
+
+
+@dataclass
 class ToolCallStartedEvent(BaseTeamRunEvent):
     event: str = TeamRunEvent.tool_call_started.value
     tool: Optional[ToolExecution] = None
+
+
+@dataclass
+class ToolCallArgsDeltaEvent(BaseTeamRunEvent):
+    event: str = TeamRunEvent.tool_call_args_delta.value
+    tool_call_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    delta: Optional[str] = None
 
 
 @dataclass
@@ -647,7 +673,9 @@ TeamRunOutputEvent = Union[
     MemoryUpdateCompletedEvent,
     SessionSummaryStartedEvent,
     SessionSummaryCompletedEvent,
+    ToolCallStartEvent,
     ToolCallStartedEvent,
+    ToolCallArgsDeltaEvent,
     ToolCallCompletedEvent,
     ToolCallErrorEvent,
     ParserModelResponseStartedEvent,
@@ -691,7 +719,9 @@ TEAM_RUN_EVENT_TYPE_REGISTRY = {
     TeamRunEvent.memory_update_completed.value: MemoryUpdateCompletedEvent,
     TeamRunEvent.session_summary_started.value: SessionSummaryStartedEvent,
     TeamRunEvent.session_summary_completed.value: SessionSummaryCompletedEvent,
+    TeamRunEvent.tool_call_start.value: ToolCallStartEvent,
     TeamRunEvent.tool_call_started.value: ToolCallStartedEvent,
+    TeamRunEvent.tool_call_args_delta.value: ToolCallArgsDeltaEvent,
     TeamRunEvent.tool_call_completed.value: ToolCallCompletedEvent,
     TeamRunEvent.tool_call_error.value: ToolCallErrorEvent,
     TeamRunEvent.parser_model_response_started.value: ParserModelResponseStartedEvent,
@@ -841,6 +871,7 @@ class TeamRunOutput:
                 "followups",
             ]
         }
+        _dict["team_id"] = self.team_id
         if self.events is not None:
             _dict["events"] = [e.to_dict() for e in self.events]
 
@@ -930,9 +961,15 @@ class TeamRunOutput:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TeamRunOutput":
+        inner = data.get("run")
+        data = dict(inner) if isinstance(inner, dict) else dict(data)
+
         events = data.pop("events", None)
-        final_events = []
+        final_events: List[Union[RunOutputEvent, TeamRunOutputEvent]] = []
         for event in events or []:
+            if isinstance(event, BaseRunOutputEvent):
+                final_events.append(cast(Union[RunOutputEvent, TeamRunOutputEvent], event))
+                continue
             if "agent_id" in event:
                 # Use the factory from response.py for agent events
                 from agno.run.agent import run_output_event_from_dict
@@ -950,10 +987,7 @@ class TeamRunOutput:
         parsed_member_responses: List[Union["TeamRunOutput", RunOutput]] = []
         if member_responses:
             for response in member_responses:
-                if "agent_id" in response:
-                    parsed_member_responses.append(RunOutput.from_dict(response))
-                else:
-                    parsed_member_responses.append(cls.from_dict(response))
+                parsed_member_responses.append(_parse_member_run_response(response))
 
         additional_input = data.pop("additional_input", None)
         if additional_input is not None:
@@ -976,8 +1010,10 @@ class TeamRunOutput:
         audio = reconstruct_audio_list(data.pop("audio", []))
         files = reconstruct_files(data.pop("files", []))
 
-        tools = data.pop("tools", [])
-        tools = [ToolExecution.from_dict(tool) for tool in tools] if tools else None
+        tools_data = data.pop("tools", None)
+        tools = None
+        if tools_data is not None:
+            tools = [tool if isinstance(tool, ToolExecution) else ToolExecution.from_dict(tool) for tool in tools_data]
 
         requirements_data = data.pop("requirements", None)
         requirements = None
