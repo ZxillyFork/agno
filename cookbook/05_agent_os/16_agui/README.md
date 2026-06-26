@@ -16,6 +16,7 @@ default empty prefix those routes are `POST /agui` and `GET /status`.
 |---|---|
 | `basic.py` | Mount one agent at the default `/agui` and `/status` routes. |
 | `agent_with_tools.py` | Contrast a Python backend tool with a frontend-supplied external-execution tool. |
+| `agent_with_silent_tools.py` | Suppress verbose pause messages for frontend-executed tools. |
 | `structured_output.py` | Stream a response constrained by a Pydantic output schema. |
 | `reasoning_agent.py` | Translate Agno reasoning lifecycle events into AG-UI reasoning events. |
 | `agent_with_media.py` | Pass AG-UI image, audio, video, and document parts to Gemini. |
@@ -44,6 +45,7 @@ Start one example at a time; every standalone server uses port 7777:
 ```bash
 .venvs/demo/bin/python cookbook/05_agent_os/16_agui/basic.py
 .venvs/demo/bin/python cookbook/05_agent_os/16_agui/agent_with_tools.py
+.venvs/demo/bin/python cookbook/05_agent_os/16_agui/agent_with_silent_tools.py
 .venvs/demo/bin/python cookbook/05_agent_os/16_agui/structured_output.py
 .venvs/demo/bin/python cookbook/05_agent_os/16_agui/reasoning_agent.py
 .venvs/demo/bin/python cookbook/05_agent_os/16_agui/agent_with_media.py
@@ -64,6 +66,7 @@ endpoint:
 |---|---|---|
 | `basic.py` | `http://localhost:7777/agui` | `http://localhost:7777/status` |
 | `agent_with_tools.py` | `http://localhost:7777/tools/agui` | `http://localhost:7777/tools/status` |
+| `agent_with_silent_tools.py` | `http://localhost:7777/agui` | `http://localhost:7777/status` |
 | `structured_output.py` | `http://localhost:7777/structured-output/agui` | `http://localhost:7777/structured-output/status` |
 | `reasoning_agent.py` | `http://localhost:7777/reasoning/agui` | `http://localhost:7777/reasoning/status` |
 | `agent_with_media.py` | `http://localhost:7777/media/agui` | `http://localhost:7777/media/status` |

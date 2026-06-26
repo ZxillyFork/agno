@@ -112,3 +112,21 @@
 **Result:** Completed successfully in 5s.
 
 ---
+
+### dynamic_approval_required.py
+
+**Status:** PASS
+**Tier:** untagged
+**Description:** Demonstrates dynamic approval raised by a tool for protected file paths.
+**Result:** Static validation passed; protected `.env` paths now trigger the approval branch.
+
+---
+
+### dynamic_call_deferred.py
+
+**Status:** PASS
+**Tier:** untagged
+**Description:** Demonstrates dynamic call deferral raised by a tool when external execution is required.
+**Result:** Static validation passed.
+
+---

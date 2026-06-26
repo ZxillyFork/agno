@@ -47,6 +47,18 @@ tool message resumed the same thread and completed with
 
 ---
 
+### agent_with_silent_tools.py
+
+**Status:** PASS
+
+**Test mode:** STATIC
+
+**Description:** Validated the AG-UI server and its frontend-executed tool configured with `external_execution_silent=True`.
+
+**Result:** The cookbook imports successfully and exposes the standard `/agui` and `/status` routes on port 7777.
+
+---
+
 ### structured_output.py
 
 **Status:** PASS
