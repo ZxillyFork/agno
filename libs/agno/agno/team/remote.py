@@ -1,13 +1,27 @@
 import json
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Literal, Optional, Sequence, Tuple, Union, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+    overload,
+)
 
 from pydantic import BaseModel
 
 from agno.media import Audio, File, Image, Video
 from agno.models.base import Model
 from agno.models.message import Message
+from agno.models.response import ToolExecution
 from agno.remote.base import BaseRemote, RemoteDb, RemoteKnowledge
-from agno.run.agent import RunOutputEvent
+from agno.run.requirement import RunRequirement
 from agno.run.team import TeamRunOutput, TeamRunOutputEvent
 from agno.utils.agent import validate_input
 from agno.utils.log import log_warning
@@ -273,7 +287,7 @@ class RemoteTeam(BaseRemote):
         **kwargs: Any,
     ) -> Union[
         TeamRunOutput,
-        AsyncIterator[RunOutputEvent],
+        AsyncIterator[TeamRunOutputEvent],
     ]:
         validated_input = validate_input(input)
         serialized_input = serialize_input(validated_input)
@@ -435,6 +449,79 @@ class RemoteTeam(BaseRemote):
         )
         return map_task_result_to_team_run_output(task_result, team_id=self.team_id, user_id=user_id)
 
+    @overload
+    async def acontinue_run(
+        self,
+        run_id: str,
+        requirements: Optional[List[RunRequirement]] = None,
+        stream: Literal[False] = False,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        *,
+        updated_tools: Optional[List[ToolExecution]] = None,
+        **kwargs: Any,
+    ) -> TeamRunOutput: ...
+
+    @overload
+    def acontinue_run(
+        self,
+        run_id: str,
+        requirements: Optional[List[RunRequirement]] = None,
+        stream: Literal[True] = True,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        *,
+        updated_tools: Optional[List[ToolExecution]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[TeamRunOutputEvent]: ...
+
+    def acontinue_run(  # type: ignore
+        self,
+        run_id: str,
+        requirements: Optional[List[RunRequirement]] = None,
+        stream: Optional[bool] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        *,
+        updated_tools: Optional[List[ToolExecution]] = None,
+        **kwargs: Any,
+    ) -> Union[TeamRunOutput, AsyncIterator[TeamRunOutputEvent]]:
+        headers = self._get_auth_headers(auth_token)
+        kwargs.pop("background_tasks", None)
+
+        if self.a2a_client:
+            raise ValueError("A2A team continue_run is not supported")
+
+        if self.agentos_client:
+            agentos_tools = cast(Optional[List[Union[ToolExecution, Dict[str, Any]]]], updated_tools)
+            agentos_requirements = cast(Optional[List[Union[RunRequirement, Dict[str, Any]]]], requirements)
+            if stream:
+                return self.agentos_client.continue_team_run_stream(  # type: ignore
+                    team_id=self.team_id,
+                    run_id=run_id,
+                    tools=agentos_tools,
+                    requirements=agentos_requirements,
+                    session_id=session_id,
+                    user_id=user_id,
+                    headers=headers,
+                    **kwargs,
+                )
+            return self.agentos_client.continue_team_run(  # type: ignore
+                team_id=self.team_id,
+                run_id=run_id,
+                tools=agentos_tools,
+                requirements=agentos_requirements,
+                session_id=session_id,
+                user_id=user_id,
+                headers=headers,
+                **kwargs,
+            )
+
+        raise ValueError("No client available")
+
     async def acancel_run(self, run_id: str, auth_token: Optional[str] = None) -> bool:
         """Cancel a running team execution.
 
@@ -455,81 +542,3 @@ class RemoteTeam(BaseRemote):
             return True
         except Exception:
             return False
-
-    @overload
-    async def acontinue_run(
-        self,
-        run_id: str,
-        requirements: List[Any],
-        stream: Literal[False] = False,
-        user_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        auth_token: Optional[str] = None,
-        **kwargs: Any,
-    ) -> TeamRunOutput: ...
-
-    @overload
-    def acontinue_run(
-        self,
-        run_id: str,
-        requirements: List[Any],
-        stream: Literal[True] = True,
-        user_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        auth_token: Optional[str] = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[TeamRunOutputEvent]: ...
-
-    def acontinue_run(  # type: ignore
-        self,
-        run_id: str,
-        requirements: List[Any],
-        stream: Optional[bool] = None,
-        user_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        auth_token: Optional[str] = None,
-        **kwargs: Any,
-    ) -> Union[
-        TeamRunOutput,
-        AsyncIterator[TeamRunOutputEvent],
-    ]:
-        """Continue a paused team run with requirements (e.g., tool approval results).
-
-        Args:
-            run_id: The run_id to continue.
-            requirements: List of RunRequirement objects with tool execution results.
-            stream: Whether to stream the response.
-            user_id: Optional user ID.
-            session_id: Optional session ID.
-            auth_token: Optional JWT token for authentication.
-            **kwargs: Additional parameters.
-
-        Returns:
-            TeamRunOutput for non-streaming, AsyncIterator[TeamRunOutputEvent] for streaming.
-        """
-        headers = self._get_auth_headers(auth_token)
-
-        if self.agentos_client:
-            if stream:
-                # Handle streaming response
-                return self.agentos_client.continue_team_run_stream(  # type: ignore
-                    team_id=self.team_id,
-                    run_id=run_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    requirements=requirements,
-                    headers=headers,
-                    **kwargs,
-                )
-            else:
-                return self.agentos_client.continue_team_run(  # type: ignore
-                    team_id=self.team_id,
-                    run_id=run_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    requirements=requirements,
-                    headers=headers,
-                    **kwargs,
-                )
-        else:
-            raise ValueError("No client available for continue_run. A2A protocol does not support continue_run.")

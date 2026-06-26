@@ -28,6 +28,7 @@ from agno.exceptions import (
 )
 from agno.media import Audio, Image, Video
 from agno.media import File as FileMedia
+from agno.models.response import ToolExecution
 from agno.os.auth import (
     INTERNAL_SCHEDULER_USER_ID,
     get_auth_token_from_request,
@@ -66,6 +67,7 @@ from agno.os.schema import (
     UnauthenticatedResponse,
     ValidationErrorResponse,
 )
+from agno.os.scopes import has_required_scopes
 from agno.os.settings import AgnoAPISettings
 from agno.os.utils import (
     afinalize_continue_stream,
@@ -92,6 +94,7 @@ from agno.os.utils import (
 from agno.registry import Registry
 from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
+from agno.run.requirement import RunRequirement
 from agno.run.team import RunErrorEvent as TeamRunErrorEvent
 from agno.run.team import TeamRunOutput
 from agno.team.factory import TeamFactory
@@ -106,6 +109,35 @@ if TYPE_CHECKING:
 def _is_run_output_accumulator(chunk: Any) -> bool:
     """Return True for accumulated run outputs that are not SSE events."""
     return isinstance(chunk, (RunOutput, TeamRunOutput))
+
+
+async def _ensure_component_approval_resolved(request: Request, db: Any, run_id: str) -> None:
+    if not getattr(request.state, "authorization_enabled", False):
+        return
+    if db is None:
+        return
+    if has_required_scopes(getattr(request.state, "scopes", []), ["approvals:write"]):
+        return
+
+    get_approvals = getattr(db, "get_approvals", None)
+    if get_approvals is None:
+        return
+
+    try:
+        if asyncio.iscoroutinefunction(get_approvals):
+            result = await get_approvals(run_id=run_id, status="pending", approval_type="required")
+        else:
+            result = get_approvals(run_id=run_id, status="pending", approval_type="required")
+        approvals = result[0] if isinstance(result, tuple) else result
+    except Exception as exc:
+        log_warning(f"Approval resolution check skipped due to error: {exc}: {exc}")
+        return
+
+    if approvals:
+        raise HTTPException(
+            status_code=403,
+            detail="This run requires admin approval before it can be continued",
+        )
 
 
 async def team_response_streamer(
@@ -409,7 +441,14 @@ async def _resume_stream_generator(
 async def team_continue_response_streamer(
     team: Union[Team, RemoteTeam],
     run_id: str,
-    requirements: List,
+    updated_tools: Optional[List[ToolExecution]] = None,
+    requirements: Optional[List[RunRequirement]] = None,
+    input: Optional[str] = None,
+    continue_from: Union[int, Literal["end", "last_user"]] = "end",
+    fork: bool = False,
+    regenerate: bool = False,
+    replace_original: Optional[bool] = None,
+    additional_instructions: Optional[str] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
@@ -429,7 +468,14 @@ async def team_continue_response_streamer(
 
         continue_response = team.acontinue_run(
             run_id=run_id,
-            requirements=requirements or [],
+            updated_tools=updated_tools,
+            requirements=requirements,
+            input=input,
+            continue_from=continue_from,
+            fork=fork,
+            regenerate=regenerate,
+            replace_original=replace_original,
+            additional_instructions=additional_instructions,
             session_id=session_id,
             user_id=user_id,
             stream=True,
@@ -482,7 +528,6 @@ async def team_continue_response_streamer(
             additional_data=e.additional_data,
         )
         yield format_sse_event(error_response)
-
     except asyncio.CancelledError:
         # Sibling-streamer parity: every other streamer ends quietly on
         # client disconnect (the finalizer above already settled the stream)
@@ -503,7 +548,14 @@ async def team_continue_response_streamer(
 async def team_resumable_continue_response_streamer(
     team: Union[Team, RemoteTeam],
     run_id: str,
-    requirements: Optional[List] = None,
+    updated_tools: Optional[List[ToolExecution]] = None,
+    requirements: Optional[List[RunRequirement]] = None,
+    input: Optional[str] = None,
+    continue_from: Union[int, Literal["end", "last_user"]] = "end",
+    fork: bool = False,
+    regenerate: bool = False,
+    replace_original: Optional[bool] = None,
+    additional_instructions: Optional[str] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
@@ -532,7 +584,14 @@ async def team_resumable_continue_response_streamer(
     try:
         async for sse_data in team.acontinue_run(
             run_id=run_id,
-            requirements=requirements or [],
+            updated_tools=updated_tools,
+            requirements=requirements,
+            input=input,
+            continue_from=continue_from,
+            fork=fork,
+            regenerate=regenerate,
+            replace_original=replace_original,
+            additional_instructions=additional_instructions,
             session_id=session_id,
             user_id=user_id,
             stream=True,
@@ -609,7 +668,9 @@ def get_team_router(
             400: {"description": "Invalid request or unsupported file type", "model": BadRequestResponse},
             404: {"description": "Team not found", "model": NotFoundResponse},
         },
-        dependencies=[Depends(require_resource_access("teams", "run", "team_id"))],
+        dependencies=[
+            Depends(require_resource_access("teams", "run", "team_id")),
+        ],
     )
     async def create_team_run(
         team_id: str,
@@ -1330,7 +1391,13 @@ def get_team_router(
         run_id: str,
         request: Request,
         background_tasks: BackgroundTasks,
-        requirements: str = Form(""),  # optional when admin approval resolved
+        stream: bool = Form(True, description="Enable streaming responses via Server-Sent Events (SSE)"),
+        background: bool = Form(False, description="Run continuation in a background task with resumable SSE"),
+        tools: str = Form("", description="JSON-serialized ToolExecution list for legacy continuation payloads"),
+        requirements: str = Form(
+            "",
+            description="JSON-serialized RunRequirement list; may be empty when an admin approval has been resolved",
+        ),
         input: Optional[str] = Form(None),
         continue_from: str = Form(
             "end",
@@ -1340,16 +1407,19 @@ def get_team_router(
         regenerate: bool = Form(False),
         replace_original: Optional[bool] = Form(None),
         additional_instructions: Optional[str] = Form(None),
-        session_id: Optional[str] = Form(None),
-        user_id: Optional[str] = Form(None),
-        stream: bool = Form(True),
-        background: bool = Form(False),
+        session_id: Optional[str] = Form(None, description="Session ID for conversation continuity"),
+        user_id: Optional[str] = Form(None, description="User identifier for tracking and personalization"),
+        version: Optional[int] = Form(None, description="Team version to use for this run"),
     ):
         kwargs = await get_request_kwargs(request, continue_team_run)
 
         if hasattr(request.state, "user_id") and request.state.user_id is not None:
+            if user_id and user_id != request.state.user_id:
+                log_warning("User ID parameter passed in both request state and kwargs, using request state")
             user_id = request.state.user_id
         if hasattr(request.state, "session_id") and request.state.session_id is not None:
+            if session_id and session_id != request.state.session_id:
+                log_warning("Session ID parameter passed in both request state and kwargs, using request state")
             session_id = request.state.session_id
         if hasattr(request.state, "dependencies") and request.state.dependencies is not None:
             dependencies = request.state.dependencies
@@ -1362,11 +1432,16 @@ def get_team_router(
                 log_warning("Metadata parameter passed in both request state and kwargs, using request state")
             kwargs["metadata"] = metadata
 
-        # Parse the JSON string manually
+        # Parse the JSON strings manually
+        try:
+            tools_data = json.loads(tools) if tools else None
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in tools: {str(e)}")
+
         try:
             requirements_data = json.loads(requirements) if requirements else None
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in requirements field")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in requirements: {str(e)}")
 
         # Factory teams: re-invoke factory to get a real team for continue
         factory = find_factory_by_id(team_id, os.teams)
@@ -1386,6 +1461,7 @@ def get_team_router(
                     team_id=team_id,
                     teams=os.teams,
                     db=os.db,
+                    version=version,
                     registry=registry,
                     create_fresh=True,
                     user_id=get_scoped_user_id(request),
@@ -1462,13 +1538,24 @@ def get_team_router(
                 stamped_team.store_member_responses = True
                 team = stamped_team
 
-        # Convert requirements dict to RunRequirement objects if provided
+        # Convert tools dicts to ToolExecution objects for the legacy payload path
+        updated_tools = None
+        if tools_data:
+            try:
+                updated_tools = [
+                    tool if isinstance(tool, ToolExecution) else ToolExecution.from_dict(tool) for tool in tools_data
+                ]
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid structure or content for tools: {str(e)}")
+
+        # Convert requirements dicts to RunRequirement objects if provided
         updated_requirements = None
         if requirements_data:
             try:
-                from agno.run.requirement import RunRequirement
-
-                updated_requirements = [RunRequirement.from_dict(req) for req in requirements_data]
+                updated_requirements = [
+                    req if isinstance(req, RunRequirement) else RunRequirement.from_dict(req)
+                    for req in requirements_data
+                ]
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid structure or content for requirements: {str(e)}")
 
@@ -1597,7 +1684,8 @@ def get_team_router(
                 team_resumable_continue_response_streamer(
                     team,
                     run_id=run_id,
-                    requirements=updated_requirements or [],
+                    updated_tools=updated_tools,
+                    requirements=updated_requirements,
                     input=input,
                     continue_from=continue_from_value,
                     fork=fork,
@@ -1617,7 +1705,8 @@ def get_team_router(
                 team_continue_response_streamer(
                     team,
                     run_id=run_id,
-                    requirements=updated_requirements or [],
+                    updated_tools=updated_tools,
+                    requirements=updated_requirements,
                     input=input,
                     continue_from=continue_from_value,
                     fork=fork,
@@ -1651,7 +1740,8 @@ def get_team_router(
             try:
                 run_response_obj = await team.acontinue_run(  # type: ignore
                     run_id=run_id,
-                    requirements=updated_requirements or [],
+                    updated_tools=updated_tools,
+                    requirements=updated_requirements,
                     input=input,
                     continue_from=continue_from_value,
                     fork=fork,

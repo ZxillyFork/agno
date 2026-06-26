@@ -19,7 +19,7 @@ from agno.os.interfaces.agui.input import extract_context, extract_media, extrac
 from agno.os.interfaces.agui.router import run_entity
 from agno.os.interfaces.agui.state import StreamState
 from agno.os.interfaces.agui.stream import async_stream_agno_response_as_agui_events
-from agno.run.agent import RunContentEvent, RunEvent, ToolCallCompletedEvent, ToolCallStartedEvent
+from agno.run.agent import RunContentEvent, RunEvent, ToolCallArgsDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent
 
 
 def test_event_buffer_initial_state():
@@ -334,6 +334,37 @@ async def test_concurrent_tool_calls_no_infinite_loop():
     tool_end_events = [e for e in events if e.type == EventType.TOOL_CALL_END]
     assert len(tool_start_events) == 3, f"Expected 3 tool starts, got {len(tool_start_events)}"
     assert len(tool_end_events) == 3, f"Expected 3 tool ends, got {len(tool_end_events)}"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_started_after_args_delta_does_not_duplicate_agui_start_or_args():
+    from agno.models.response import ToolExecution
+
+    async def mock_stream_with_tool_call_args_delta_then_started():
+        yield ToolCallArgsDeltaEvent(tool_call_id="tool_1", tool_name="search", delta='{"query":"test"}')
+
+        tool_start_response = ToolCallStartedEvent()
+        tool_start_response.tool = ToolExecution(
+            tool_call_id="tool_1", tool_name="search", tool_args={"query": "test"}
+        )
+        yield tool_start_response
+
+        tool_end_response = ToolCallCompletedEvent()
+        tool_end_response.tool = ToolExecution(
+            tool_call_id="tool_1", tool_name="search", tool_args={"query": "test"}
+        )
+        yield tool_end_response
+
+    events = []
+    async for event in async_stream_agno_response_as_agui_events(
+        mock_stream_with_tool_call_args_delta_then_started(), "thread_1", "run_1"
+    ):
+        events.append(event)
+
+    event_types = [event.type for event in events]
+    assert event_types.count(EventType.TOOL_CALL_START) == 1
+    assert event_types.count(EventType.TOOL_CALL_ARGS) == 1
+    assert event_types.count(EventType.TOOL_CALL_END) == 1
 
 
 @pytest.mark.asyncio

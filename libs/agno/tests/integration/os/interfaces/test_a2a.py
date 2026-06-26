@@ -22,7 +22,9 @@ from agno.run.agent import (
     RunOutputEvent,
     RunStartedEvent,
     RunStatus,
+    ToolCallArgsDeltaEvent,
     ToolCallCompletedEvent,
+    ToolCallStartEvent,
     ToolCallStartedEvent,
 )
 from agno.run.workflow import (
@@ -353,6 +355,93 @@ def test_a2a_streaming_with_tools(test_agent: Agent, test_client: TestClient):
         assert final_task["result"]["kind"] == "task"
         assert final_task["result"]["status"]["state"] == "completed"
         assert final_task["result"]["history"][0]["parts"][0]["text"] == "The weather in Shanghai is 72°F and sunny."
+
+
+def test_a2a_streaming_emits_tool_call_start_and_args_delta(test_agent: Agent, test_client: TestClient):
+    """Test A2A streaming exposes the new tool_call_start and tool_call_args_delta events."""
+
+    async def mock_event_stream() -> AsyncIterator[RunOutputEvent]:
+        yield RunStartedEvent(
+            session_id="context-789",
+            agent_id=test_agent.id,
+            agent_name=test_agent.name,
+            run_id="test-run-123",
+        )
+
+        yield ToolCallStartEvent(
+            session_id="context-789",
+            agent_id=test_agent.id,
+            agent_name=test_agent.name,
+            run_id="test-run-123",
+            tool_call_id="tool_1",
+            tool_name="get_weather",
+        )
+
+        yield ToolCallArgsDeltaEvent(
+            session_id="context-789",
+            agent_id=test_agent.id,
+            agent_name=test_agent.name,
+            run_id="test-run-123",
+            tool_call_id="tool_1",
+            tool_name="get_weather",
+            delta='{"location":"Shanghai"}',
+        )
+
+        yield ToolCallStartedEvent(
+            session_id="context-789",
+            agent_id=test_agent.id,
+            agent_name=test_agent.name,
+            run_id="test-run-123",
+            tool=ToolExecution(tool_call_id="tool_1", tool_name="get_weather", tool_args={"location": "Shanghai"}),
+        )
+
+        yield RunCompletedEvent(
+            session_id="context-789",
+            agent_id=test_agent.id,
+            agent_name=test_agent.name,
+            run_id="test-run-123",
+            content="done",
+        )
+
+    with patch.object(test_agent, "arun") as mock_arun:
+        mock_arun.return_value = mock_event_stream()
+
+        request_body = {
+            "jsonrpc": "2.0",
+            "method": "message/stream",
+            "id": "request-123",
+            "params": {
+                "message": {
+                    "messageId": "msg-123",
+                    "role": "user",
+                    "contextId": "context-789",
+                    "parts": [{"kind": "text", "text": "What's the weather in SF?"}],
+                }
+            },
+        }
+
+        response = test_client.post(f"/a2a/agents/{test_agent.id}/v1/message:stream", json=request_body)
+
+        assert response.status_code == 200
+
+        events = []
+        for chunk in response.text.split("\n\n"):
+            if chunk.strip():
+                for line in chunk.strip().split("\n"):
+                    if line.startswith("data: "):
+                        events.append(json.loads(line[6:]))
+
+        tool_start = [e for e in events if e["result"].get("metadata", {}).get("agno_event_type") == "tool_call_start"]
+        assert len(tool_start) == 1
+        assert tool_start[0]["result"]["metadata"]["tool_call_id"] == "tool_1"
+        assert tool_start[0]["result"]["metadata"]["tool_name"] == "get_weather"
+
+        tool_args_delta = [
+            e for e in events if e["result"].get("metadata", {}).get("agno_event_type") == "tool_call_args_delta"
+        ]
+        assert len(tool_args_delta) == 1
+        assert tool_args_delta[0]["result"]["metadata"]["tool_call_id"] == "tool_1"
+        assert tool_args_delta[0]["result"]["metadata"]["tool_args_delta"] == '{"location":"Shanghai"}'
 
 
 def test_a2a_streaming_with_reasoning(test_agent: Agent, test_client: TestClient):

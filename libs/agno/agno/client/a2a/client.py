@@ -311,6 +311,14 @@ class A2AClient:
                     content = part_data.get("text", "")
                     break
 
+        if metadata and metadata.get("agno_event_type") in {
+            "tool_call_start",
+            "tool_call_started",
+            "tool_call_args_delta",
+            "tool_call_completed",
+        }:
+            event_type = metadata["agno_event_type"]
+
         return StreamEvent(
             event_type=event_type,
             content=content,
