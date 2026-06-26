@@ -91,6 +91,8 @@ def _upsert_tool_executions(run_response: TeamRunOutput, tool_executions: List[T
 
         for index, existing_tool in enumerate(run_response.tools):
             if existing_tool.tool_call_id == tool_execution.tool_call_id:
+                if tool_execution.child_run_id is None and existing_tool.child_run_id is not None:
+                    tool_execution.child_run_id = existing_tool.child_run_id
                 run_response.tools[index] = tool_execution
                 break
         else:

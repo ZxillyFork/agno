@@ -657,12 +657,17 @@ def _propagate_member_pause(
             req_copy.tool_execution = deepcopy(req_copy.tool_execution)
         if req_copy.user_input_schema is not None:
             req_copy.user_input_schema = deepcopy(req_copy.user_input_schema)
+        if req_copy.user_feedback_schema is not None:
+            req_copy.user_feedback_schema = deepcopy(req_copy.user_feedback_schema)
+        req_copy.routed_member_is_team_level = req_copy.member_agent_id is None
         if req_copy.member_agent_id is None:
             req_copy.member_agent_id = member_id
+            req_copy.member_run_id = member_run_response.run_id
         if req_copy.member_agent_name is None:
             req_copy.member_agent_name = member_agent.name
-        if req_copy.member_run_id is None:
-            req_copy.member_run_id = member_run_response.run_id
+        req_copy.routed_member_agent_id = member_id
+        req_copy.routed_member_agent_name = member_agent.name
+        req_copy.routed_member_run_id = member_run_response.run_id
         # Keep a reference to the member's paused RunOutput so continue_run
         # can pass it directly without needing a session/DB lookup.
         req_copy._member_run_response = member_run_response

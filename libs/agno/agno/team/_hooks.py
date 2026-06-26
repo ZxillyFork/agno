@@ -101,7 +101,7 @@ def handle_team_run_paused(
     from agno.team._run import _cleanup_and_store
 
     run_response.status = RunStatus.paused
-    if not run_response.content:
+    if run_response.content is None:
         run_response.content = _get_team_paused_content(run_response)
 
     # Only create a team-level approval if this is NOT a member-propagated pause.
@@ -138,7 +138,7 @@ def handle_team_run_paused_stream(
     from agno.team._run import _cleanup_and_store
 
     run_response.status = RunStatus.paused
-    if not run_response.content:
+    if run_response.content is None:
         run_response.content = _get_team_paused_content(run_response)
 
     if not _member_approval_already_exists(run_response):
@@ -175,7 +175,7 @@ async def ahandle_team_run_paused(
     from agno.team._run import _acleanup_and_store
 
     run_response.status = RunStatus.paused
-    if not run_response.content:
+    if run_response.content is None:
         run_response.content = _get_team_paused_content(run_response)
 
     if not _member_approval_already_exists(run_response):
@@ -210,7 +210,7 @@ async def ahandle_team_run_paused_stream(
     from agno.team._run import _acleanup_and_store
 
     run_response.status = RunStatus.paused
-    if not run_response.content:
+    if run_response.content is None:
         run_response.content = _get_team_paused_content(run_response)
 
     if not _member_approval_already_exists(run_response):

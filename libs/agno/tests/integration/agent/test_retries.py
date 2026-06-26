@@ -94,7 +94,7 @@ def test_agent_keyboard_interrupt_stops_retries():
     # Should stop on first attempt without retrying
     assert attempt_count["count"] == 1
     assert response.status == RunStatus.cancelled
-    assert response.content == "Operation cancelled by user"
+    assert response.content is None
 
 
 @pytest.mark.asyncio

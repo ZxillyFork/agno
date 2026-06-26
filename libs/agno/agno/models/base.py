@@ -3012,7 +3012,7 @@ class Model(ABC):
                     sync_future.cancel()
                     raise
 
-            thread_call_ids = {fc.call_id for fc in thread_function_calls}
+            thread_call_object_ids = {id(fc) for fc in thread_function_calls}
             pending_non_thread_function_calls: List[FunctionCall] = []
 
             async def _flush_pending_non_thread_function_calls() -> AsyncIterator[
@@ -3058,7 +3058,7 @@ class Model(ABC):
                         function_call_results.extend(additional_input)
                     return
 
-                if fc.call_id not in thread_call_ids:
+                if id(fc) not in thread_call_object_ids:
                     pending_non_thread_function_calls.append(fc)
                     continue
 
@@ -3336,8 +3336,14 @@ class Model(ABC):
                 if pending_tasks:
                     log_warning(
                         f"Tool calls did not finish within {_TOOL_CALL_BATCH_SETTLE_TIMEOUT_SECONDS}s after a dynamic pause; "
-                        "unfinished calls will continue in the background."
+                        "cancelling unfinished calls before returning the pause."
                     )
+                    for pending_task in pending_tasks:
+                        pending_task.cancel()
+                    settled_results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+                    for settled_task, settled_result in zip(pending_tasks, settled_results):
+                        task_results[settled_task] = settled_result
+                    pending_tasks = set()
 
                 for settled_task in ordered_tasks:
                     if settled_task in task_results:
@@ -3711,6 +3717,8 @@ class Model(ABC):
 
         indexed_paused_calls = paused_function_calls + paused_generator_calls
         if indexed_paused_calls:
+            if additional_input:
+                function_call_results.extend(additional_input)
             paused_calls = [
                 (function_call, pause_exc)
                 for _, function_call, pause_exc in sorted(indexed_paused_calls, key=lambda item: item[0])
@@ -3719,6 +3727,8 @@ class Model(ABC):
             return
 
         if first_static_pause_response is not None:
+            if additional_input:
+                function_call_results.extend(additional_input)
             if first_static_pause_started is not None:
                 yield first_static_pause_started
             yield first_static_pause_response

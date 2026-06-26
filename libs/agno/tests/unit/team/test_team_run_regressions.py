@@ -2,19 +2,23 @@ import gc
 import inspect
 import warnings
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from agno.agent.agent import Agent
 from agno.db.postgres import AsyncPostgresDb
+from agno.models.response import ToolExecution
 from agno.run import RunContext
 from agno.run.base import RunStatus
+from agno.run.messages import RunMessages
+from agno.run.requirement import RunRequirement
 from agno.run.team import TeamRunOutput
 from agno.session import TeamSession
 from agno.team import _hooks
 from agno.team import _run as team_run
+from agno.team.remote import RemoteTeam
 from agno.team.team import Team
 
 
@@ -27,6 +31,136 @@ def test_all_team_pause_handlers_accept_run_context():
     ]:
         params = inspect.signature(fn).parameters
         assert "run_context" in params, f"{fn.__name__} missing run_context param"
+
+
+def test_remote_team_acontinue_run_drops_background_tasks_from_stream_request():
+    remote_team = RemoteTeam(base_url="http://localhost:7777", team_id="team-1")
+    client = MagicMock()
+    client.continue_team_run_stream.return_value = iter(())
+    remote_team.agentos_client = client
+
+    remote_team.acontinue_run(
+        "run-1",
+        stream=True,
+        session_id="session-1",
+        background_tasks=object(),
+        extra_flag=True,
+    )
+
+    call_kwargs = client.continue_team_run_stream.call_args.kwargs
+    assert "background_tasks" not in call_kwargs
+    assert call_kwargs["extra_flag"] is True
+
+
+def test_remote_team_acontinue_run_preserves_requirements_positional_argument():
+    remote_team = RemoteTeam(base_url="http://localhost:7777", team_id="team-1")
+    client = MagicMock()
+    client.continue_team_run.return_value = TeamRunOutput(run_id="run-1")
+    remote_team.agentos_client = client
+    requirement = RunRequirement(
+        tool_execution=ToolExecution(tool_call_id="call-1", tool_name="approve_me", confirmed=True)
+    )
+
+    remote_team.acontinue_run("run-1", [requirement], stream=False, session_id="session-1")
+
+    call_kwargs = client.continue_team_run.call_args.kwargs
+    assert call_kwargs["requirements"] == [requirement]
+    assert call_kwargs["tools"] is None
+
+
+def test_team_tool_update_creates_audit_approval_for_confirmation(monkeypatch: pytest.MonkeyPatch):
+    approvals: list[dict[str, Any]] = []
+
+    class Db:
+        def create_approval(self, data):
+            approvals.append(data)
+
+    monkeypatch.setattr("agno.agent._tools.reject_tool_call", lambda *args, **kwargs: None)
+
+    team = Team(id="team-1", name="Audit Team", members=[Agent(name="m1")])
+    team.db = Db()
+    tool_execution = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="audit_tool",
+        tool_args={"x": 1},
+        requires_confirmation=True,
+        confirmed=False,
+        approval_type="audit",
+    )
+    run_response = TeamRunOutput(run_id="team-run", session_id="session-1", tools=[tool_execution])
+
+    team_run._handle_team_tool_call_updates(team, run_response, RunMessages(), tools=[])
+
+    assert len(approvals) == 1
+    assert approvals[0]["approval_type"] == "audit"
+    assert approvals[0]["status"] == "rejected"
+    assert approvals[0]["source_type"] == "team"
+    assert approvals[0]["team_id"] == "team-1"
+    assert approvals[0]["tool_name"] == "audit_tool"
+
+
+@pytest.mark.asyncio
+async def test_async_team_tool_update_creates_audit_approval_for_external_execution(monkeypatch: pytest.MonkeyPatch):
+    approvals: list[dict[str, Any]] = []
+
+    class Db:
+        async def create_approval(self, data):
+            approvals.append(data)
+
+    monkeypatch.setattr("agno.agent._tools.handle_external_execution_update", lambda *args, **kwargs: None)
+
+    team = Team(id="team-1", name="Audit Team", members=[Agent(name="m1")])
+    team.db = Db()
+    tool_execution = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="audit_external",
+        tool_args={"x": 1},
+        external_execution_required=True,
+        result="done",
+        external_execution_result_provided=True,
+        approval_type="audit",
+    )
+    run_response = TeamRunOutput(run_id="team-run", session_id="session-1", tools=[tool_execution])
+
+    await team_run._ahandle_team_tool_call_updates(team, run_response, RunMessages(), tools=[])
+
+    assert len(approvals) == 1
+    assert approvals[0]["approval_type"] == "audit"
+    assert approvals[0]["status"] == "approved"
+    assert approvals[0]["pause_type"] == "external_execution"
+    assert approvals[0]["source_type"] == "team"
+    assert approvals[0]["team_id"] == "team-1"
+    assert approvals[0]["tool_name"] == "audit_external"
+
+
+def test_team_tool_update_preserves_audit_pause_type_for_user_input(monkeypatch: pytest.MonkeyPatch):
+    approvals: list[dict[str, Any]] = []
+
+    class Db:
+        def create_approval(self, data):
+            approvals.append(data)
+
+    monkeypatch.setattr("agno.agent._tools.handle_user_input_update", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agno.agent._tools.run_tool", lambda *args, **kwargs: iter(()))
+
+    team = Team(id="team-1", name="Audit Team", members=[Agent(name="m1")])
+    team.db = Db()
+    tool_execution = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="audit_input",
+        tool_args={"x": 1},
+        requires_user_input=True,
+        user_input_schema=[],
+        approval_type="audit",
+    )
+    tool_execution.user_input_schema = [type("Field", (), {"name": "answer", "value": "yes"})()]
+    run_response = TeamRunOutput(run_id="team-run", session_id="session-1", tools=[tool_execution])
+
+    team_run._handle_team_tool_call_updates(team, run_response, RunMessages(), tools=[])
+
+    assert len(approvals) == 1
+    assert approvals[0]["approval_type"] == "audit"
+    assert approvals[0]["pause_type"] == "user_input"
 
 
 def test_handle_team_run_paused_forwards_run_context_to_cleanup(monkeypatch: pytest.MonkeyPatch):

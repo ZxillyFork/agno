@@ -53,6 +53,7 @@ from agno.run.agent import (
     RunOutput,
     RunOutputEvent,
 )
+from agno.run.approval import acreate_audit_approval, create_audit_approval
 from agno.run.cancel import (
     acancel_run as acancel_run_global,
 )
@@ -110,6 +111,7 @@ from agno.utils.events import (
     create_team_run_cancelled_event,
     create_team_run_completed_event,
     create_team_run_content_completed_event,
+    create_team_run_continued_event,
     create_team_run_error_event,
     create_team_run_started_event,
     create_team_session_summary_completed_event,
@@ -147,6 +149,13 @@ if TYPE_CHECKING:
     from agno.run.requirement import RunRequirement
     from agno.team._run_options import ResolvedRunOptions
     from agno.team.team import Team
+
+
+def _get_cancel_reason(exc: Optional[BaseException] = None) -> Optional[str]:
+    if exc is None:
+        return None
+    reason = str(exc).strip()
+    return reason or None
 
 
 def cancel_run(run_id: str) -> bool:
@@ -392,6 +401,7 @@ def _run_tasks(
                 tool_choice=team.tool_choice,
                 tool_call_limit=team.tool_call_limit,
                 run_response=run_response,
+                run_context=run_context,
                 send_media_to_model=team.send_media_to_model,
                 compression_manager=team.compression_manager if team.compress_tool_results else None,
                 **result_store_kwargs(team),
@@ -1260,6 +1270,7 @@ def _run(
                     tool_choice=team.tool_choice,
                     tool_call_limit=team.tool_call_limit,
                     run_response=run_response,
+                    run_context=run_context,
                     send_media_to_model=team.send_media_to_model,
                     compression_manager=team.compression_manager if team.compress_tool_results else None,
                     **result_store_kwargs(team),
@@ -2289,6 +2300,7 @@ async def _arun_tasks(
                 tool_choice=team.tool_choice,
                 tool_call_limit=team.tool_call_limit,
                 run_response=run_response,
+                run_context=run_context,
                 send_media_to_model=team.send_media_to_model,
                 compression_manager=team.compression_manager if team.compress_tool_results else None,
                 **result_store_kwargs(team),
@@ -3248,6 +3260,7 @@ async def _arun(
                     response_format=response_format,
                     send_media_to_model=team.send_media_to_model,
                     run_response=run_response,
+                    run_context=run_context,
                     compression_manager=team.compression_manager if team.compress_tool_results else None,
                     **result_store_kwargs(team),
                     after_tool_results=abuild_team_after_tool_results_callback(
@@ -4535,12 +4548,9 @@ def _handle_team_run_cancellation(
     session: Optional[TeamSession] = None,
 ) -> TeamRunOutput:
     """Prepare a team run response for cancellation: set status, preserve content and messages."""
-    reason = _normalize_team_cancellation_reason(run_response, error)
     log_debug(f"Team run {run_response.run_id} was cancelled")
     run_response.status = RunStatus.cancelled
     has_partial_content = bool(run_response.content)
-    if not run_response.content:
-        run_response.content = reason
     if run_response.messages is None and run_messages is not None:
         messages_for_run_response = [msg for msg in run_messages.messages if msg.add_to_agent_memory]
         # Preserve partial streamed content as the assistant message, filling an empty trailing one if present
@@ -5326,6 +5336,29 @@ def _scrub_member_responses(team: "Team", member_responses: List[Union[TeamRunOu
             member._scrub_member_responses(member_response.member_responses)  # type: ignore
 
 
+def _replace_or_add_member_response(
+    run_response: TeamRunOutput, member_response: Union[TeamRunOutput, RunOutput]
+) -> None:
+    """Keep the parent TeamRunOutput aligned with a continued member run."""
+
+    if run_response.member_responses is None:
+        run_response.member_responses = []
+
+    member_run_id = getattr(member_response, "run_id", None)
+    member_id = getattr(member_response, "agent_id", None) or getattr(member_response, "team_id", None)
+
+    for index, existing_response in enumerate(run_response.member_responses):
+        existing_run_id = getattr(existing_response, "run_id", None)
+        existing_member_id = getattr(existing_response, "agent_id", None) or getattr(existing_response, "team_id", None)
+        if (member_run_id and existing_run_id == member_run_id) or (
+            member_id and existing_member_id == member_id and existing_run_id == member_run_id
+        ):
+            run_response.member_responses[index] = member_response
+            return
+
+    run_response.add_member_run(member_response)
+
+
 # ---------------------------------------------------------------------------
 # Run dependency resolution (moved from _tools.py)
 # ---------------------------------------------------------------------------
@@ -5511,6 +5544,12 @@ async def _aget_continue_run_messages(
     return run_messages
 
 
+def _append_additional_input_to_run_messages(run_messages: RunMessages, run_response: TeamRunOutput) -> None:
+    if run_response.additional_input:
+        run_messages.messages.extend(run_response.additional_input)
+        run_response.additional_input = None
+
+
 def _handle_team_tool_call_updates(
     team: "Team",
     run_response: TeamRunOutput,
@@ -5525,6 +5564,10 @@ def _handle_team_tool_call_updates(
     etc.) that ``Team`` also provides, so passing a ``Team`` is safe at runtime.
     """
     from agno.agent._tools import (
+        _is_rejected_paused_tool,
+        _mark_rejected_tool_resolved,
+        _tool_user_feedback_ready,
+        _tool_user_input_ready,
         handle_ask_user_tool_update,
         handle_external_execution_update,
         handle_get_user_input_tool_update,
@@ -5537,39 +5580,63 @@ def _handle_team_tool_call_updates(
     _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
 
     for _t in run_response.tools or []:
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
+            _mark_rejected_tool_resolved(_t)
+            _maybe_create_team_audit_approval(team, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             if _t.confirmed is not None and _t.confirmed is True and _t.result is None:
                 deque(run_tool(team, run_response, run_messages, _t, functions=_functions, team_mode=True), maxlen=0)  # type: ignore
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
+            _maybe_create_team_audit_approval(
+                team, _t, run_response, "approved" if _t.confirmed is True else "rejected"
+            )
             _t.requires_confirmation = False
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            handle_external_execution_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
+            if _t.result is not None or _t.external_execution_result_provided:
+                pause_type = "external_execution"
+                handle_external_execution_update(
+                    team, run_messages=run_messages, tool=_t, run_response=run_response
+                )  # type: ignore
+                _maybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_get_user_input_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                handle_get_user_input_tool_update(
+                    team, run_messages=run_messages, tool=_t, run_response=run_response
+                )  # type: ignore
+                _t.requires_user_input = False
+                _t.answered = True
 
-        # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_ask_user_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                handle_ask_user_tool_update(
+                    team, run_messages=run_messages, tool=_t, run_response=run_response
+                )  # type: ignore
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(team, tool=_t)  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
-            deque(run_tool(team, run_response, run_messages, _t, functions=_functions, team_mode=True), maxlen=0)  # type: ignore
+            if _tool_user_input_ready(_t):
+                pause_type = "user_input"
+                handle_user_input_update(team, tool=_t)  # type: ignore
+                deque(run_tool(team, run_response, run_messages, _t, functions=_functions, team_mode=True), maxlen=0)  # type: ignore
+                _t.requires_user_input = False
+                _t.answered = True
+                _maybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
 
 def _handle_team_tool_call_updates_stream(
@@ -5585,6 +5652,10 @@ def _handle_team_tool_call_updates_stream(
     Yields events during tool execution for streaming responses.
     """
     from agno.agent._tools import (
+        _is_rejected_paused_tool,
+        _mark_rejected_tool_resolved,
+        _tool_user_feedback_ready,
+        _tool_user_input_ready,
         handle_ask_user_tool_update,
         handle_external_execution_update,
         handle_get_user_input_tool_update,
@@ -5597,6 +5668,12 @@ def _handle_team_tool_call_updates_stream(
     _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
 
     for _t in run_response.tools or []:
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
+            _mark_rejected_tool_resolved(_t)
+            _maybe_create_team_audit_approval(team, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             if _t.confirmed is not None and _t.confirmed is True and _t.result is None:
@@ -5609,43 +5686,61 @@ def _handle_team_tool_call_updates_stream(
                     stream_events=stream_events,  # type: ignore
                     team_mode=True,
                 )
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
+            _maybe_create_team_audit_approval(
+                team, _t, run_response, "approved" if _t.confirmed is True else "rejected"
+            )
             _t.requires_confirmation = False
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            handle_external_execution_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
+            if _t.result is not None or _t.external_execution_result_provided:
+                pause_type = "external_execution"
+                handle_external_execution_update(
+                    team, run_messages=run_messages, tool=_t, run_response=run_response
+                )  # type: ignore
+                _maybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_get_user_input_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                handle_get_user_input_tool_update(
+                    team, run_messages=run_messages, tool=_t, run_response=run_response
+                )  # type: ignore
+                _t.requires_user_input = False
+                _t.answered = True
 
-        # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_ask_user_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                handle_ask_user_tool_update(
+                    team, run_messages=run_messages, tool=_t, run_response=run_response
+                )  # type: ignore
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(team, tool=_t)  # type: ignore
-            yield from run_tool(
-                team,  # type: ignore[arg-type]
-                run_response,  # type: ignore[arg-type]
-                run_messages,
-                _t,
-                functions=_functions,
-                stream_events=stream_events,  # type: ignore
-                team_mode=True,
-            )
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                pause_type = "user_input"
+                handle_user_input_update(team, tool=_t)  # type: ignore
+                yield from run_tool(
+                    team,  # type: ignore[arg-type]
+                    run_response,  # type: ignore[arg-type]
+                    run_messages,
+                    _t,
+                    functions=_functions,
+                    stream_events=stream_events,  # type: ignore
+                    team_mode=True,
+                )
+                _t.requires_user_input = False
+                _t.answered = True
+                _maybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
 
 async def _ahandle_team_tool_call_updates(
@@ -5659,6 +5754,10 @@ async def _ahandle_team_tool_call_updates(
     See _handle_team_tool_call_updates docstring for the Team/Agent duck-typing note.
     """
     from agno.agent._tools import (
+        _is_rejected_paused_tool,
+        _mark_rejected_tool_resolved,
+        _tool_user_feedback_ready,
+        _tool_user_input_ready,
         arun_tool,
         handle_ask_user_tool_update,
         handle_external_execution_update,
@@ -5671,59 +5770,74 @@ async def _ahandle_team_tool_call_updates(
     _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
 
     for _t in run_response.tools or []:
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
+            _mark_rejected_tool_resolved(_t)
+            await _amaybe_create_team_audit_approval(team, _t, run_response, "rejected")
+            continue
+
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             if _t.confirmed is not None and _t.confirmed is True and _t.result is None:
                 async for _ in arun_tool(team, run_response, run_messages, _t, functions=_functions, team_mode=True):  # type: ignore
                     pass
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
+            await _amaybe_create_team_audit_approval(
+                team, _t, run_response, "approved" if _t.confirmed is True else "rejected"
+            )
             _t.requires_confirmation = False
 
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            # The handler may offload an oversized result; the write must not run on the event loop.
-            await asyncio.to_thread(
-                handle_external_execution_update,
-                team,  # type: ignore[arg-type]
-                run_messages=run_messages,
-                tool=_t,
-                run_response=run_response,  # type: ignore[arg-type]
-            )
+            if _t.result is not None or _t.external_execution_result_provided:
+                pause_type = "external_execution"
+                await asyncio.to_thread(
+                    handle_external_execution_update,
+                    team,  # type: ignore[arg-type]
+                    run_messages=run_messages,
+                    tool=_t,
+                    run_response=run_response,  # type: ignore[arg-type]
+                )
+                await _amaybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            # The handler may offload an oversized result; the write must not run on the event loop.
-            await asyncio.to_thread(
-                handle_get_user_input_tool_update,
-                team,  # type: ignore[arg-type]
-                run_messages=run_messages,
-                tool=_t,
-                run_response=run_response,  # type: ignore[arg-type]
-            )
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                await asyncio.to_thread(
+                    handle_get_user_input_tool_update,
+                    team,  # type: ignore[arg-type]
+                    run_messages=run_messages,
+                    tool=_t,
+                    run_response=run_response,  # type: ignore[arg-type]
+                )
+                _t.requires_user_input = False
+                _t.answered = True
 
-        # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            # The handler may offload an oversized result; the write must not run on the event loop.
-            await asyncio.to_thread(
-                handle_ask_user_tool_update,
-                team,  # type: ignore[arg-type]
-                run_messages=run_messages,
-                tool=_t,
-                run_response=run_response,  # type: ignore[arg-type]
-            )
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                await asyncio.to_thread(
+                    handle_ask_user_tool_update,
+                    team,  # type: ignore[arg-type]
+                    run_messages=run_messages,
+                    tool=_t,
+                    run_response=run_response,  # type: ignore[arg-type]
+                )
+                _t.requires_user_input = False
+                _t.answered = True
 
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(team, tool=_t)  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
-            async for _ in arun_tool(team, run_response, run_messages, _t, functions=_functions, team_mode=True):  # type: ignore
-                pass
+            if _tool_user_input_ready(_t):
+                pause_type = "user_input"
+                handle_user_input_update(team, tool=_t)  # type: ignore
+                async for _ in arun_tool(team, run_response, run_messages, _t, functions=_functions, team_mode=True):  # type: ignore
+                    pass
+                _t.requires_user_input = False
+                _t.answered = True
+                await _amaybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
 
 async def _ahandle_team_tool_call_updates_stream(
@@ -5739,6 +5853,10 @@ async def _ahandle_team_tool_call_updates_stream(
     Yields events during tool execution for async streaming responses.
     """
     from agno.agent._tools import (
+        _is_rejected_paused_tool,
+        _mark_rejected_tool_resolved,
+        _tool_user_feedback_ready,
+        _tool_user_input_ready,
         arun_tool,
         handle_ask_user_tool_update,
         handle_external_execution_update,
@@ -5751,6 +5869,12 @@ async def _ahandle_team_tool_call_updates_stream(
     _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
 
     for _t in run_response.tools or []:
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
+            _mark_rejected_tool_resolved(_t)
+            await _amaybe_create_team_audit_approval(team, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             if _t.confirmed is not None and _t.confirmed is True and _t.result is None:
@@ -5764,65 +5888,108 @@ async def _ahandle_team_tool_call_updates_stream(
                     team_mode=True,
                 ):
                     yield event  # type: ignore
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(team, run_messages, _t, functions=_functions)  # type: ignore
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
+            await _amaybe_create_team_audit_approval(
+                team, _t, run_response, "approved" if _t.confirmed is True else "rejected"
+            )
             _t.requires_confirmation = False
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            # The handler may offload an oversized result; the write must not run on the event loop.
-            await asyncio.to_thread(
-                handle_external_execution_update,
-                team,  # type: ignore[arg-type]
-                run_messages=run_messages,
-                tool=_t,
-                run_response=run_response,  # type: ignore[arg-type]
-            )
+            if _t.result is not None or _t.external_execution_result_provided:
+                pause_type = "external_execution"
+                await asyncio.to_thread(
+                    handle_external_execution_update,
+                    team,  # type: ignore[arg-type]
+                    run_messages=run_messages,
+                    tool=_t,
+                    run_response=run_response,  # type: ignore[arg-type]
+                )
+                await _amaybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            # The handler may offload an oversized result; the write must not run on the event loop.
-            await asyncio.to_thread(
-                handle_get_user_input_tool_update,
-                team,  # type: ignore[arg-type]
-                run_messages=run_messages,
-                tool=_t,
-                run_response=run_response,  # type: ignore[arg-type]
-            )
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                await asyncio.to_thread(
+                    handle_get_user_input_tool_update,
+                    team,  # type: ignore[arg-type]
+                    run_messages=run_messages,
+                    tool=_t,
+                    run_response=run_response,  # type: ignore[arg-type]
+                )
+                _t.requires_user_input = False
+                _t.answered = True
 
-        # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            # The handler may offload an oversized result; the write must not run on the event loop.
-            await asyncio.to_thread(
-                handle_ask_user_tool_update,
-                team,  # type: ignore[arg-type]
-                run_messages=run_messages,
-                tool=_t,
-                run_response=run_response,  # type: ignore[arg-type]
-            )
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                await asyncio.to_thread(
+                    handle_ask_user_tool_update,
+                    team,  # type: ignore[arg-type]
+                    run_messages=run_messages,
+                    tool=_t,
+                    run_response=run_response,  # type: ignore[arg-type]
+                )
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(team, tool=_t)  # type: ignore
-            async for event in arun_tool(
-                team,  # type: ignore[arg-type]
-                run_response,  # type: ignore[arg-type]
-                run_messages,
-                _t,
-                functions=_functions,
-                stream_events=stream_events,  # type: ignore
-                team_mode=True,
-            ):
-                yield event  # type: ignore
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                pause_type = "user_input"
+                handle_user_input_update(team, tool=_t)  # type: ignore
+                async for event in arun_tool(
+                    team,  # type: ignore[arg-type]
+                    run_response,  # type: ignore[arg-type]
+                    run_messages,
+                    _t,
+                    functions=_functions,
+                    stream_events=stream_events,  # type: ignore
+                    team_mode=True,
+                ):
+                    yield event  # type: ignore
+                _t.requires_user_input = False
+                _t.answered = True
+                await _amaybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
+
+
+def _maybe_create_team_audit_approval(
+    team: "Team", tool_execution: Any, run_response: TeamRunOutput, status: str, pause_type: Optional[str] = None
+) -> None:
+    """Create an audit approval record for resolved team-level HITL tools."""
+
+    if getattr(tool_execution, "approval_type", None) == "audit":
+        create_audit_approval(
+            db=team.db,
+            tool_execution=tool_execution,
+            run_response=run_response,
+            status=status,
+            team_id=team.id,
+            team_name=team.name,
+            pause_type=pause_type,
+        )
+
+
+async def _amaybe_create_team_audit_approval(
+    team: "Team", tool_execution: Any, run_response: TeamRunOutput, status: str, pause_type: Optional[str] = None
+) -> None:
+    """Async variant of _maybe_create_team_audit_approval."""
+
+    if getattr(tool_execution, "approval_type", None) == "audit":
+        await acreate_audit_approval(
+            db=team.db,
+            tool_execution=tool_execution,
+            run_response=run_response,
+            status=status,
+            team_id=team.id,
+            team_name=team.name,
+            pause_type=pause_type,
+        )
 
 
 def _normalize_requirements_payload(
@@ -6260,14 +6427,436 @@ def _reclaim_own_requirements(
     return reclaimed
 
 
+def _sync_run_response_tools_from_requirements(
+    run_response: TeamRunOutput, requirements: List["RunRequirement"]
+) -> None:
+    unresolved_tools = [
+        req.tool_execution
+        for req in requirements
+        if req.tool_execution is not None and not _is_requirement_resolved(req)
+    ]
+    updated_tools = unresolved_tools or [req.tool_execution for req in requirements if req.tool_execution is not None]
+    if not updated_tools:
+        return
+
+    if not run_response.tools:
+        run_response.tools = updated_tools
+        return
+
+    synced_tools = list(run_response.tools)
+    matched_tool_indexes: set[int] = set()
+    for updated_tool in updated_tools:
+        matched = False
+        for index, existing_tool in enumerate(synced_tools):
+            if index in matched_tool_indexes:
+                continue
+            if existing_tool is updated_tool:
+                matched_tool_indexes.add(index)
+                matched = True
+                break
+            if (
+                existing_tool.tool_call_id is not None
+                and updated_tool.tool_call_id is not None
+                and existing_tool.tool_call_id == updated_tool.tool_call_id
+            ):
+                synced_tools[index] = updated_tool
+                matched_tool_indexes.add(index)
+                matched = True
+                break
+        if not matched:
+            synced_tools.append(updated_tool)
+
+    run_response.tools = synced_tools
+
+
+def _remaining_original_member_requirements(
+    requirements: List["RunRequirement"], original_member_req_ids: set[int]
+) -> List["RunRequirement"]:
+    return [
+        req for req in requirements if id(req) in original_member_req_ids and getattr(req, "_routing_failed", False)
+    ]
+
+
 def _has_member_requirements(requirements: List[Any]) -> bool:
     """Check if any requirements are for member agents (have member_agent_id set)."""
-    return any(getattr(req, "member_agent_id", None) is not None for req in requirements)
+    return any(
+        getattr(req, "routed_member_agent_id", None) is not None or getattr(req, "member_agent_id", None) is not None
+        for req in requirements
+    )
 
 
 def _has_team_level_requirements(requirements: List[Any]) -> bool:
     """Check if any requirements are for team-level tools (no member_agent_id)."""
-    return any(getattr(req, "member_agent_id", None) is None for req in requirements)
+    return any(
+        getattr(req, "routed_member_agent_id", None) is None and getattr(req, "member_agent_id", None) is None
+        for req in requirements
+    )
+
+
+def _unresolved_member_requirements(requirements: List[Any]) -> List[Any]:
+    return [
+        req
+        for req in requirements
+        if _get_requirement_route_member_id(req) is not None and _requirement_blocks_continue(req)
+    ]
+
+
+def _unresolved_team_level_requirements(requirements: List[Any]) -> List[Any]:
+    return [
+        req
+        for req in requirements
+        if _get_requirement_route_member_id(req) is None and not _is_requirement_resolved(req)
+    ]
+
+
+def _resolved_team_level_requirements(requirements: List[Any]) -> List[Any]:
+    return [
+        req for req in requirements if _get_requirement_route_member_id(req) is None and _is_requirement_resolved(req)
+    ]
+
+
+def _handle_team_run_paused_stream_with_output(
+    team: "Team",
+    run_response: TeamRunOutput,
+    session: TeamSession,
+    run_context: Optional[RunContext],
+    yield_run_output: bool,
+) -> Iterator[Union[TeamRunOutputEvent, RunOutputEvent, TeamRunOutput]]:
+    from agno.team import _hooks
+
+    yield from _hooks.handle_team_run_paused_stream(
+        team, run_response=run_response, session=session, run_context=run_context
+    )
+    if yield_run_output:
+        yield run_response
+
+
+def _apply_requirement_resolution(target: "RunRequirement", source: "RunRequirement") -> None:
+    """Copy resolution data into a routed requirement without replacing its routing context."""
+
+    if target.tool_execution is not None and source.tool_execution is not None:
+        target.tool_execution.confirmed = source.tool_execution.confirmed
+        target.tool_execution.confirmation_note = source.tool_execution.confirmation_note
+        target.tool_execution.result = source.tool_execution.result
+        target.tool_execution.external_execution_result_provided = (
+            source.tool_execution.external_execution_result_provided
+        )
+        target.tool_execution.resume_metadata = source.tool_execution.resume_metadata
+
+        if source.tool_execution.user_input_schema is not None:
+            target.tool_execution.user_input_schema = source.tool_execution.user_input_schema
+        if source.tool_execution.user_feedback_schema is not None:
+            target.tool_execution.user_feedback_schema = source.tool_execution.user_feedback_schema
+        target.tool_execution.answered = source.tool_execution.answered
+
+    target.confirmation = source.confirmation
+    target.confirmation_note = source.confirmation_note
+    target.external_execution_result = source.external_execution_result
+    target.external_execution_result_provided = source.external_execution_result_provided
+    target.approval_metadata = source.approval_metadata
+    if target.approval_metadata is None and source.tool_execution is not None:
+        target.approval_metadata = source.tool_execution.resume_metadata
+
+    if source.user_input_schema is not None:
+        target.user_input_schema = source.user_input_schema
+    if source.user_feedback_schema is not None:
+        target.user_feedback_schema = source.user_feedback_schema
+
+
+def _apply_tool_resolution_to_requirement(target: "RunRequirement", source_tool: ToolExecution) -> None:
+    """Copy legacy ToolExecution resolution data into a matching RunRequirement."""
+
+    if target.tool_execution is not None:
+        target.tool_execution.confirmed = source_tool.confirmed
+        target.tool_execution.confirmation_note = source_tool.confirmation_note
+        target.tool_execution.result = source_tool.result
+        target.tool_execution.external_execution_result_provided = source_tool.external_execution_result_provided
+        target.tool_execution.resume_metadata = source_tool.resume_metadata
+
+        if source_tool.user_input_schema is not None:
+            target.tool_execution.user_input_schema = source_tool.user_input_schema
+        if source_tool.user_feedback_schema is not None:
+            target.tool_execution.user_feedback_schema = source_tool.user_feedback_schema
+        target.tool_execution.answered = source_tool.answered
+
+    if source_tool.confirmed is not None:
+        target.confirmation = source_tool.confirmed
+        target.confirmation_note = source_tool.confirmation_note
+    if source_tool.resume_metadata is not None:
+        target.approval_metadata = source_tool.resume_metadata
+    if source_tool.user_input_schema is not None:
+        target.user_input_schema = source_tool.user_input_schema
+    if source_tool.user_feedback_schema is not None:
+        target.user_feedback_schema = source_tool.user_feedback_schema
+    if source_tool.external_execution_result_provided or (
+        source_tool.external_execution_required and source_tool.result is not None
+    ):
+        target.external_execution_result = source_tool.result
+        target.external_execution_result_provided = True
+
+
+def _apply_tool_resolution_to_tool(target: ToolExecution, source: ToolExecution) -> None:
+    """Apply legacy ToolExecution resolution fields without dropping stored tool context."""
+
+    if source.confirmed is not None:
+        target.confirmed = source.confirmed
+    if source.confirmation_note is not None:
+        target.confirmation_note = source.confirmation_note
+    if source.resume_metadata is not None:
+        target.resume_metadata = source.resume_metadata
+    if source.user_input_schema is not None:
+        target.user_input_schema = source.user_input_schema
+    if source.user_feedback_schema is not None:
+        target.user_feedback_schema = source.user_feedback_schema
+    if source.answered is not None:
+        target.answered = source.answered
+    if source.external_execution_result_provided or source.result is not None:
+        target.result = source.result
+    if source.external_execution_result_provided is not None:
+        target.external_execution_result_provided = source.external_execution_result_provided
+
+
+def _requirement_route_run_id(req: "RunRequirement") -> Optional[str]:
+    return getattr(req, "routed_member_run_id", None) or getattr(req, "member_run_id", None)
+
+
+def _is_requirement_resolved(requirement: "RunRequirement") -> bool:
+    try:
+        return requirement.is_resolved()
+    except Exception:
+        return False
+
+
+def _requirement_blocks_continue(requirement: "RunRequirement") -> bool:
+    return getattr(requirement, "_routing_failed", False) or not _is_requirement_resolved(requirement)
+
+
+def _requirements_have_same_route_and_tool_call(target: "RunRequirement", source: "RunRequirement") -> bool:
+    target_tool = getattr(target, "tool_execution", None)
+    source_tool = getattr(source, "tool_execution", None)
+    target_tool_call_id = getattr(target_tool, "tool_call_id", None)
+    source_tool_call_id = getattr(source_tool, "tool_call_id", None)
+    if target_tool_call_id is None or source_tool_call_id is None or target_tool_call_id != source_tool_call_id:
+        return False
+
+    return _get_requirement_route_member_id(target) == _get_requirement_route_member_id(
+        source
+    ) and _requirement_route_run_id(target) == _requirement_route_run_id(source)
+
+
+def _requirements_have_same_tool_call(target: "RunRequirement", source: "RunRequirement") -> bool:
+    target_tool = getattr(target, "tool_execution", None)
+    source_tool = getattr(source, "tool_execution", None)
+    target_tool_call_id = getattr(target_tool, "tool_call_id", None)
+    source_tool_call_id = getattr(source_tool, "tool_call_id", None)
+    return target_tool_call_id is not None and target_tool_call_id == source_tool_call_id
+
+
+def _find_requirement_resolution_target(
+    existing_requirements: List["RunRequirement"],
+    source: "RunRequirement",
+    matched_existing_ids: set[int],
+) -> Optional["RunRequirement"]:
+    source_id = getattr(source, "id", None)
+    if source_id is not None:
+        exact_match = next(
+            (
+                existing
+                for existing in existing_requirements
+                if id(existing) not in matched_existing_ids and getattr(existing, "id", None) == source_id
+            ),
+            None,
+        )
+        if exact_match is not None:
+            return exact_match
+
+    candidates = [
+        existing
+        for existing in existing_requirements
+        if id(existing) not in matched_existing_ids and _requirements_have_same_route_and_tool_call(existing, source)
+    ]
+    if not candidates:
+        return None
+
+    unresolved_candidates = [candidate for candidate in candidates if not _is_requirement_resolved(candidate)]
+    if unresolved_candidates:
+        return unresolved_candidates[-1]
+    return candidates[-1]
+
+
+def _find_member_requirement_resolution_target(
+    existing_requirements: List["RunRequirement"],
+    source: "RunRequirement",
+    matched_existing_ids: set[int],
+) -> Optional["RunRequirement"]:
+    source_id = getattr(source, "id", None)
+    if source_id is not None:
+        exact_match = next(
+            (
+                existing
+                for existing in existing_requirements
+                if id(existing) not in matched_existing_ids and getattr(existing, "id", None) == source_id
+            ),
+            None,
+        )
+        if exact_match is not None:
+            return exact_match
+
+    candidates = [
+        existing
+        for existing in existing_requirements
+        if id(existing) not in matched_existing_ids and _requirements_have_same_tool_call(existing, source)
+    ]
+    if not candidates:
+        return None
+
+    unresolved_candidates = [candidate for candidate in candidates if not _is_requirement_resolved(candidate)]
+    if unresolved_candidates:
+        return unresolved_candidates[-1]
+    return candidates[-1]
+
+
+def _apply_updated_tools_to_run_response(run_response: TeamRunOutput, updated_tools: List[ToolExecution]) -> None:
+    from agno.run.requirement import RunRequirement
+
+    if run_response.tools:
+        existing_tools = list(run_response.tools)
+        matched_indexes: set[int] = set()
+        for updated_tool in updated_tools:
+            for index, existing_tool in enumerate(existing_tools):
+                if index in matched_indexes:
+                    continue
+                if (
+                    existing_tool.tool_call_id is not None
+                    and updated_tool.tool_call_id is not None
+                    and existing_tool.tool_call_id == updated_tool.tool_call_id
+                ):
+                    _apply_tool_resolution_to_tool(existing_tool, updated_tool)
+                    matched_indexes.add(index)
+                    break
+            else:
+                existing_tools.append(updated_tool)
+        run_response.tools = existing_tools
+    else:
+        run_response.tools = updated_tools
+
+    if run_response.requirements:
+        matched_existing_ids: set[int] = set()
+        existing_requirements = list(run_response.requirements)
+        for updated_tool in updated_tools:
+            source = RunRequirement(updated_tool)
+            target = _find_requirement_resolution_target(existing_requirements, source, matched_existing_ids)
+            if target is None:
+                continue
+            matched_existing_ids.add(id(target))
+            _apply_tool_resolution_to_requirement(target, updated_tool)
+        _sync_run_response_tools_from_requirements(run_response, existing_requirements)
+
+
+def _apply_requirements_to_run_response(run_response: TeamRunOutput, requirements: List["RunRequirement"]) -> None:
+    existing_requirements = list(run_response.requirements or [])
+    if not existing_requirements:
+        run_response.requirements = requirements
+        _sync_run_response_tools_from_requirements(run_response, requirements)
+        return
+
+    matched_existing_ids: set[int] = set()
+    merged_requirements = list(existing_requirements)
+    for source in requirements:
+        target = _find_requirement_resolution_target(existing_requirements, source, matched_existing_ids)
+        if target is None:
+            merged_requirements.append(source)
+            continue
+
+        matched_existing_ids.add(id(target))
+        _apply_requirement_resolution(target, source)
+
+    run_response.requirements = merged_requirements
+    _sync_run_response_tools_from_requirements(run_response, merged_requirements)
+
+
+def _merge_routed_requirements_into_member_run(member_run_output: Any, reqs: List["RunRequirement"]) -> None:
+    existing_requirements = list(getattr(member_run_output, "requirements", None) or [])
+    matched_existing_ids: set[int] = set()
+    unmatched_requirements = []
+    merged_tool_executions = []
+
+    for req in reqs:
+        target = _find_member_requirement_resolution_target(existing_requirements, req, matched_existing_ids)
+        if target is not None:
+            matched_existing_ids.add(id(target))
+            _apply_requirement_resolution(target, req)
+            if target.tool_execution is not None:
+                merged_tool_executions.append(target.tool_execution)
+        else:
+            unmatched_requirements.append(req)
+            if req.tool_execution is not None:
+                merged_tool_executions.append(req.tool_execution)
+
+    if unmatched_requirements:
+        member_run_output.requirements = existing_requirements + unmatched_requirements
+
+    if merged_tool_executions and getattr(member_run_output, "tools", None):
+        synced_tools = list(member_run_output.tools)
+        matched_tool_indexes: set[int] = set()
+        for merged_tool in merged_tool_executions:
+            matched = False
+            for index, existing_tool in enumerate(synced_tools):
+                if index in matched_tool_indexes:
+                    continue
+                if existing_tool is merged_tool:
+                    matched_tool_indexes.add(index)
+                    matched = True
+                    break
+                if (
+                    existing_tool.tool_call_id is not None
+                    and merged_tool.tool_call_id is not None
+                    and existing_tool.tool_call_id == merged_tool.tool_call_id
+                ):
+                    synced_tools[index] = merged_tool
+                    matched_tool_indexes.add(index)
+                    matched = True
+                    break
+            if not matched:
+                synced_tools.append(merged_tool)
+        member_run_output.tools = synced_tools
+    elif merged_tool_executions and not getattr(member_run_output, "tools", None):
+        member_run_output.tools = merged_tool_executions
+
+
+def _get_requirement_route_member_id(req: "RunRequirement") -> Optional[str]:
+    return getattr(req, "routed_member_agent_id", None) or getattr(req, "member_agent_id", None)
+
+
+def _get_requirement_route_run_id(reqs: List["RunRequirement"]) -> Optional[str]:
+    if not reqs:
+        return None
+    return _requirement_route_run_id(reqs[0])
+
+
+def _get_requirement_route_bucket_key(req: "RunRequirement") -> Any:
+    member_run_output = getattr(req, "_member_run_response", None)
+    if member_run_output is not None:
+        return ("run_response", id(member_run_output))
+    return ("run_id", _requirement_route_run_id(req))
+
+
+def _prepare_requirements_for_routed_member(reqs: List["RunRequirement"]) -> List["RunRequirement"]:
+    from copy import copy
+
+    prepared = []
+    for req in reqs:
+        routed_req = copy(req)
+        routed_req.routed_member_agent_id = None
+        routed_req.routed_member_agent_name = None
+        routed_req.routed_member_run_id = None
+        if getattr(req, "routed_member_is_team_level", False):
+            routed_req.member_agent_id = None
+            routed_req.member_agent_name = None
+            routed_req.member_run_id = None
+        routed_req.routed_member_is_team_level = False
+        prepared.append(routed_req)
+    return prepared
 
 
 def _member_continue_kwargs_from_run_context(run_context: Optional[RunContext]) -> Dict[str, Any]:
@@ -6340,7 +6929,7 @@ def _resolve_member_run_output_for_continue(
     from agno.utils.team import get_member_id
 
     member_run_output = getattr(reqs[0], "_member_run_response", None) if reqs else None
-    member_run_id = reqs[0].member_run_id if reqs else None
+    member_run_id = _requirement_route_run_id(reqs[0]) if reqs else None
     routed_to_team = isinstance(member, Team)
 
     if member_run_output is not None and member_run_id is not None:
@@ -6421,11 +7010,11 @@ def _group_requirements_for_continue(
     from agno.utils.callables import get_resolved_members
     from agno.utils.team import get_member_id
 
-    member_reqs: Dict[Tuple[str, Optional[str]], List["RunRequirement"]] = {}
+    member_reqs: Dict[Tuple[str, Any], List["RunRequirement"]] = {}
     for req in run_response.requirements or []:
-        mid = getattr(req, "member_agent_id", None)
+        mid = _get_requirement_route_member_id(req)
         if mid is not None:
-            member_reqs.setdefault((mid, getattr(req, "member_run_id", None)), []).append(req)
+            member_reqs.setdefault((mid, _get_requirement_route_bucket_key(req)), []).append(req)
 
     entries: List[Tuple[Union["Agent", "Team"], Optional[Union[RunOutput, TeamRunOutput]], List["RunRequirement"]]] = []
     for (member_id, _), reqs in member_reqs.items():
@@ -6537,6 +7126,7 @@ def _route_requirements_to_members(
     for member, member_run_output, reqs in groups:
         member_id = get_member_id(member) or ""
         member_run_id = reqs[0].member_run_id if reqs else None
+        routed_reqs = _prepare_requirements_for_routed_member(reqs)
 
         member_run_id = getattr(member_run_output, "run_id", None) if member_run_output is not None else member_run_id
         if member_run_id and run_response.run_id is not None:
@@ -6547,26 +7137,26 @@ def _route_requirements_to_members(
         member_continue_kwargs = _member_continue_kwargs_from_run_context(run_context)
 
         if member_run_output is not None:
-            # Update requirements and tool executions on the member's run output
-            member_run_output.requirements = reqs
-            updated_tools = [req.tool_execution for req in reqs if req.tool_execution is not None]
-            if updated_tools and member_run_output.tools:
-                updated_map = {t.tool_call_id: t for t in updated_tools}
-                member_run_output.tools = [updated_map.get(t.tool_call_id, t) for t in member_run_output.tools]
+            # Update resolution fields on the member's paused run output while preserving nested routing context.
+            _merge_routed_requirements_into_member_run(member_run_output, routed_reqs)
 
             member_response = member.continue_run(
                 run_response=member_run_output,  # type: ignore[arg-type]
+                requirements=routed_reqs,
                 session_id=session.session_id,
                 **member_continue_kwargs,
             )
         else:
             # Fallback: use run_id (requires DB or cached session)
+            member_run_id = member_run_id or _get_requirement_route_run_id(reqs)
             member_response = member.continue_run(  # type: ignore[arg-type]
                 run_id=member_run_id,
-                requirements=reqs,
+                requirements=routed_reqs,
                 session_id=session.session_id,
                 **member_continue_kwargs,
             )
+
+        _replace_or_add_member_response(run_response, member_response)
 
         # Check if member is still paused (chained HITL)
         if getattr(member_response, "is_paused", False):
@@ -6612,87 +7202,119 @@ def _route_requirements_to_members_stream(
     Yields:
         Member streaming events (RunOutputEvent, TeamRunOutputEvent).
     """
-    from agno.utils.team import get_member_id
+    from agno.team._tools import _find_member_route_by_id
 
-    groups = _group_requirements_for_continue(team, run_response, session, run_context)
+    # Group requirements by member and paused member run.
+    member_reqs: Dict[tuple[str, Any], List[RunRequirement]] = {}
+    for req in run_response.requirements or []:
+        mid = _get_requirement_route_member_id(req)
+        if mid is not None:
+            member_reqs.setdefault((mid, _get_requirement_route_bucket_key(req)), []).append(req)
 
-    for member, member_run_output, reqs in groups:
-        member_id = get_member_id(member) or ""
-        member_run_id = reqs[0].member_run_id if reqs else None
+    for (member_id, _), reqs in member_reqs.items():
+        route_result = _find_member_route_by_id(team, member_id, run_context=run_context)
+        if route_result is None:
+            log_warning(f"Could not find member with ID {member_id} for continue_run routing")
+            for req in reqs:
+                req._routing_failed = True
+            member_results.append(f"[{member_id}]: Could not route requirement — member not found")
+            continue
 
-        member_run_id = getattr(member_run_output, "run_id", None) if member_run_output is not None else member_run_id
-        if member_run_id and run_response.run_id is not None:
-            register_member_run(run_response.run_id, member_run_id)
+        _, member = route_result
 
-        # Forward team's run_context state to the member so dependencies and
-        # session_state remain accessible to member tools after continue_run.
-        member_continue_kwargs = _member_continue_kwargs_from_run_context(run_context)
+        try:
+            member_run_output = getattr(reqs[0], "_member_run_response", None)
+            routed_reqs = _prepare_requirements_for_routed_member(reqs)
 
-        if member_run_output is not None:
-            member_run_output.requirements = reqs
-            updated_tools = [req.tool_execution for req in reqs if req.tool_execution is not None]
-            if updated_tools and member_run_output.tools:
-                updated_map = {t.tool_call_id: t for t in updated_tools}
-                member_run_output.tools = [updated_map.get(t.tool_call_id, t) for t in member_run_output.tools]
+            member_run_id = reqs[0].member_run_id if reqs else None
+            if member_run_output is None and member_run_id:
+                if run_response.member_responses:
+                    for sibling_response in run_response.member_responses:
+                        if getattr(sibling_response, "run_id", None) == member_run_id:
+                            member_run_output = sibling_response
+                            break
+                if member_run_output is None and session is not None and session.runs:
+                    for session_run in session.runs:
+                        if getattr(session_run, "run_id", None) == member_run_id:
+                            member_run_output = session_run  # type: ignore[assignment]
+                            break
 
-            member_response_stream = member.continue_run(  # type: ignore[call-overload]
-                run_response=member_run_output,  # type: ignore[arg-type]
-                session_id=session.session_id,
-                stream=True,
-                stream_events=stream_events or team.stream_member_events,
-                yield_run_output=True,
-                **member_continue_kwargs,
+            member_run_id = (
+                getattr(member_run_output, "run_id", None) if member_run_output is not None else member_run_id
             )
-        else:
-            member_response_stream = member.continue_run(  # type: ignore[call-overload]
-                run_id=member_run_id,
-                requirements=reqs,
-                session_id=session.session_id,
-                stream=True,
-                stream_events=stream_events or team.stream_member_events,
-                yield_run_output=True,
-                **member_continue_kwargs,
-            )
+            if member_run_id and run_response.run_id is not None:
+                register_member_run(run_response.run_id, member_run_id)
 
-        # Iterate the member's streaming response — yield intermediate events,
-        member_response: Optional[Union[RunOutput, TeamRunOutput]] = None
-        for event in member_response_stream:  # type: ignore[union-attr]
-            if isinstance(event, (RunOutput, TeamRunOutput)):
-                member_response = event
-                continue  # Don't yield the final RunOutput
+            member_continue_kwargs = _member_continue_kwargs_from_run_context(run_context)
 
-            if not isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES):
-                raise_if_cancelled(run_response.run_id)  # type: ignore
+            if member_run_output is not None:
+                _merge_routed_requirements_into_member_run(member_run_output, routed_reqs)
 
-            # Set parent_run_id on member events (same as delegate_task_to_member)
-            event.parent_run_id = getattr(event, "parent_run_id", None) or run_response.run_id
-
-            # Forward member terminals regardless of stream_events so the wire always sees a terminal.
-            if isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES) or stream_events or team.stream_member_events:
-                yield handle_event(
-                    event,
-                    run_response,
-                    events_to_skip=team.events_to_skip,
-                    store_events=team.store_events,
+                member_response_stream = member.continue_run(  # type: ignore[call-overload]
+                    run_response=member_run_output,  # type: ignore[arg-type]
+                    requirements=routed_reqs,
+                    session_id=session.session_id,
+                    stream=True,
+                    stream_events=stream_events or team.stream_member_events,
+                    yield_run_output=True,
+                    **member_continue_kwargs,
+                )
+            else:
+                member_run_id = member_run_id or _get_requirement_route_run_id(reqs)
+                member_response_stream = member.continue_run(  # type: ignore[call-overload]
+                    run_id=member_run_id,
+                    requirements=routed_reqs,
+                    session_id=session.session_id,
+                    stream=True,
+                    stream_events=stream_events or team.stream_member_events,
+                    yield_run_output=True,
+                    **member_continue_kwargs,
                 )
 
-        if member_response is None:
-            log_warning(f"Member {member_id} streaming did not yield a final RunOutput")
-            member_results.append(f"[{member.name or member_id}]: Task completed (no final output)")
-        elif getattr(member_response, "is_paused", False):
-            from agno.team._tools import _propagate_member_pause
+            # Iterate the member's streaming response — yield intermediate events,
+            member_response: Optional[Union[RunOutput, TeamRunOutput]] = None
+            for event in member_response_stream:  # type: ignore[union-attr]
+                if isinstance(event, (RunOutput, TeamRunOutput)):
+                    member_response = event
+                    continue  # Don't yield the final RunOutput
 
-            _propagate_member_pause(run_response, member, member_response)
-            # Persist paused member run so continue_run can find it after session reload
-            session.upsert_run(_member_run_for_storage(team, session, member_response))
-        else:
-            session.upsert_run(_member_run_for_storage(team, session, member_response))
-            content = getattr(member_response, "content", None) or "Task completed"
-            member_results.append(f"[{member.name or member_id}]: {content}")
+                if not isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES):
+                    raise_if_cancelled(run_response.run_id)  # type: ignore
 
-        # Clear _member_run_response references to allow GC of the member RunOutput
-        for req in reqs:
-            req._member_run_response = None
+                # Set parent_run_id on member events (same as delegate_task_to_member)
+                event.parent_run_id = getattr(event, "parent_run_id", None) or run_response.run_id
+
+                # Forward member terminals regardless of stream_events so the wire always sees a terminal.
+                if isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES) or stream_events or team.stream_member_events:
+                    yield handle_event(
+                        event,
+                        run_response,
+                        events_to_skip=team.events_to_skip,
+                        store_events=team.store_events,
+                    )
+
+            if member_response is None:
+                log_warning(f"Member {member_id} streaming did not yield a final RunOutput")
+                member_results.append(f"[{member.name or member_id}]: Task completed (no final output)")
+            elif getattr(member_response, "is_paused", False):
+                from agno.team._tools import _propagate_member_pause
+
+                _propagate_member_pause(run_response, member, member_response)
+            else:
+                session.upsert_run(member_response)
+                content = getattr(member_response, "content", None) or "Task completed"
+                member_results.append(f"[{member.name or member_id}]: {content}")
+        except RunCancelledException:
+            raise
+        except Exception as exc:
+            for req in reqs:
+                req._routing_failed = True
+            log_warning(f"Member {member.name or member_id} streaming continue_run failed: {exc}")
+        finally:
+            # Clear _member_run_response references to allow GC of the member RunOutput,
+            # even if streaming raised.
+            for req in reqs:
+                req._member_run_response = None
 
 
 async def _aroute_requirements_to_members(
@@ -6722,6 +7344,7 @@ async def _aroute_requirements_to_members(
     ) -> Optional[str]:
         member_id = get_member_id(member) or ""
         member_run_id = reqs[0].member_run_id if reqs else None
+        routed_reqs = _prepare_requirements_for_routed_member(reqs)
 
         member_run_id = getattr(member_run_output, "run_id", None) if member_run_output is not None else member_run_id
         if member_run_id and run_response.run_id is not None:
@@ -6732,24 +7355,24 @@ async def _aroute_requirements_to_members(
         member_continue_kwargs = _member_continue_kwargs_from_run_context(run_context)
 
         if member_run_output is not None:
-            member_run_output.requirements = reqs
-            updated_tools = [req.tool_execution for req in reqs if req.tool_execution is not None]
-            if updated_tools and member_run_output.tools:
-                updated_map = {t.tool_call_id: t for t in updated_tools}
-                member_run_output.tools = [updated_map.get(t.tool_call_id, t) for t in member_run_output.tools]
+            _merge_routed_requirements_into_member_run(member_run_output, routed_reqs)
 
             member_response = await member.acontinue_run(  # type: ignore[misc]
                 run_response=member_run_output,  # type: ignore[arg-type]
+                requirements=routed_reqs,
                 session_id=session.session_id,
                 **member_continue_kwargs,
             )
         else:
+            member_run_id = member_run_id or _get_requirement_route_run_id(reqs)
             member_response = await member.acontinue_run(  # type: ignore[misc]
                 run_id=member_run_id,
-                requirements=reqs,
+                requirements=routed_reqs,
                 session_id=session.session_id,
                 **member_continue_kwargs,
             )
+
+        _replace_or_add_member_response(run_response, member_response)
 
         # Clear _member_run_response references to allow GC of the member RunOutput
         for req in reqs:
@@ -6770,17 +7393,22 @@ async def _aroute_requirements_to_members(
             content = getattr(member_response, "content", None) or "Task completed"
             return f"[{member.name or member_id}]: {content}"
 
+    task_reqs = [reqs for _, _, reqs in groups]
     tasks = [_continue_member(member, member_run_output, reqs) for member, member_run_output, reqs in groups]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     member_results: List[str] = []
-    for r in results:
+    for index, r in enumerate(results):
         if isinstance(r, RunNotContinuableError):
             # A member (e.g. a sub-team) refused the continue outright; the
             # paused state is intact, so surface it instead of completing
             # the team run without the approved tool.
             raise r
+        if isinstance(r, (RunCancelledException, asyncio.CancelledError)):
+            raise r
         if isinstance(r, BaseException):
+            for req in task_reqs[index]:
+                req._routing_failed = True
             log_warning(f"Member continue_run failed: {r}")
         elif isinstance(r, str):
             member_results.append(r)
@@ -6812,87 +7440,122 @@ async def _aroute_requirements_to_members_stream(
     Yields:
         Member streaming events (RunOutputEvent, TeamRunOutputEvent).
     """
-    from agno.utils.team import get_member_id
+    from agno.team._tools import _find_member_route_by_id
 
-    groups = _group_requirements_for_continue(team, run_response, session, run_context)
+    # Group requirements by member and paused member run.
+    member_reqs: Dict[tuple[str, Any], List[RunRequirement]] = {}
+    for req in run_response.requirements or []:
+        mid = _get_requirement_route_member_id(req)
+        if mid is not None:
+            member_reqs.setdefault((mid, _get_requirement_route_bucket_key(req)), []).append(req)
 
-    for member, member_run_output, reqs in groups:
-        member_id = get_member_id(member) or ""
-        member_run_id = reqs[0].member_run_id if reqs else None
+    for (member_id, _), reqs in member_reqs.items():
+        route_result = _find_member_route_by_id(team, member_id, run_context=run_context)
+        if route_result is None:
+            log_warning(f"Could not find member with ID {member_id} for continue_run routing")
+            for req in reqs:
+                req._routing_failed = True
+            member_results.append(f"[{member_id}]: Could not route requirement — member not found")
+            continue
 
-        member_run_id = getattr(member_run_output, "run_id", None) if member_run_output is not None else member_run_id
-        if member_run_id and run_response.run_id is not None:
-            await aregister_member_run(run_response.run_id, member_run_id)
+        _, member = route_result
 
-        # Forward team's run_context state to the member so dependencies and
-        # session_state remain accessible to member tools after continue_run.
-        member_continue_kwargs = _member_continue_kwargs_from_run_context(run_context)
+        # Per-member try/except so one member's failure doesn't abort the rest
+        # of the streaming loop. Mirrors the `return_exceptions=True` shape of
+        # `_aroute_requirements_to_members` (the non-streaming sibling).
+        try:
+            member_run_output = getattr(reqs[0], "_member_run_response", None)
+            routed_reqs = _prepare_requirements_for_routed_member(reqs)
 
-        if member_run_output is not None:
-            member_run_output.requirements = reqs
-            updated_tools = [req.tool_execution for req in reqs if req.tool_execution is not None]
-            if updated_tools and member_run_output.tools:
-                updated_map = {t.tool_call_id: t for t in updated_tools}
-                member_run_output.tools = [updated_map.get(t.tool_call_id, t) for t in member_run_output.tools]
+            member_run_id = reqs[0].member_run_id if reqs else None
+            if member_run_output is None and member_run_id:
+                if run_response.member_responses:
+                    for sibling_response in run_response.member_responses:
+                        if getattr(sibling_response, "run_id", None) == member_run_id:
+                            member_run_output = sibling_response
+                            break
+                if member_run_output is None and session is not None and session.runs:
+                    for session_run in session.runs:
+                        if getattr(session_run, "run_id", None) == member_run_id:
+                            member_run_output = session_run  # type: ignore[assignment]
+                            break
 
-            member_response_stream = member.acontinue_run(  # type: ignore[call-overload]
-                run_response=member_run_output,  # type: ignore[arg-type]
-                session_id=session.session_id,
-                stream=True,
-                stream_events=stream_events or team.stream_member_events,
-                yield_run_output=True,
-                **member_continue_kwargs,
+            member_run_id = (
+                getattr(member_run_output, "run_id", None) if member_run_output is not None else member_run_id
             )
-        else:
-            member_response_stream = member.acontinue_run(  # type: ignore[call-overload]
-                run_id=member_run_id,
-                requirements=reqs,
-                session_id=session.session_id,
-                stream=True,
-                stream_events=stream_events or team.stream_member_events,
-                yield_run_output=True,
-                **member_continue_kwargs,
-            )
+            if member_run_id and run_response.run_id is not None:
+                await aregister_member_run(run_response.run_id, member_run_id)
 
-        # Iterate the member's async streaming response — yield intermediate events,
-        member_response: Optional[Union[RunOutput, TeamRunOutput]] = None
-        async for event in member_response_stream:  # type: ignore[union-attr]
-            if isinstance(event, (RunOutput, TeamRunOutput)):
-                member_response = event
-                continue  # Don't yield the final RunOutput
+            member_continue_kwargs = _member_continue_kwargs_from_run_context(run_context)
 
-            if not isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES):
-                await araise_if_cancelled(run_response.run_id)  # type: ignore
+            if member_run_output is not None:
+                _merge_routed_requirements_into_member_run(member_run_output, routed_reqs)
 
-            # Set parent_run_id on member events (same as adelegate_task_to_member)
-            event.parent_run_id = getattr(event, "parent_run_id", None) or run_response.run_id
-
-            # Forward member terminals regardless of stream_events so the wire always sees a terminal.
-            if isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES) or stream_events or team.stream_member_events:
-                yield handle_event(
-                    event,
-                    run_response,
-                    events_to_skip=team.events_to_skip,
-                    store_events=team.store_events,
+                member_response_stream = member.acontinue_run(  # type: ignore[call-overload]
+                    run_response=member_run_output,  # type: ignore[arg-type]
+                    requirements=routed_reqs,
+                    session_id=session.session_id,
+                    stream=True,
+                    stream_events=stream_events or team.stream_member_events,
+                    yield_run_output=True,
+                    **member_continue_kwargs,
+                )
+            else:
+                member_run_id = member_run_id or _get_requirement_route_run_id(reqs)
+                member_response_stream = member.acontinue_run(  # type: ignore[call-overload]
+                    run_id=member_run_id,
+                    requirements=routed_reqs,
+                    session_id=session.session_id,
+                    stream=True,
+                    stream_events=stream_events or team.stream_member_events,
+                    yield_run_output=True,
+                    **member_continue_kwargs,
                 )
 
-        if member_response is None:
-            log_warning(f"Member {member_id} streaming did not yield a final RunOutput")
-            member_results.append(f"[{member.name or member_id}]: Task completed (no final output)")
-        elif getattr(member_response, "is_paused", False):
-            from agno.team._tools import _propagate_member_pause
+            # Iterate the member's async streaming response — yield intermediate events,
+            member_response: Optional[Union[RunOutput, TeamRunOutput]] = None
+            async for event in member_response_stream:  # type: ignore[union-attr]
+                if isinstance(event, (RunOutput, TeamRunOutput)):
+                    member_response = event
+                    continue  # Don't yield the final RunOutput
 
-            _propagate_member_pause(run_response, member, member_response)
-            # Persist paused member run so continue_run can find it after session reload
-            session.upsert_run(await _amember_run_for_storage(team, session, member_response))
-        else:
-            session.upsert_run(await _amember_run_for_storage(team, session, member_response))
-            content = getattr(member_response, "content", None) or "Task completed"
-            member_results.append(f"[{member.name or member_id}]: {content}")
+                if not isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES):
+                    await araise_if_cancelled(run_response.run_id)  # type: ignore
 
-        # Clear _member_run_response references to allow GC of the member RunOutput
-        for req in reqs:
-            req._member_run_response = None
+                # Set parent_run_id on member events (same as adelegate_task_to_member)
+                event.parent_run_id = getattr(event, "parent_run_id", None) or run_response.run_id
+
+                # Forward member terminals regardless of stream_events so the wire always sees a terminal.
+                if isinstance(event, _MEMBER_CANCEL_BYPASS_EVENT_TYPES) or stream_events or team.stream_member_events:
+                    yield handle_event(
+                        event,
+                        run_response,
+                        events_to_skip=team.events_to_skip,
+                        store_events=team.store_events,
+                    )
+
+            if member_response is None:
+                log_warning(f"Member {member_id} streaming did not yield a final RunOutput")
+                member_results.append(f"[{member.name or member_id}]: Task completed (no final output)")
+            elif getattr(member_response, "is_paused", False):
+                from agno.team._tools import _propagate_member_pause
+
+                _propagate_member_pause(run_response, member, member_response)
+            else:
+                session.upsert_run(member_response)
+                content = getattr(member_response, "content", None) or "Task completed"
+                member_results.append(f"[{member.name or member_id}]: {content}")
+        except RunCancelledException:
+            raise
+        except Exception as exc:
+            for req in reqs:
+                req._routing_failed = True
+            log_warning(f"Member {member.name or member_id} streaming continue_run failed: {exc}")
+        finally:
+            # Clear _member_run_response references to allow GC of the member RunOutput,
+            # even if streaming raised.
+            for req in reqs:
+                req._member_run_response = None
 
 
 def _build_continuation_message(member_results: List[str]) -> str:
@@ -6985,6 +7648,7 @@ async def _ahandle_model_response_for_continue(
         tool_choice=team.tool_choice,
         tool_call_limit=team.tool_call_limit,
         run_response=run_response,
+        run_context=run_context,
         send_media_to_model=team.send_media_to_model,
         compression_manager=team.compression_manager if team.compress_tool_results else None,
         **result_store_kwargs(team),
@@ -7496,11 +8160,25 @@ async def afork_session_dispatch(
     return new_session.session_id
 
 
+def _append_member_results_to_run_messages(run_messages: RunMessages, member_results: List[str]) -> None:
+    if member_results:
+        run_messages.messages.append(Message(role="user", content=_build_continuation_message(member_results)))
+
+
+def _append_member_results_to_run_response(run_response: TeamRunOutput, member_results: List[str]) -> None:
+    if not member_results:
+        return
+    if run_response.additional_input is None:
+        run_response.additional_input = []
+    run_response.additional_input.append(Message(role="user", content=_build_continuation_message(member_results)))
+
+
 def continue_run_dispatch(
     team: "Team",
     run_response: Optional[TeamRunOutput] = None,
     *,
     run_id: Optional[str] = None,
+    updated_tools: Optional[List[ToolExecution]] = None,
     requirements: Optional[List[Any]] = None,
     # --- Continue sugar (mirrors agent dispatch) ---
     input: Optional[str] = None,
@@ -7761,6 +8439,10 @@ def continue_run_dispatch(
             )
     # --- End snapshot dispatch ----------------------------------------------
 
+    # Apply explicit tool updates first (legacy `updated_tools` parameter path)
+    if updated_tools is not None:
+        _apply_updated_tools_to_run_response(run_response, updated_tools)
+
     # Normalize and apply requirements
     if requirements:
         old_requirements, old_tools, decisions = _apply_requirements_payload(run_response, requirements)
@@ -7778,7 +8460,7 @@ def continue_run_dispatch(
                 # The payload was supplied; the approval gate is what refused.
                 # Surface its reason instead of asking for a payload again.
                 raise ValueError(str(e))
-    elif run_response.tools:
+    elif updated_tools is None and (run_response.tools or run_response.requirements):
         from agno.run.approval import check_and_apply_approval_resolution
 
         try:
@@ -7845,8 +8527,8 @@ def continue_run_dispatch(
     # Route member requirements to member agents
     member_results: List[str] = []
     if has_member:
-        member_reqs = [r for r in (run_response.requirements or []) if getattr(r, "member_agent_id", None) is not None]
-        team_level_reqs = [r for r in (run_response.requirements or []) if getattr(r, "member_agent_id", None) is None]
+        member_reqs = [r for r in (run_response.requirements or []) if _get_requirement_route_member_id(r) is not None]
+        team_level_reqs = [r for r in (run_response.requirements or []) if _get_requirement_route_member_id(r) is None]
         # Set only member reqs for routing; _route_requirements_to_members
         # may append newly propagated reqs via _propagate_member_pause (chained HITL).
         original_member_req_ids = {id(r) for r in member_reqs}
@@ -7903,15 +8585,30 @@ def continue_run_dispatch(
 
         # Non-streaming: merge and check for chained pauses
         newly_propagated = [r for r in (run_response.requirements or []) if id(r) not in original_member_req_ids]
-        run_response.requirements = team_level_reqs + newly_propagated
+        remaining_member_reqs = _remaining_original_member_requirements(
+            run_response.requirements or [], original_member_req_ids
+        )
+        run_response.requirements = team_level_reqs + remaining_member_reqs + newly_propagated
 
-        # Check if any members are still paused
-        if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+        # Check if any members are still paused and no team-level resolution can be consumed.
+        if _unresolved_member_requirements(run_response.requirements or []) and not _resolved_team_level_requirements(
+            run_response.requirements or []
+        ):
             from agno.team import _hooks
 
-            return _hooks.handle_team_run_paused(
-                team, run_response=run_response, session=team_session, run_context=run_context
-            )
+            _append_member_results_to_run_response(run_response, member_results)
+            if opts.stream:
+                return _handle_team_run_paused_stream_with_output(
+                    team,
+                    run_response=run_response,
+                    session=team_session,
+                    run_context=run_context,
+                    yield_run_output=opts.yield_run_output,
+                )
+            else:
+                return _hooks.handle_team_run_paused(
+                    team, run_response=run_response, session=team_session, run_context=run_context
+                )
 
     # Handle team-level tool resolution
     if has_team_level or _did_snapshot_dispatch:
@@ -7919,25 +8616,21 @@ def continue_run_dispatch(
         # requirements, no tools) still needs the team-leader model call to
         # produce a response. Without this, those runs would fall through
         # with no model invocation.
-        # Guard: if team-level requirements are unresolved, re-pause instead of auto-rejecting
-        unresolved_team = [
-            r
-            for r in (run_response.requirements or [])
-            if getattr(r, "member_agent_id", None) is None and not r.is_resolved()
-        ]
-        if unresolved_team:
+        # Guard only when there is no resolved team-level tool to consume. Partial
+        # continues should execute resolved tools before re-pausing on remaining work.
+        unresolved_team = _unresolved_team_level_requirements(run_response.requirements or [])
+        if unresolved_team and not _resolved_team_level_requirements(run_response.requirements or []):
             from agno.team import _hooks
 
+            _append_member_results_to_run_response(run_response, member_results)
             if opts.stream:
-
-                def _paused_stream_with_final() -> Iterator[Union[TeamRunOutputEvent, RunOutputEvent, TeamRunOutput]]:
-                    yield from _hooks.handle_team_run_paused_stream(
-                        team, run_response=run_response, session=team_session, run_context=run_context
-                    )
-                    if opts.yield_run_output:
-                        yield run_response
-
-                return _paused_stream_with_final()
+                return _handle_team_run_paused_stream_with_output(
+                    team,
+                    run_response=run_response,
+                    session=team_session,
+                    run_context=run_context,
+                    yield_run_output=opts.yield_run_output,
+                )
             else:
                 return _hooks.handle_team_run_paused(
                     team, run_response=run_response, session=team_session, run_context=run_context
@@ -7970,15 +8663,22 @@ def continue_run_dispatch(
             add_history_to_context=team.add_history_to_context,
             run_context=run_context,
         )
-
-        # Handle tool call updates (execute confirmed tools, etc.)
-        _handle_team_tool_call_updates(team, run_response=run_response, run_messages=run_messages, tools=_tools)
+        _append_additional_input_to_run_messages(run_messages, run_response)
+        _append_member_results_to_run_messages(run_messages, member_results)
 
         # Reset run state for continuation
         run_response.status = RunStatus.running
         # Reset content before re-running the model; _update_run_response appends
         # to existing content, so stale content from the paused run must be cleared.
         run_response.content = None
+
+        if not opts.stream:
+            handle_event(
+                create_team_run_continued_event(run_response),
+                run_response,
+                events_to_skip=team.events_to_skip,
+                store_events=team.store_events,
+            )
 
         log_debug(f"Team Continue Run Start: {run_response.run_id}", center=True)
 
@@ -7998,20 +8698,30 @@ def continue_run_dispatch(
                 background_tasks=background_tasks,
                 **kwargs,
             )
-        else:
-            return _continue_run(
-                team,
-                run_response=run_response,
-                run_messages=run_messages,
-                run_context=run_context,
-                tools=_tools,
-                session=team_session,
-                user_id=user_id,
-                response_format=response_format,
-                debug_mode=debug_mode,
-                background_tasks=background_tasks,
-                **kwargs,
+
+        # Handle tool call updates (execute confirmed tools, etc.) before the non-stream model call.
+        _handle_team_tool_call_updates(team, run_response=run_response, run_messages=run_messages, tools=_tools)
+        if run_response.requirements and any(_requirement_blocks_continue(req) for req in run_response.requirements):
+            from agno.team import _hooks
+
+            _append_member_results_to_run_response(run_response, member_results)
+            return _hooks.handle_team_run_paused(
+                team, run_response=run_response, session=team_session, run_context=run_context
             )
+
+        return _continue_run(
+            team,
+            run_response=run_response,
+            run_messages=run_messages,
+            run_context=run_context,
+            tools=_tools,
+            session=team_session,
+            user_id=user_id,
+            response_format=response_format,
+            debug_mode=debug_mode,
+            background_tasks=background_tasks,
+            **kwargs,
+        )
 
     # Member-only case: continue the same run with member results
     if member_results and not has_team_level:
@@ -8043,7 +8753,9 @@ def continue_run_dispatch(
             run_context=run_context,
         )
 
-        # Prepare for member HITL continuation
+        # Prepare for member HITL continuation: splice the resolved member outputs
+        # into the delegate_task_to_member tool call so the team model can keep
+        # reasoning on the same run rather than spawning a new one.
         _prepare_member_hitl_continuation(run_response, run_messages, member_results)
 
         log_debug(f"Team Continue Run (Member HITL): {run_response.run_id}", center=True)
@@ -8150,9 +8862,12 @@ def _continue_run_dispatch_stream_with_member_events(
 
     # Phase 2: After member routing completes, check for chained pauses
     newly_propagated = [r for r in (run_response.requirements or []) if id(r) not in original_member_req_ids]
-    run_response.requirements = team_level_reqs + newly_propagated
+    remaining_member_reqs = _remaining_original_member_requirements(
+        run_response.requirements or [], original_member_req_ids
+    )
+    run_response.requirements = team_level_reqs + remaining_member_reqs + newly_propagated
 
-    if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+    if run_response.requirements and any(_requirement_blocks_continue(req) for req in run_response.requirements):
         from agno.team import _hooks
 
         yield from _hooks.handle_team_run_paused_stream(
@@ -8167,7 +8882,7 @@ def _continue_run_dispatch_stream_with_member_events(
         unresolved_team = [
             r
             for r in (run_response.requirements or [])
-            if getattr(r, "member_agent_id", None) is None and not r.is_resolved()
+            if _get_requirement_route_member_id(r) is None and _requirement_blocks_continue(r)
         ]
         if unresolved_team:
             from agno.team import _hooks
@@ -8204,6 +8919,7 @@ def _continue_run_dispatch_stream_with_member_events(
             add_history_to_context=team.add_history_to_context,
             run_context=run_context,
         )
+        _append_member_results_to_run_messages(run_messages, member_results)
 
         _handle_team_tool_call_updates(team, run_response=run_response, run_messages=run_messages, tools=_tools)
 
@@ -8316,17 +9032,8 @@ def _continue_run(
         parse_response_with_parser_model,
     )
     from agno.team._telemetry import log_team_telemetry
-    from agno.utils.events import create_team_run_continued_event
 
     register_run(run_response.run_id)  # type: ignore
-
-    # Emit RunContinued event (matching streaming variant behaviour)
-    handle_event(
-        create_team_run_continued_event(run_response),
-        run_response,
-        events_to_skip=team.events_to_skip,
-        store_events=team.store_events,
-    )
 
     team.model = cast(Model, team.model)
 
@@ -8346,6 +9053,7 @@ def _continue_run(
                     tool_choice=team.tool_choice,
                     tool_call_limit=team.tool_call_limit,
                     run_response=run_response,
+                    run_context=run_context,
                     send_media_to_model=team.send_media_to_model,
                     compression_manager=team.compression_manager if team.compress_tool_results else None,
                     **result_store_kwargs(team),
@@ -8532,6 +9240,15 @@ def _continue_run_stream(
                     tools=tools,
                     stream_events=stream_events,
                 )
+                if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+                    from agno.team import _hooks
+
+                    yield from _hooks.handle_team_run_paused_stream(
+                        team, run_response=run_response, session=session, run_context=run_context
+                    )
+                    if yield_run_output:
+                        yield run_response
+                    return
 
                 # Stream model response
                 if team.output_model is None:
@@ -9244,6 +9961,7 @@ def acontinue_run_dispatch(  # type: ignore
     run_response: Optional[TeamRunOutput] = None,
     *,
     run_id: Optional[str] = None,
+    updated_tools: Optional[List[ToolExecution]] = None,
     requirements: Optional[List[Any]] = None,
     # --- Continue sugar (mirrors agent dispatch) ---
     input: Optional[str] = None,
@@ -9396,6 +10114,7 @@ def acontinue_run_dispatch(  # type: ignore
             team,
             run_response=run_response,
             run_context=run_context,
+            updated_tools=updated_tools,
             requirements=requirements,
             input=input,
             continue_from=continue_from,
@@ -9418,6 +10137,7 @@ def acontinue_run_dispatch(  # type: ignore
             team,
             run_response=run_response,
             run_context=run_context,
+            updated_tools=updated_tools,
             requirements=requirements,
             input=input,
             continue_from=continue_from,
@@ -9440,6 +10160,7 @@ async def _acontinue_run(
     session_id: str,
     run_context: RunContext,
     run_response: Optional[TeamRunOutput] = None,
+    updated_tools: Optional[List[ToolExecution]] = None,
     requirements: Optional[List[Any]] = None,
     # --- Snapshot dispatch sugar (mirrors sync continue_run_dispatch) ---
     input: Optional[str] = None,
@@ -9563,6 +10284,10 @@ async def _acontinue_run(
                     # Reset content so update_run_response doesn't append to
                     # stale content from the source run.
                     run_response.content = None
+                # Apply explicit tool updates first (legacy `updated_tools` parameter path)
+                elif updated_tools is not None:
+                    _apply_updated_tools_to_run_response(run_response, updated_tools)
+
                 # Normalize and apply requirements
                 elif requirements:
                     if not requirements_applied:
@@ -9584,7 +10309,7 @@ async def _acontinue_run(
                                 # The payload was supplied; the approval gate is
                                 # what refused. Surface its reason.
                                 raise ValueError(str(e))
-                elif run_response.tools:
+                elif updated_tools is None and (run_response.tools or run_response.requirements):
                     from agno.run.approval import acheck_and_apply_approval_resolution
 
                     try:
@@ -9613,16 +10338,20 @@ async def _acontinue_run(
                     _did_snapshot_dispatch = True
 
                 await aregister_run(run_response.run_id)  # type: ignore
+                continued_event_emitted = False
 
-                # Emit RunContinued event (matching streaming variant behaviour)
-                from agno.utils.events import create_team_run_continued_event
-
-                handle_event(
-                    create_team_run_continued_event(run_response),
-                    run_response,
-                    events_to_skip=team.events_to_skip,
-                    store_events=team.store_events,
-                )
+                def _emit_run_continued_event() -> None:
+                    nonlocal continued_event_emitted
+                    if continued_event_emitted:
+                        return
+                    assert run_response is not None
+                    handle_event(
+                        create_team_run_continued_event(run_response),
+                        run_response,
+                        events_to_skip=team.events_to_skip,
+                        store_events=team.store_events,
+                    )
+                    continued_event_emitted = True
 
                 run_response.requirements = _reclaim_own_requirements(
                     team, run_response.requirements, run_response.run_id
@@ -9652,10 +10381,10 @@ async def _acontinue_run(
                 member_results: List[str] = list(routed_member_results)
                 if has_member:
                     member_reqs = [
-                        r for r in (run_response.requirements or []) if getattr(r, "member_agent_id", None) is not None
+                        r for r in (run_response.requirements or []) if _get_requirement_route_member_id(r) is not None
                     ]
                     team_level_reqs = [
-                        r for r in (run_response.requirements or []) if getattr(r, "member_agent_id", None) is None
+                        r for r in (run_response.requirements or []) if _get_requirement_route_member_id(r) is None
                     ]
                     original_member_req_ids = {id(r) for r in member_reqs}
                     run_response.requirements = member_reqs
@@ -9675,17 +10404,23 @@ async def _acontinue_run(
                     newly_propagated = [
                         r for r in (run_response.requirements or []) if id(r) not in original_member_req_ids
                     ]
-                    run_response.requirements = team_level_reqs + newly_propagated
+                    remaining_member_reqs = _remaining_original_member_requirements(
+                        run_response.requirements or [], original_member_req_ids
+                    )
+                    run_response.requirements = team_level_reqs + remaining_member_reqs + newly_propagated
                     # This attempt's routing succeeded; bank its results so a
                     # transient leader failure below retries the leader with
                     # them instead of completing a leaderless run.
                     member_results = routed_member_results + member_results
                     routed_member_results = member_results
 
-                    # Check if still paused
-                    if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+                    # Check if still paused and no team-level resolution can be consumed.
+                    if _unresolved_member_requirements(
+                        run_response.requirements or []
+                    ) and not _resolved_team_level_requirements(run_response.requirements or []):
                         from agno.team import _hooks
 
+                        _append_member_results_to_run_response(run_response, member_results)
                         return await _hooks.ahandle_team_run_paused(
                             team, run_response=run_response, session=team_session, run_context=run_context
                         )
@@ -9696,18 +10431,17 @@ async def _acontinue_run(
                     # requirements but still needs the team-leader model call
                     # to produce a response. Without this, forked runs would
                     # fall through to terminal cleanup with content=None.
-                    # Guard: if team-level requirements are unresolved, re-pause instead of auto-rejecting
-                    unresolved_team = [
-                        r
-                        for r in (run_response.requirements or [])
-                        if getattr(r, "member_agent_id", None) is None and not r.is_resolved()
-                    ]
-                    if unresolved_team:
+                    # Guard only when there is no resolved team-level tool to consume.
+                    unresolved_team = _unresolved_team_level_requirements(run_response.requirements or [])
+                    if unresolved_team and not _resolved_team_level_requirements(run_response.requirements or []):
                         from agno.team import _hooks
 
+                        _append_member_results_to_run_response(run_response, member_results)
                         return await _hooks.ahandle_team_run_paused(
                             team, run_response=run_response, session=team_session, run_context=run_context
                         )
+
+                    _emit_run_continued_event()
 
                     team.model = cast(Model, team.model)
                     await _check_and_refresh_mcp_tools(team)
@@ -9734,10 +10468,20 @@ async def _acontinue_run(
                         add_history_to_context=team.add_history_to_context,
                         run_context=run_context,
                     )
+                    _append_additional_input_to_run_messages(run_messages, run_response)
+                    _append_member_results_to_run_messages(run_messages, member_results)
 
                     await _ahandle_team_tool_call_updates(
                         team, run_response=run_response, run_messages=run_messages, tools=_tools
                     )
+                    if run_response.requirements and any(
+                        _requirement_blocks_continue(req) for req in run_response.requirements
+                    ):
+                        from agno.team import _hooks
+
+                        return await _hooks.ahandle_team_run_paused(
+                            team, run_response=run_response, session=team_session, run_context=run_context
+                        )
 
                     run_response.status = RunStatus.running
                     run_response.content = None
@@ -9759,6 +10503,8 @@ async def _acontinue_run(
                     # Member-only: continue the same run with results
                     team.model = cast(Model, team.model)
                     await _check_and_refresh_mcp_tools(team)
+                    if not continued_event_emitted:
+                        _emit_run_continued_event()
 
                     team_run_context: Dict[str, Any] = {}  # type: ignore[no-redef]
                     learning_tools = await _aget_learning_tools(team, user_id, team_session)
@@ -9802,6 +10548,9 @@ async def _acontinue_run(
                         return paused_result
 
                 # Post-hooks
+                if not continued_event_emitted:
+                    _emit_run_continued_event()
+
                 if team.post_hooks is not None:
                     async for _ in _aexecute_post_hooks(
                         team,
@@ -9918,6 +10667,7 @@ async def _acontinue_run_stream(
     session_id: str,
     run_context: RunContext,
     run_response: Optional[TeamRunOutput] = None,
+    updated_tools: Optional[List[ToolExecution]] = None,
     requirements: Optional[List[Any]] = None,
     # --- Snapshot dispatch sugar (mirrors sync continue_run_dispatch) ---
     input: Optional[str] = None,
@@ -10044,6 +10794,10 @@ async def _acontinue_run_stream(
                     # Reset content so update_run_response doesn't append to
                     # stale content from the source run.
                     run_response.content = None
+                # Apply explicit tool updates first (legacy `updated_tools` parameter path)
+                elif updated_tools is not None:
+                    _apply_updated_tools_to_run_response(run_response, updated_tools)
+
                 # Normalize and apply requirements
                 elif requirements:
                     if not requirements_applied:
@@ -10065,7 +10819,7 @@ async def _acontinue_run_stream(
                                 # The payload was supplied; the approval gate is
                                 # what refused. Surface its reason.
                                 raise ValueError(str(e))
-                elif run_response.tools:
+                elif updated_tools is None and (run_response.tools or run_response.requirements):
                     from agno.run.approval import acheck_and_apply_approval_resolution
 
                     try:
@@ -10129,10 +10883,10 @@ async def _acontinue_run_stream(
                 member_results: List[str] = list(routed_member_results)
                 if has_member:
                     member_reqs = [
-                        r for r in (run_response.requirements or []) if getattr(r, "member_agent_id", None) is not None
+                        r for r in (run_response.requirements or []) if _get_requirement_route_member_id(r) is not None
                     ]
                     team_level_reqs = [
-                        r for r in (run_response.requirements or []) if getattr(r, "member_agent_id", None) is None
+                        r for r in (run_response.requirements or []) if _get_requirement_route_member_id(r) is None
                     ]
                     original_member_req_ids = {id(r) for r in member_reqs}
                     run_response.requirements = member_reqs
@@ -10156,13 +10910,19 @@ async def _acontinue_run_stream(
                     newly_propagated = [
                         r for r in (run_response.requirements or []) if id(r) not in original_member_req_ids
                     ]
-                    run_response.requirements = team_level_reqs + newly_propagated
+                    remaining_member_reqs = _remaining_original_member_requirements(
+                        run_response.requirements or [], original_member_req_ids
+                    )
+                    run_response.requirements = team_level_reqs + remaining_member_reqs + newly_propagated
                     # Routing succeeded; bank the accumulated results for a retry.
                     routed_member_results = member_results
 
-                    if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+                    if _unresolved_member_requirements(
+                        run_response.requirements or []
+                    ) and not _resolved_team_level_requirements(run_response.requirements or []):
                         from agno.team import _hooks
 
+                        _append_member_results_to_run_response(run_response, member_results)
                         async for item in _hooks.ahandle_team_run_paused_stream(
                             team, run_response=run_response, session=team_session, run_context=run_context
                         ):
@@ -10176,15 +10936,12 @@ async def _acontinue_run_stream(
                     # requirements but still needs the team-leader model call
                     # to produce a response. Without this, forked runs would
                     # fall through to terminal cleanup with content=None.
-                    # Guard: if team-level requirements are unresolved, re-pause instead of auto-rejecting
-                    unresolved_team = [
-                        r
-                        for r in (run_response.requirements or [])
-                        if getattr(r, "member_agent_id", None) is None and not r.is_resolved()
-                    ]
-                    if unresolved_team:
+                    # Guard only when there is no resolved team-level tool to consume.
+                    unresolved_team = _unresolved_team_level_requirements(run_response.requirements or [])
+                    if unresolved_team and not _resolved_team_level_requirements(run_response.requirements or []):
                         from agno.team import _hooks
 
+                        _append_member_results_to_run_response(run_response, member_results)
                         async for item in _hooks.ahandle_team_run_paused_stream(
                             team, run_response=run_response, session=team_session, run_context=run_context
                         ):
@@ -10220,6 +10977,8 @@ async def _acontinue_run_stream(
                         add_history_to_context=team.add_history_to_context,
                         run_context=run_context,
                     )
+                    _append_additional_input_to_run_messages(run_messages, run_response)
+                    _append_member_results_to_run_messages(run_messages, member_results)
 
                     run_response.status = RunStatus.running
                     run_response.content = None
@@ -10243,6 +11002,18 @@ async def _acontinue_run_stream(
                     ):
                         await araise_if_cancelled(run_response.run_id)  # type: ignore
                         yield event
+                    if run_response.requirements and any(
+                        _requirement_blocks_continue(req) for req in run_response.requirements
+                    ):
+                        from agno.team import _hooks
+
+                        async for item in _hooks.ahandle_team_run_paused_stream(
+                            team, run_response=run_response, session=team_session, run_context=run_context
+                        ):
+                            yield item
+                        if yield_run_output:
+                            yield run_response
+                        return
 
                     # Stream model response
                     if team.output_model is None:
@@ -10298,7 +11069,9 @@ async def _acontinue_run_stream(
                     await araise_if_cancelled(run_response.run_id)  # type: ignore
 
                     # Check for new pauses
-                    if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+                    if run_response.requirements and any(
+                        _requirement_blocks_continue(req) for req in run_response.requirements
+                    ):
                         from agno.team import _hooks
 
                         async for item in _hooks.ahandle_team_run_paused_stream(
@@ -10349,7 +11122,10 @@ async def _acontinue_run_stream(
                         run_context=run_context,
                     )
 
-                    # Prepare for member HITL continuation
+                    # Prepare for member HITL continuation: splice the resolved
+                    # member outputs into the existing delegate_task_to_member tool
+                    # call so the team model keeps reasoning on the same run rather
+                    # than spawning a new one.
                     _prepare_member_hitl_continuation(run_response, run_messages, member_results)
 
                     log_debug(f"Team Continue Run Stream (Member HITL): {run_response.run_id}", center=True)
@@ -10415,7 +11191,9 @@ async def _acontinue_run_stream(
                             yield event
 
                     # Check for new pauses
-                    if run_response.requirements and any(not req.is_resolved() for req in run_response.requirements):
+                    if run_response.requirements and any(
+                        _requirement_blocks_continue(req) for req in run_response.requirements
+                    ):
                         from agno.team import _hooks
 
                         async for item in _hooks.ahandle_team_run_paused_stream(

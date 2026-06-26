@@ -1182,10 +1182,21 @@ def get_run_messages(
             agent.system_message_role if agent.system_message_role not in ["user", "assistant", "tool"] else None
         )
 
+        # Build the list of run statuses to exclude from history.
+        # By default cancelled/paused/error runs are skipped, but when
+        # include_cancelled_history is set we keep cancelled runs so the
+        # model can see the partial conversation from the aborted turn.
+        from agno.run.base import RunStatus
+
+        skip_statuses = [RunStatus.paused, RunStatus.error, RunStatus.regenerated]
+        if not agent.include_cancelled_history:
+            skip_statuses.append(RunStatus.cancelled)
+
         history: List[Message] = session.get_messages(
             last_n_runs=agent.num_history_runs,
             limit=agent.num_history_messages,
             skip_roles=[skip_role] if skip_role else None,
+            skip_statuses=skip_statuses,
             agent_id=agent.id if agent.team_id is not None else None,
         )
 
@@ -1388,10 +1399,21 @@ async def aget_run_messages(
             agent.system_message_role if agent.system_message_role not in ["user", "assistant", "tool"] else None
         )
 
+        # Build the list of run statuses to exclude from history.
+        # By default cancelled/paused/error runs are skipped, but when
+        # include_cancelled_history is set we keep cancelled runs so the
+        # model can see the partial conversation from the aborted turn.
+        from agno.run.base import RunStatus
+
+        skip_statuses = [RunStatus.paused, RunStatus.error, RunStatus.regenerated]
+        if not agent.include_cancelled_history:
+            skip_statuses.append(RunStatus.cancelled)
+
         history: List[Message] = session.get_messages(
             last_n_runs=agent.num_history_runs,
             limit=agent.num_history_messages,
             skip_roles=[skip_role] if skip_role else None,
+            skip_statuses=skip_statuses,
             agent_id=agent.id if agent.team_id is not None else None,
         )
 
@@ -1560,10 +1582,17 @@ def _build_continue_run_messages(
             agent.system_message_role if agent.system_message_role not in ["user", "assistant", "tool"] else None
         )
 
+        from agno.run.base import RunStatus
+
+        skip_statuses = [RunStatus.paused, RunStatus.error, RunStatus.regenerated]
+        if not agent.include_cancelled_history:
+            skip_statuses.append(RunStatus.cancelled)
+
         history: List[Message] = session.get_messages(
             last_n_runs=agent.num_history_runs,
             limit=agent.num_history_messages,
             skip_roles=[skip_role] if skip_role else None,
+            skip_statuses=skip_statuses,
             agent_id=agent.id if agent.team_id is not None else None,
         )
 

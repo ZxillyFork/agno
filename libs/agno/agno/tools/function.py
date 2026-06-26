@@ -3002,7 +3002,11 @@ class FunctionCall(BaseModel):
 
         # Check cache if enabled and not a generator function
         cached_result = None
-        cacheable = self.function.cache_results and not isgeneratorfunction(self.function.entrypoint)
+        cacheable = (
+            self.function.cache_results
+            and self.function._run_context is None
+            and not isgeneratorfunction(self.function.entrypoint)
+        )
         if cacheable and _has_injected_media(entrypoint_args):
             log_debug(f"Skipping cache for {self.function.name}: the call carries attached media")
             cacheable = False
@@ -3277,7 +3281,7 @@ class FunctionCall(BaseModel):
 
         # Check cache if enabled and not a generator function
         cached_result = None
-        cacheable = self.function.cache_results and not (
+        cacheable = self.function.cache_results and self.function._run_context is None and not (
             isasyncgenfunction(self.function.entrypoint) or isgeneratorfunction(self.function.entrypoint)
         )
         if cacheable and _has_injected_media(entrypoint_args):
