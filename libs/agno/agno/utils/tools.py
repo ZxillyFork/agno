@@ -17,8 +17,14 @@ def get_function_call_for_tool_call(
             _tool_call_function_name = _tool_call_function.get("name")
             _tool_call_function_arguments_str = _tool_call_function.get("arguments") or "{}"
             if _tool_call_function_name is not None:
+                namespace = tool_call.get("namespace")
+                lookup_name = (
+                    f"{namespace}.{_tool_call_function_name}"
+                    if isinstance(namespace, str) and namespace
+                    else _tool_call_function_name
+                )
                 return get_function_call(
-                    name=_tool_call_function_name,
+                    name=lookup_name,
                     arguments=_tool_call_function_arguments_str,
                     call_id=_tool_call_id,
                     functions=functions,

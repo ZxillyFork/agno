@@ -3,6 +3,7 @@ from agno.models.openai.like import OpenAILike
 from agno.models.openai.open_responses import OpenResponses
 from agno.models.openai.responses import OpenAIResponses
 from agno.models.openai.types import ReasoningEffort, ReasoningSummary, ServiceTier, Verbosity
+from agno.models.openai.tools import ToolNamespace, ToolSearch, ToolSearchCall
 
 __all__ = [
     "OpenAIChat",
@@ -13,4 +14,7 @@ __all__ = [
     "ReasoningSummary",
     "ServiceTier",
     "Verbosity",
+    "ToolNamespace",
+    "ToolSearch",
+    "ToolSearchCall",
 ]

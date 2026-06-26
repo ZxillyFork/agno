@@ -1,21 +1,30 @@
 import asyncio
+import json
 import time
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Type, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Sequence, Tuple, Type, Union
 
 import httpx
 from pydantic import BaseModel
 from typing_extensions import Literal
 
-from agno.exceptions import ContextWindowExceededError, ModelAuthenticationError, ModelProviderError
+from agno.exceptions import (
+    ContextWindowExceededError,
+    ModelAuthenticationError,
+    ModelProviderError,
+    _describe_exception,
+)
 from agno.media import File
 from agno.metrics import MessageMetrics
 from agno.models.base import Model
 from agno.models.message import Citations, Message, UrlCitation
 from agno.models.openai.types import ReasoningEffort, ReasoningSummary, ServiceTier, Verbosity
-from agno.models.response import ModelResponse
+from agno.models.openai.tools import ToolNamespace, ToolSearch, ToolSearchCall, _default_format_tool, maybe_await
+from agno.models.response import ModelResponse, ModelResponseEvent
 from agno.run.agent import RunOutput
-from agno.tools.function import Function
+from agno.tools.function import Function, FunctionCall
 from agno.utils.log import log_debug, log_error, log_warning
 from agno.utils.models.openai_responses import images_to_message
 from agno.utils.models.schema_utils import get_response_schema_for_provider
@@ -26,6 +35,22 @@ try:
     from openai.types.responses import Response, ResponseReasoningItem, ResponseStreamEvent, ResponseUsage
 except ImportError as e:
     raise ImportError("`openai` not installed. Please install using `pip install openai -U`") from e
+
+
+# Client-side tool_search state is per-run, not per-model. Storing it in ContextVars keeps a
+# single OpenAIResponses instance shared across concurrent runs (asyncio tasks / threads) from
+# leaking dynamically loaded tools or search items between runs. Each task/thread sees its own copy.
+_CLIENT_TOOL_SEARCH_FUNCTIONS_VAR: ContextVar[Optional[Dict[str, "Function"]]] = ContextVar(
+    "agno_openai_client_tool_search_functions", default=None
+)
+_CLIENT_TOOL_SEARCH_ITEMS_VAR: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar(
+    "agno_openai_client_tool_search_items", default=None
+)
+_CLIENT_TOOL_SEARCH_RUN_ID_VAR: ContextVar[Optional[str]] = ContextVar(
+    "agno_openai_client_tool_search_run_id", default=None
+)
+
+_ASYNC_SEARCHER_SYNC_ERROR = "Async ToolSearch searcher cannot be used in a synchronous run. Use arun() instead."
 
 
 @dataclass
@@ -83,6 +108,7 @@ class OpenAIResponses(Model):
 
     # Parameters affecting built-in tools
     vector_store_name: str = "knowledge_base"
+    client_tool_search_max_rounds: int = 5
 
     # OpenAI clients
     client: Optional[OpenAI] = None
@@ -261,7 +287,7 @@ class OpenAIResponses(Model):
         self,
         messages: Optional[List[Message]] = None,
         response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[Any]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
     ) -> Dict[str, Any]:
@@ -346,7 +372,7 @@ class OpenAIResponses(Model):
                 tools = []
 
             # Check if web_search_preview tool is already present
-            has_web_search = any(tool.get("type") == "web_search_preview" for tool in tools)
+            has_web_search = any(isinstance(tool, dict) and tool.get("type") == "web_search_preview" for tool in tools)
 
             # Add web_search_preview if not present - this enables the model to search
             # the web for current information and provide citations
@@ -403,11 +429,22 @@ class OpenAIResponses(Model):
         return request_params
 
     @staticmethod
-    def _has_file_search_tool(tools: Optional[List[Union[Function, Dict[str, Any]]]] = None) -> bool:
+    def _has_file_search_tool(tools: Optional[List[Any]] = None) -> bool:
         """Check if any tool in the list is a file_search tool."""
         if not tools:
             return False
-        return any(isinstance(tool, dict) and tool.get("type") == "file_search" for tool in tools)
+
+        def is_file_search(tool: Any) -> bool:
+            if isinstance(tool, dict):
+                if tool.get("type") == "file_search":
+                    return True
+                if tool.get("type") == "namespace":
+                    return any(is_file_search(namespace_tool) for namespace_tool in tool.get("tools", []))
+            if isinstance(tool, ToolNamespace):
+                return any(is_file_search(namespace_tool) for namespace_tool in tool.tools)
+            return False
+
+        return any(is_file_search(tool) for tool in tools)
 
     @staticmethod
     def _format_file_for_input(file: File) -> Optional[Dict[str, Any]]:
@@ -503,6 +540,152 @@ class OpenAIResponses(Model):
 
         return None
 
+    @staticmethod
+    def _tool_sort_key(tool: Any) -> str:
+        if isinstance(tool, Function):
+            return tool.name
+        if isinstance(tool, ToolNamespace):
+            return tool.name
+        if isinstance(tool, ToolSearch):
+            return "tool_search"
+        if isinstance(tool, dict):
+            function_dict = tool.get("function")
+            if isinstance(function_dict, dict):
+                return str(function_dict.get("name", ""))
+            return str(tool.get("name", ""))
+        return str(getattr(tool, "name", getattr(tool, "type", "")))
+
+    def _format_tools(self, tools: Optional[List[Union[Function, dict]]]) -> List[Any]:
+        return sorted(list(tools or []), key=self._tool_sort_key)
+
+    def _normalize_function_parameter_types(self, tool_dict: Dict[str, Any]) -> Dict[str, Any]:
+        for prop in tool_dict.get("parameters", {}).get("properties", {}).values():
+            if isinstance(prop.get("type", ""), list):
+                prop["type"] = prop["type"][0]
+        return tool_dict
+
+    def _format_openai_tool(self, tool: Any) -> Dict[str, Any]:
+        if isinstance(tool, Function):
+            # Reuse the shared Function->dict formatter (type + defer_loading) and only add the
+            # Responses-specific parameter-type normalization here, so the two stay in sync.
+            return self._normalize_function_parameter_types(_default_format_tool(tool))
+
+        if isinstance(tool, ToolSearch):
+            return tool.to_dict()
+
+        if isinstance(tool, ToolNamespace):
+            return tool.to_dict(format_tool=self._format_openai_tool)
+
+        if isinstance(tool, dict):
+            tool_dict = deepcopy(tool)
+            if tool_dict.get("type") == "function":
+                if isinstance(tool_dict.get("function"), dict):
+                    function_dict = tool_dict.pop("function")
+                    function_dict["type"] = "function"
+                    for key, value in tool_dict.items():
+                        if key not in function_dict:
+                            function_dict[key] = value
+                    tool_dict = function_dict
+                return self._normalize_function_parameter_types(tool_dict)
+            if tool_dict.get("type") == "namespace":
+                tool_dict["tools"] = [self._format_openai_tool(namespace_tool) for namespace_tool in tool_dict["tools"]]
+            return tool_dict
+
+        if hasattr(tool, "to_dict"):
+            return tool.to_dict()
+
+        raise TypeError(f"Unsupported OpenAI Responses tool type: {type(tool).__name__}")
+
+    @property
+    def _client_tool_search_functions(self) -> Dict[str, Function]:
+        """Dynamically loaded client tool_search functions for the in-flight run (per task/thread)."""
+        value = _CLIENT_TOOL_SEARCH_FUNCTIONS_VAR.get()
+        if value is None:
+            value = {}
+            _CLIENT_TOOL_SEARCH_FUNCTIONS_VAR.set(value)
+        return value
+
+    @property
+    def _client_tool_search_items(self) -> List[Dict[str, Any]]:
+        """tool_search call/output items accumulated for the in-flight run (per task/thread)."""
+        value = _CLIENT_TOOL_SEARCH_ITEMS_VAR.get()
+        if value is None:
+            value = []
+            _CLIENT_TOOL_SEARCH_ITEMS_VAR.set(value)
+        return value
+
+    def _get_functions_from_tools(
+        self, tools: Optional[List[Union[Function, dict]]], include_dynamic_functions: bool = False
+    ) -> Dict[str, Function]:
+        functions: Dict[str, Function] = {}
+        plain_candidates: Dict[str, List[Function]] = {}
+
+        def collect(tool: Any, namespace: Optional[str] = None) -> None:
+            if isinstance(tool, Function):
+                if namespace:
+                    functions[f"{namespace}.{tool.name}"] = tool
+                else:
+                    functions[tool.name] = tool
+                plain_candidates.setdefault(tool.name, []).append(tool)
+            elif isinstance(tool, ToolNamespace):
+                for namespace_tool in tool.tools:
+                    collect(namespace_tool, tool.name)
+
+        for tool in tools or []:
+            collect(tool)
+        for name, candidates in plain_candidates.items():
+            unique_candidates = {id(candidate): candidate for candidate in candidates}
+            if name not in functions and len(unique_candidates) == 1:
+                functions[name] = next(iter(unique_candidates.values()))
+        if include_dynamic_functions:
+            functions.update(self._client_tool_search_functions)
+        return functions
+
+    def _register_loaded_functions(self, loaded_tools: Sequence[Any], run_context: Optional[Any] = None) -> None:
+        """Prepare and register functions returned by a client tool_search searcher.
+
+        Unlike statically registered tools (prepared in ``parse_tools``), these arrive mid-run, so
+        they must be made ready for execution here: copy them (the searcher may return shared
+        objects), process the entrypoint, and inject the run context so tools declaring a
+        ``run_context`` parameter receive it.
+
+        FIXME(client-tool-search cross-process resume): the API-level round-trip is handled — the
+        tool_search_call/tool_search_output items are persisted on the assistant message's
+        provider_data and re-injected by ``_format_messages``, so the request stays valid across
+        turns. What is still missing is the *executable* side: these prepared Functions live only in
+        per-run ContextVar state, so they survive same-process pause/continue but not cross-process
+        resume (a runtime Function + entrypoint closure cannot be serialized). Resuming a confirmed
+        tool loaded via client tool_search in a fresh process then fails in
+        ``get_function_call_to_run_from_tool_execution`` with "Function call not found". A proper fix
+        needs to re-run the searcher on resume (the persisted tool_search items give the inputs to do
+        so); tracked separately.
+        """
+        effective_run_context = run_context if run_context is not None else self._current_run_context
+        registry = self._client_tool_search_functions
+        for name, func in self._get_functions_from_tools(list(loaded_tools)).items():
+            prepared = func.model_copy(deep=True)
+            try:
+                prepared.process_entrypoint(strict=bool(prepared.strict))
+            except Exception as e:
+                log_warning(f"Failed to process entrypoint for dynamically loaded tool '{name}': {e}")
+            if effective_run_context is not None:
+                prepared._run_context = effective_run_context
+            registry[name] = prepared
+
+    def get_function_calls_to_run(
+        self,
+        assistant_message: Message,
+        messages: List[Message],
+        functions: Optional[Dict[str, Function]] = None,
+    ) -> List[FunctionCall]:
+        merged_functions = dict(functions or {})
+        merged_functions.update(self._client_tool_search_functions)
+        return super().get_function_calls_to_run(
+            assistant_message=assistant_message,
+            messages=messages,
+            functions=merged_functions,
+        )
+
     def _create_vector_store(self, file_ids: List[str]) -> str:
         """Create a vector store for the files."""
         vector_store = self.get_client().vector_stores.create(name=self.vector_store_name)
@@ -528,34 +711,15 @@ class OpenAIResponses(Model):
             time.sleep(1)
         return vector_store.id
 
-    def _format_tool_params(
-        self, messages: List[Message], tools: Optional[List[Union[Function, Dict[str, Any]]]] = None
-    ) -> List[Dict[str, Any]]:
+    def _format_tool_params(self, messages: List[Message], tools: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         """Format the tool parameters for the OpenAI Responses API."""
-        formatted_tools = []
-        if tools:
-            for _tool in tools:
-                if isinstance(_tool, Function):
-                    _tool_dict = _tool.to_dict()
-                    _tool_dict["type"] = "function"
-                    for prop in _tool_dict.get("parameters", {}).get("properties", {}).values():
-                        if isinstance(prop.get("type", ""), list):
-                            prop["type"] = prop["type"][0]
-                    formatted_tools.append(_tool_dict)
-                elif _tool.get("type") == "function":
-                    _tool_dict = _tool.get("function", {})
-                    _tool_dict["type"] = "function"
-                    for prop in _tool_dict.get("parameters", {}).get("properties", {}).values():
-                        if isinstance(prop.get("type", ""), list):
-                            prop["type"] = prop["type"][0]
-                    formatted_tools.append(_tool_dict)
-                else:
-                    formatted_tools.append(_tool)
+        sorted_tools = self._format_tools(tools) if tools is not None else []
+        formatted_tools = [self._format_openai_tool(_tool) for _tool in sorted_tools]
 
         # Only upload files to vector store when file_search tool is present.
         # Otherwise, files will be embedded inline via _format_messages().
         file_ids = []
-        if self._has_file_search_tool(tools):
+        if self._has_file_search_tool(sorted_tools):
             for message in messages:
                 if message.files is not None and len(message.files) > 0:
                     for file in message.files:
@@ -566,11 +730,24 @@ class OpenAIResponses(Model):
         vector_store_id = self._create_vector_store(file_ids) if file_ids else None
 
         # Add the file IDs to the tool parameters
-        for _tool in formatted_tools:
-            if _tool.get("type", "") == "file_search" and vector_store_id is not None:
-                _tool["vector_store_ids"] = [vector_store_id]
+        # Attach the vector store id to every file_search tool, including those nested inside a
+        # namespace. _has_file_search_tool already recurses into namespaces to decide whether to
+        # upload, so the attachment must recurse too — otherwise files are uploaded but never
+        # reachable, and retrieval silently returns nothing.
+        if vector_store_id is not None:
+            for _tool in formatted_tools:
+                self._attach_vector_store_id(_tool, vector_store_id)
 
         return formatted_tools
+
+    def _attach_vector_store_id(self, tool_dict: Dict[str, Any], vector_store_id: str) -> None:
+        if not isinstance(tool_dict, dict):
+            return
+        if tool_dict.get("type", "") == "file_search":
+            tool_dict["vector_store_ids"] = [vector_store_id]
+        elif tool_dict.get("type", "") == "namespace":
+            for namespace_tool in tool_dict.get("tools", []):
+                self._attach_vector_store_id(namespace_tool, vector_store_id)
 
     def _build_fc_id_to_call_id_map(self, messages: List[Message]) -> Dict[str, str]:
         """Build a mapping from function_call id (fc_*) to call_id (call_*) from assistant tool_calls.
@@ -591,6 +768,16 @@ class OpenAIResponses(Model):
                     if isinstance(fc_id, str) and isinstance(call_id, str):
                         fc_id_to_call_id[fc_id] = call_id
         return fc_id_to_call_id
+
+    @staticmethod
+    def _is_cancelled_tool_result(message: Message) -> bool:
+        content = message.content
+        return (
+            message.role == "tool"
+            and isinstance(content, str)
+            and content.startswith("Tool call '")
+            and content.endswith("' was cancelled before it could complete.")
+        )
 
     def _format_messages(
         self,
@@ -642,6 +829,25 @@ class OpenAIResponses(Model):
                     break
 
         fc_id_to_call_id = self._build_fc_id_to_call_id_map(messages)
+        allow_unpaired_tool_outputs = self._using_reasoning_model() and previous_response_id is not None
+        seen_tool_call_ids: set[str] = set()
+        real_tool_result_ids: set[str] = set()
+
+        # Tool results can be restored out of order from storage; pre-scan tool calls
+        # so a valid result is not dropped just because its assistant message comes later.
+        for message in messages_to_format:
+            if message.tool_calls is not None and len(message.tool_calls) > 0:
+                for tool_call in message.tool_calls:
+                    tool_call_id = tool_call.get("id")
+                    call_id = tool_call.get("call_id")
+                    if isinstance(tool_call_id, str):
+                        seen_tool_call_ids.add(tool_call_id)
+                    if isinstance(call_id, str):
+                        seen_tool_call_ids.add(call_id)
+
+        for message in messages_to_format:
+            if message.role == "tool" and message.tool_call_id and not self._is_cancelled_tool_result(message):
+                real_tool_result_ids.add(fc_id_to_call_id.get(message.tool_call_id, message.tool_call_id))
 
         for message in messages_to_format:
             if message.role in ["user", "system"]:
@@ -684,11 +890,18 @@ class OpenAIResponses(Model):
 
                 if message.tool_call_id and tool_result is not None:
                     function_call_id = message.tool_call_id
+                    if not allow_unpaired_tool_outputs and function_call_id not in seen_tool_call_ids:
+                        continue
+
                     # Normalize: if a fc_* id was provided, translate to its corresponding call_* id
                     if isinstance(function_call_id, str) and function_call_id in fc_id_to_call_id:
                         call_id_value = fc_id_to_call_id[function_call_id]
                     else:
                         call_id_value = function_call_id
+
+                    if self._is_cancelled_tool_result(message) and call_id_value in real_tool_result_ids:
+                        continue
+
                     formatted_messages.append(
                         {"type": "function_call_output", "call_id": call_id_value, "output": tool_result}
                     )
@@ -700,17 +913,35 @@ class OpenAIResponses(Model):
                 if self._using_reasoning_model() and previous_response_id is not None:
                     continue
 
+                # Re-inject persisted tool_search items (call/output) BEFORE the function_call items
+                # of this turn. The API only makes a deferred/namespaced tool available after its
+                # tool_search_output appears in the input, so omitting them breaks the round-trip.
+                persisted_provider_data = getattr(message, "provider_data", None) or {}
+                for tool_search_item in persisted_provider_data.get("tool_search_items", []) or []:
+                    formatted_messages.append(deepcopy(tool_search_item))
+
                 for tool_call in message.tool_calls:
-                    formatted_messages.append(
-                        {
-                            "type": "function_call",
-                            "id": tool_call.get("id"),
-                            "call_id": tool_call.get("call_id", tool_call.get("id")),
-                            "name": tool_call["function"]["name"],
-                            "arguments": tool_call["function"]["arguments"],
-                            "status": "completed",
-                        }
-                    )
+                    tool_call_id = tool_call.get("id")
+                    call_id = tool_call.get("call_id")
+                    if isinstance(tool_call_id, str):
+                        seen_tool_call_ids.add(tool_call_id)
+                    if isinstance(call_id, str):
+                        seen_tool_call_ids.add(call_id)
+
+                    function_call_item: Dict[str, Any] = {
+                        "type": "function_call",
+                        "id": tool_call.get("id"),
+                        "call_id": tool_call.get("call_id", tool_call.get("id")),
+                        "name": tool_call["function"]["name"],
+                        "arguments": tool_call["function"]["arguments"],
+                        "status": "completed",
+                    }
+                    # Round-trip the namespace for deferred/namespaced tools; the API rejects a
+                    # function_call that omits the namespace it was originally emitted with.
+                    tool_call_namespace = tool_call.get("namespace")
+                    if tool_call_namespace is not None:
+                        function_call_item["namespace"] = tool_call_namespace
+                    formatted_messages.append(function_call_item)
             elif message.role == "assistant":
                 # Handle null content by converting to empty string
                 content = message.content if message.content is not None else ""
@@ -772,15 +1003,17 @@ class OpenAIResponses(Model):
         messages: List[Message],
         assistant_message: Message,
         response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[Any]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        run_context: Optional[Any] = None,
     ) -> ModelResponse:
         """
         Send a request to the OpenAI Responses API.
         """
         try:
+            self._maybe_reset_client_tool_search_state(messages)
             request_params = self.get_request_params(
                 messages=messages,
                 response_format=response_format,
@@ -807,22 +1040,16 @@ class OpenAIResponses(Model):
                 log_debug(f"Background response submitted: {provider_response.id}, polling for completion...")
                 provider_response = self._poll_background_response(provider_response.id)
 
-            if provider_response.status == "failed":
-                error_msg = provider_response.error.message if provider_response.error else "Background response failed"
-                raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id)
-            if provider_response.status == "cancelled":
-                raise ModelProviderError(
-                    message=f"Background response {provider_response.id} was cancelled",
-                    model_name=self.name,
-                    model_id=self.id,
-                )
-            if provider_response.status == "incomplete":
-                log_warning(
-                    f"Background response {provider_response.id} completed with status 'incomplete': "
-                    f"{provider_response.incomplete_details}"
-                )
+            self._validate_provider_response_status(provider_response)
+            provider_response, client_tool_search_items = self._resolve_client_tool_searches(
+                provider_response,
+                request_params=request_params,
+                tools=tools,
+                run_context=run_context if run_context is not None else self._current_run_context,
+            )
 
             model_response = self._parse_provider_response(provider_response, response_format=response_format)
+            self._attach_tool_search_items(model_response, provider_response, client_tool_search_items)
 
             return model_response
 
@@ -844,8 +1071,9 @@ class OpenAIResponses(Model):
                 model_id=self.id,
             ) from exc
         except APIConnectionError as exc:
-            log_error(f"API connection error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
         except APIStatusError as exc:
             log_error(f"API status error from OpenAI API: {exc}")
             try:
@@ -873,23 +1101,417 @@ class OpenAIResponses(Model):
             log_error(f"Model authentication error from OpenAI API: {exc}")
             raise exc
         except Exception as exc:
-            log_error(f"Error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
+
+    def _tool_state_aliases(
+        self,
+        *,
+        output_index: Optional[int] = None,
+        item_id: Optional[str] = None,
+        call_id: Optional[str] = None,
+    ) -> List[str]:
+        aliases: List[str] = []
+        if output_index is not None:
+            aliases.append(f"idx:{output_index}")
+        if item_id:
+            aliases.append(f"item:{item_id}")
+        if call_id:
+            aliases.append(f"call:{call_id}")
+        return aliases
+
+    def _find_tool_entry(
+        self,
+        tool_uses: Dict[str, Dict[str, Any]],
+        *,
+        output_index: Optional[int] = None,
+        item_id: Optional[str] = None,
+        call_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        for alias in self._tool_state_aliases(output_index=output_index, item_id=item_id, call_id=call_id):
+            tool_entry = tool_uses.get(alias)
+            if tool_entry is not None:
+                return tool_entry
+        return None
+
+    def _index_tool_entry(
+        self,
+        tool_uses: Dict[str, Dict[str, Any]],
+        tool_entry: Dict[str, Any],
+        *,
+        output_index: Optional[int] = None,
+        item_id: Optional[str] = None,
+        call_id: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        for alias in self._tool_state_aliases(output_index=output_index, item_id=item_id, call_id=call_id):
+            tool_uses[alias] = tool_entry
+        return tool_uses
+
+    def _drop_tool_entry(
+        self, tool_uses: Dict[str, Dict[str, Any]], tool_entry: Dict[str, Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        for alias, existing_entry in list(tool_uses.items()):
+            if existing_entry is tool_entry:
+                del tool_uses[alias]
+        return tool_uses
+
+    def _merge_tool_entry(
+        self,
+        tool_entry: Dict[str, Any],
+        *,
+        item_id: Optional[str] = None,
+        call_id: Optional[str] = None,
+        name: Optional[str] = None,
+        arguments: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        tool_entry["id"] = item_id or tool_entry.get("id")
+        tool_entry["call_id"] = call_id or tool_entry.get("call_id") or tool_entry.get("id")
+        tool_entry["type"] = "function"
+        # The OpenAI Responses API requires namespaced/deferred function_call items to be
+        # round-tripped with their ``namespace`` field, otherwise the follow-up request fails with
+        # "Missing namespace for function_call ...". Preserve it on the stored tool call.
+        if namespace is not None:
+            tool_entry["namespace"] = namespace
+        function_entry = tool_entry.setdefault("function", {})
+        function_entry["name"] = name or function_entry.get("name")
+        if arguments is not None:
+            function_entry["arguments"] = arguments
+        else:
+            function_entry.setdefault("arguments", "")
+        return tool_entry
+
+    def _build_tool_entry_from_item(self, item: Any) -> Dict[str, Any]:
+        return self._merge_tool_entry(
+            {},
+            item_id=getattr(item, "id", None),
+            call_id=getattr(item, "call_id", None) or getattr(item, "id", None),
+            name=getattr(item, "name", None),
+            arguments=getattr(item, "arguments", None) or "",
+            namespace=getattr(item, "namespace", None),
+        )
+
+    def _append_assistant_tool_call(self, assistant_message: Message, tool_call: Dict[str, Any]) -> None:
+        tool_call_id = tool_call.get("call_id") or tool_call.get("id")
+        if assistant_message.tool_calls is None:
+            assistant_message.tool_calls = []
+
+        for existing_tool_call in assistant_message.tool_calls:
+            existing_tool_call_id = existing_tool_call.get("call_id") or existing_tool_call.get("id")
+            if tool_call_id is not None and existing_tool_call_id == tool_call_id:
+                existing_tool_call.update(tool_call)
+                return
+
+        assistant_message.tool_calls.append(tool_call)
+
+    def _maybe_reset_client_tool_search_state(self, messages: List[Message]) -> None:
+        # Client tool_search state must live for exactly one agent run and never leak into
+        # another. When the run_id is known we scope strictly to it; otherwise we fall back to
+        # the message-role heuristic (keep across the immediate function_call_output follow-up,
+        # reset on a fresh non-tool turn).
+        run_context = self._current_run_context
+        current_run_id = getattr(run_context, "run_id", None) if run_context is not None else None
+        if current_run_id is not None:
+            if _CLIENT_TOOL_SEARCH_RUN_ID_VAR.get() != current_run_id:
+                _CLIENT_TOOL_SEARCH_RUN_ID_VAR.set(current_run_id)
+                _CLIENT_TOOL_SEARCH_FUNCTIONS_VAR.set({})
+                _CLIENT_TOOL_SEARCH_ITEMS_VAR.set([])
+            return
+        if not messages or messages[-1].role != self.tool_message_role:
+            _CLIENT_TOOL_SEARCH_FUNCTIONS_VAR.set({})
+            _CLIENT_TOOL_SEARCH_ITEMS_VAR.set([])
+
+    @staticmethod
+    def _dump_openai_item(item: Any) -> Dict[str, Any]:
+        if isinstance(item, dict):
+            return deepcopy(item)
+        if hasattr(item, "model_dump"):
+            return item.model_dump(exclude_none=True)
+        return dict(item)
+
+    @staticmethod
+    def _coerce_tool_search_arguments(arguments: Any) -> Dict[str, Any]:
+        if arguments is None:
+            return {}
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            if not arguments:
+                return {}
+            try:
+                decoded = json.loads(arguments)
+                return decoded if isinstance(decoded, dict) else {"query": decoded}
+            except Exception:
+                return {"query": arguments}
+        return {"query": arguments}
+
+    def _extract_tool_search_calls(self, response: Response) -> List[ToolSearchCall]:
+        calls: List[ToolSearchCall] = []
+        for output in getattr(response, "output", []) or []:
+            if getattr(output, "type", None) != "tool_search_call":
+                continue
+
+            raw = self._dump_openai_item(output)
+            execution = getattr(output, "execution", None) or raw.get("execution")
+            if execution != "client":
+                continue
+
+            call_id = (
+                getattr(output, "call_id", None) or raw.get("call_id") or getattr(output, "id", None) or raw.get("id")
+            )
+            if not call_id:
+                continue
+
+            arguments = getattr(output, "arguments", None)
+            if arguments is None:
+                arguments = raw.get("arguments")
+
+            calls.append(
+                ToolSearchCall(
+                    call_id=call_id,
+                    arguments=self._coerce_tool_search_arguments(arguments),
+                    status=getattr(output, "status", None) or raw.get("status"),
+                    raw=raw,
+                )
+            )
+        return calls
+
+    def _get_client_tool_search(self, tools: Optional[Sequence[Any]]) -> Optional[ToolSearch]:
+        for tool in tools or []:
+            if isinstance(tool, ToolSearch) and tool.execution == "client":
+                return tool
+        return None
+
+    def _build_tool_search_output(self, call: ToolSearchCall, loaded_tools: Sequence[Any]) -> Dict[str, Any]:
+        return {
+            "type": "tool_search_output",
+            "execution": "client",
+            "call_id": call.call_id,
+            "status": "completed",
+            "tools": [self._format_openai_tool(tool) for tool in loaded_tools],
+        }
+
+    def _reject_async_searcher_in_sync_run(self, client_tool_search: Optional[ToolSearch]) -> None:
+        if client_tool_search is not None and client_tool_search.is_async_searcher():
+            raise ModelProviderError(message=_ASYNC_SEARCHER_SYNC_ERROR, model_name=self.name, model_id=self.id)
+
+    @staticmethod
+    def _collect_turn_tool_search_items(
+        turn_items: List[Dict[str, Any]],
+        calls: Sequence[ToolSearchCall],
+        tool_search_outputs: Sequence[Dict[str, Any]],
+    ) -> None:
+        """Record this round's tool_search call + output in order, for cross-turn round-trip.
+
+        The order matters: the API only makes a deferred tool available *after* the
+        tool_search_output that loaded it appears in the input, so the call/output must precede the
+        function_call that uses them when the turn is replayed.
+        """
+        for call, output in zip(calls, tool_search_outputs):
+            if call.raw is not None:
+                turn_items.append(deepcopy(call.raw))
+            turn_items.append(deepcopy(output))
+
+    def _extract_tool_search_items(self, response: Response) -> List[Dict[str, Any]]:
+        """Return the raw tool_search_call/tool_search_output items present in a response's output."""
+        items: List[Dict[str, Any]] = []
+        for output in getattr(response, "output", []) or []:
+            if getattr(output, "type", None) in {"tool_search_call", "tool_search_output"}:
+                items.append(self._dump_openai_item(output))
+        return items
+
+    def _attach_tool_search_items(
+        self, model_response: ModelResponse, provider_response: Response, client_items: Sequence[Dict[str, Any]]
+    ) -> None:
+        """Persist this turn's tool_search items on the model response so they round-trip in history.
+
+        Client-executed items are passed in (they are not present in the final response output);
+        hosted (server) items are read from the final response output.
+        """
+        items: List[Dict[str, Any]] = list(client_items)
+        items.extend(self._extract_tool_search_items(provider_response))
+        if items:
+            model_response.provider_data = model_response.provider_data or {}
+            model_response.provider_data["tool_search_items"] = items
+
+    def _consume_loaded_tools(
+        self, call: ToolSearchCall, loaded_tools: Any, run_context: Optional[Any]
+    ) -> Dict[str, Any]:
+        """Register the tools a searcher returned for one call and build its tool_search_output."""
+        loaded_tools_list = list(loaded_tools or [])
+        self._register_loaded_functions(loaded_tools_list, run_context)
+        tool_search_output = self._build_tool_search_output(call, loaded_tools_list)
+        self._client_tool_search_items.append(tool_search_output)
+        return tool_search_output
+
+    def _run_tool_search_calls(
+        self, calls: Sequence[ToolSearchCall], client_tool_search: ToolSearch, run_context: Optional[Any]
+    ) -> List[Dict[str, Any]]:
+        """Resolve a batch of client tool_search calls with a synchronous searcher."""
+        tool_search_outputs: List[Dict[str, Any]] = []
+        for call in calls:
+            if call.raw is not None:
+                self._client_tool_search_items.append(call.raw)
+            loaded_tools = client_tool_search.searcher(call, run_context)  # type: ignore[misc]
+            if hasattr(loaded_tools, "__await__"):
+                raise ModelProviderError(message=_ASYNC_SEARCHER_SYNC_ERROR, model_name=self.name, model_id=self.id)
+            tool_search_outputs.append(self._consume_loaded_tools(call, loaded_tools, run_context))
+        return tool_search_outputs
+
+    async def _arun_tool_search_calls(
+        self, calls: Sequence[ToolSearchCall], client_tool_search: ToolSearch, run_context: Optional[Any]
+    ) -> List[Dict[str, Any]]:
+        """Resolve a batch of client tool_search calls with a sync or async searcher."""
+        tool_search_outputs: List[Dict[str, Any]] = []
+        for call in calls:
+            if call.raw is not None:
+                self._client_tool_search_items.append(call.raw)
+            loaded_tools = await maybe_await(client_tool_search.searcher(call, run_context))  # type: ignore[misc]
+            tool_search_outputs.append(self._consume_loaded_tools(call, loaded_tools, run_context))
+        return tool_search_outputs
+
+    def _tool_search_follow_up_input(
+        self, response: Response, tool_search_outputs: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        return [self._dump_openai_item(output) for output in getattr(response, "output", []) or []] + list(
+            tool_search_outputs
+        )
+
+    @staticmethod
+    def _tool_search_follow_up_params(request_params: Dict[str, Any]) -> Dict[str, Any]:
+        follow_up_params = deepcopy(request_params)
+        follow_up_params.pop("tools", None)
+        follow_up_params.pop("tool_choice", None)
+        follow_up_params.pop("previous_response_id", None)
+        return follow_up_params
+
+    def _validate_provider_response_status(self, provider_response: Response) -> None:
+        if provider_response.status == "failed":
+            error_msg = provider_response.error.message if provider_response.error else "Background response failed"
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id)
+        if provider_response.status == "cancelled":
+            raise ModelProviderError(
+                message=f"Background response {provider_response.id} was cancelled",
+                model_name=self.name,
+                model_id=self.id,
+            )
+        if provider_response.status == "incomplete":
+            log_warning(
+                f"Background response {provider_response.id} completed with status 'incomplete': "
+                f"{provider_response.incomplete_details}"
+            )
+
+    def _append_tool_search_extra(self, model_response: ModelResponse, item: Any) -> None:
+        raw_item = self._dump_openai_item(item)
+        item_type = raw_item.get("type") or getattr(item, "type", None)
+        if item_type not in {"tool_search_call", "tool_search_output"}:
+            return
+
+        model_response.extra = model_response.extra or {}
+        tool_search_extra = model_response.extra.setdefault("tool_search", {})
+        if item_type == "tool_search_call":
+            tool_search_extra.setdefault("calls", []).append(raw_item)
+        else:
+            tool_search_extra.setdefault("outputs", []).append(raw_item)
+
+    def _resolve_client_tool_searches(
+        self,
+        provider_response: Response,
+        *,
+        request_params: Dict[str, Any],
+        tools: Optional[Sequence[Any]],
+        run_context: Optional[Any] = None,
+    ) -> Tuple[Response, List[Dict[str, Any]]]:
+        client_tool_search = self._get_client_tool_search(tools)
+        if client_tool_search is None or client_tool_search.searcher is None:
+            return provider_response, []
+        self._reject_async_searcher_in_sync_run(client_tool_search)
+
+        turn_items: List[Dict[str, Any]] = []
+        current_response = provider_response
+        follow_up_params = self._tool_search_follow_up_params(request_params)
+        for round_index in range(self.client_tool_search_max_rounds + 1):
+            calls = self._extract_tool_search_calls(current_response)
+            if not calls:
+                return current_response, turn_items
+            if round_index >= self.client_tool_search_max_rounds:
+                break
+
+            tool_search_outputs = self._run_tool_search_calls(calls, client_tool_search, run_context)
+            self._collect_turn_tool_search_items(turn_items, calls, tool_search_outputs)
+
+            current_response = self.get_client().responses.create(
+                model=self.id,
+                input=self._tool_search_follow_up_input(current_response, tool_search_outputs),  # type: ignore
+                **follow_up_params,
+            )
+            if self.background and current_response.status in ("queued", "in_progress"):
+                current_response = self._poll_background_response(current_response.id)
+            self._validate_provider_response_status(current_response)
+
+        raise ModelProviderError(
+            message=f"Exceeded maximum client tool search rounds ({self.client_tool_search_max_rounds})",
+            model_name=self.name,
+            model_id=self.id,
+        )
+
+    async def _aresolve_client_tool_searches(
+        self,
+        provider_response: Response,
+        *,
+        request_params: Dict[str, Any],
+        tools: Optional[Sequence[Any]],
+        run_context: Optional[Any] = None,
+    ) -> Tuple[Response, List[Dict[str, Any]]]:
+        client_tool_search = self._get_client_tool_search(tools)
+        if client_tool_search is None or client_tool_search.searcher is None:
+            return provider_response, []
+
+        turn_items: List[Dict[str, Any]] = []
+        current_response = provider_response
+        follow_up_params = self._tool_search_follow_up_params(request_params)
+        for round_index in range(self.client_tool_search_max_rounds + 1):
+            calls = self._extract_tool_search_calls(current_response)
+            if not calls:
+                return current_response, turn_items
+            if round_index >= self.client_tool_search_max_rounds:
+                break
+
+            tool_search_outputs = await self._arun_tool_search_calls(calls, client_tool_search, run_context)
+            self._collect_turn_tool_search_items(turn_items, calls, tool_search_outputs)
+
+            current_response = await self.get_async_client().responses.create(
+                model=self.id,
+                input=self._tool_search_follow_up_input(current_response, tool_search_outputs),  # type: ignore
+                **follow_up_params,
+            )
+            if self.background and current_response.status in ("queued", "in_progress"):
+                current_response = await self._apoll_background_response(current_response.id)
+            self._validate_provider_response_status(current_response)
+
+        raise ModelProviderError(
+            message=f"Exceeded maximum client tool search rounds ({self.client_tool_search_max_rounds})",
+            model_name=self.name,
+            model_id=self.id,
+        )
 
     async def ainvoke(
         self,
         messages: List[Message],
         assistant_message: Message,
         response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[Any]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        run_context: Optional[Any] = None,
     ) -> ModelResponse:
         """
         Sends an asynchronous request to the OpenAI Responses API.
         """
         try:
+            self._maybe_reset_client_tool_search_state(messages)
             request_params = self.get_request_params(
                 messages=messages,
                 response_format=response_format,
@@ -916,22 +1538,16 @@ class OpenAIResponses(Model):
                 log_debug(f"Background response submitted: {provider_response.id}, polling for completion...")
                 provider_response = await self._apoll_background_response(provider_response.id)
 
-            if provider_response.status == "failed":
-                error_msg = provider_response.error.message if provider_response.error else "Background response failed"
-                raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id)
-            if provider_response.status == "cancelled":
-                raise ModelProviderError(
-                    message=f"Background response {provider_response.id} was cancelled",
-                    model_name=self.name,
-                    model_id=self.id,
-                )
-            if provider_response.status == "incomplete":
-                log_warning(
-                    f"Background response {provider_response.id} completed with status 'incomplete': "
-                    f"{provider_response.incomplete_details}"
-                )
+            self._validate_provider_response_status(provider_response)
+            provider_response, client_tool_search_items = await self._aresolve_client_tool_searches(
+                provider_response,
+                request_params=request_params,
+                tools=tools,
+                run_context=run_context if run_context is not None else self._current_run_context,
+            )
 
             model_response = self._parse_provider_response(provider_response, response_format=response_format)
+            self._attach_tool_search_items(model_response, provider_response, client_tool_search_items)
 
             return model_response
 
@@ -953,8 +1569,9 @@ class OpenAIResponses(Model):
                 model_id=self.id,
             ) from exc
         except APIConnectionError as exc:
-            log_error(f"API connection error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
         except APIStatusError as exc:
             log_error(f"API status error from OpenAI API: {exc}")
             try:
@@ -982,23 +1599,26 @@ class OpenAIResponses(Model):
             log_error(f"Model authentication error from OpenAI API: {exc}")
             raise exc
         except Exception as exc:
-            log_error(f"Error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
 
     def invoke_stream(
         self,
         messages: List[Message],
         assistant_message: Message,
         response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[Any]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        run_context: Optional[Any] = None,
     ) -> Iterator[ModelResponse]:
         """
         Send a streaming request to the OpenAI Responses API.
         """
         try:
+            self._maybe_reset_client_tool_search_state(messages)
             request_params = self.get_request_params(
                 messages=messages,
                 response_format=response_format,
@@ -1009,22 +1629,66 @@ class OpenAIResponses(Model):
             # Background mode is not supported for streaming. Strip the flag and warn.
             if request_params.pop("background", None):
                 log_warning("Background mode is not supported for streaming requests. Ignoring `background=True`.")
-            tool_use: Dict[str, Any] = {}
+            tool_uses: Dict[str, Dict[str, Any]] = {}
 
             assistant_message.metrics.start_timer()
 
-            for chunk in self.get_client().responses.create(
-                **self._get_model_request_kwargs(),
-                input=self._format_messages(messages, compress_tool_results, tools=tools),  # type: ignore
-                stream=True,
-                **request_params,
-            ):
-                model_response, tool_use = self._parse_provider_response_delta(
-                    stream_event=chunk,  # type: ignore
-                    assistant_message=assistant_message,
-                    tool_use=tool_use,  # type: ignore
+            stream_input: List[Any] = self._format_messages(messages, compress_tool_results, tools=tools)
+            stream_params = request_params
+            current_run_context = run_context if run_context is not None else self._current_run_context
+            client_tool_search = self._get_client_tool_search(tools)
+            turn_tool_search_items: List[Dict[str, Any]] = []
+            for round_index in range(self.client_tool_search_max_rounds + 1):
+                tool_uses = {}
+                completed_response = None
+                for chunk in self.get_client().responses.create(
+                    **self._get_model_request_kwargs(),
+                    input=stream_input,  # type: ignore
+                    stream=True,
+                    **stream_params,
+                ):
+                    if getattr(chunk, "type", None) == "response.completed":
+                        completed_response = getattr(chunk, "response", None)
+                    model_response, tool_use = self._parse_provider_response_delta(
+                        stream_event=chunk,  # type: ignore
+                        assistant_message=assistant_message,
+                        tool_uses=tool_uses,  # type: ignore
+                    )
+                    tool_uses = tool_use
+                    yield model_response
+
+                if completed_response is None:
+                    break
+
+                # Record any tool_search items the model emitted this round (hosted items and the
+                # client tool_search_call) so the turn can be round-tripped in later requests.
+                turn_tool_search_items.extend(self._extract_tool_search_items(completed_response))
+
+                calls = self._extract_tool_search_calls(completed_response)
+                if not calls or client_tool_search is None or client_tool_search.searcher is None:
+                    break
+                if round_index >= self.client_tool_search_max_rounds:
+                    raise ModelProviderError(
+                        message=f"Exceeded maximum client tool search rounds ({self.client_tool_search_max_rounds})",
+                        model_name=self.name,
+                        model_id=self.id,
+                    )
+                self._reject_async_searcher_in_sync_run(client_tool_search)
+
+                tool_search_outputs = self._run_tool_search_calls(calls, client_tool_search, current_run_context)
+                turn_tool_search_items.extend(deepcopy(output) for output in tool_search_outputs)
+
+                stream_input = self._tool_search_follow_up_input(completed_response, tool_search_outputs)
+                stream_params = self._tool_search_follow_up_params(request_params)
+            else:
+                raise ModelProviderError(
+                    message=f"Exceeded maximum client tool search rounds ({self.client_tool_search_max_rounds})",
+                    model_name=self.name,
+                    model_id=self.id,
                 )
-                yield model_response
+
+            if turn_tool_search_items:
+                yield ModelResponse(provider_data={"tool_search_items": turn_tool_search_items})
 
             assistant_message.metrics.stop_timer()
 
@@ -1046,8 +1710,9 @@ class OpenAIResponses(Model):
                 model_id=self.id,
             ) from exc
         except APIConnectionError as exc:
-            log_error(f"API connection error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
         except APIStatusError as exc:
             log_error(f"API status error from OpenAI API: {exc}")
             try:
@@ -1075,23 +1740,26 @@ class OpenAIResponses(Model):
             log_error(f"Model authentication error from OpenAI API: {exc}")
             raise exc
         except Exception as exc:
-            log_error(f"Error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
 
     async def ainvoke_stream(
         self,
         messages: List[Message],
         assistant_message: Message,
         response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[Any]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        run_context: Optional[Any] = None,
     ) -> AsyncIterator[ModelResponse]:
         """
         Sends an asynchronous streaming request to the OpenAI Responses API.
         """
         try:
+            self._maybe_reset_client_tool_search_state(messages)
             request_params = self.get_request_params(
                 messages=messages,
                 response_format=response_format,
@@ -1102,19 +1770,62 @@ class OpenAIResponses(Model):
             # Background mode is not supported for streaming. Strip the flag and warn.
             if request_params.pop("background", None):
                 log_warning("Background mode is not supported for streaming requests. Ignoring `background=True`.")
-            tool_use: Dict[str, Any] = {}
+            tool_uses: Dict[str, Dict[str, Any]] = {}
 
             assistant_message.metrics.start_timer()
 
-            async_stream = await self.get_async_client().responses.create(
-                **self._get_model_request_kwargs(),
-                input=self._format_messages(messages, compress_tool_results, tools=tools),  # type: ignore
-                stream=True,
-                **request_params,
-            )
-            async for chunk in async_stream:  # type: ignore
-                model_response, tool_use = self._parse_provider_response_delta(chunk, assistant_message, tool_use)  # type: ignore
-                yield model_response
+            stream_input: List[Any] = self._format_messages(messages, compress_tool_results, tools=tools)
+            stream_params = request_params
+            current_run_context = run_context if run_context is not None else self._current_run_context
+            client_tool_search = self._get_client_tool_search(tools)
+            turn_tool_search_items: List[Dict[str, Any]] = []
+            for round_index in range(self.client_tool_search_max_rounds + 1):
+                tool_uses = {}
+                completed_response = None
+                async_stream = await self.get_async_client().responses.create(
+                    **self._get_model_request_kwargs(),
+                    input=stream_input,  # type: ignore
+                    stream=True,
+                    **stream_params,
+                )
+                async for chunk in async_stream:  # type: ignore
+                    if getattr(chunk, "type", None) == "response.completed":
+                        completed_response = getattr(chunk, "response", None)
+                    model_response, tool_use = self._parse_provider_response_delta(chunk, assistant_message, tool_uses)  # type: ignore
+                    tool_uses = tool_use
+                    yield model_response
+
+                if completed_response is None:
+                    break
+
+                # Record any tool_search items the model emitted this round (hosted items and the
+                # client tool_search_call) so the turn can be round-tripped in later requests.
+                turn_tool_search_items.extend(self._extract_tool_search_items(completed_response))
+
+                calls = self._extract_tool_search_calls(completed_response)
+                if not calls or client_tool_search is None or client_tool_search.searcher is None:
+                    break
+                if round_index >= self.client_tool_search_max_rounds:
+                    raise ModelProviderError(
+                        message=f"Exceeded maximum client tool search rounds ({self.client_tool_search_max_rounds})",
+                        model_name=self.name,
+                        model_id=self.id,
+                    )
+
+                tool_search_outputs = await self._arun_tool_search_calls(calls, client_tool_search, current_run_context)
+                turn_tool_search_items.extend(deepcopy(output) for output in tool_search_outputs)
+
+                stream_input = self._tool_search_follow_up_input(completed_response, tool_search_outputs)
+                stream_params = self._tool_search_follow_up_params(request_params)
+            else:
+                raise ModelProviderError(
+                    message=f"Exceeded maximum client tool search rounds ({self.client_tool_search_max_rounds})",
+                    model_name=self.name,
+                    model_id=self.id,
+                )
+
+            if turn_tool_search_items:
+                yield ModelResponse(provider_data={"tool_search_items": turn_tool_search_items})
 
             assistant_message.metrics.stop_timer()
 
@@ -1136,8 +1847,9 @@ class OpenAIResponses(Model):
                 model_id=self.id,
             ) from exc
         except APIConnectionError as exc:
-            log_error(f"API connection error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"API connection error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
         except APIStatusError as exc:
             log_error(f"API status error from OpenAI API: {exc}")
             try:
@@ -1165,8 +1877,9 @@ class OpenAIResponses(Model):
             log_error(f"Model authentication error from OpenAI API: {exc}")
             raise exc
         except Exception as exc:
-            log_error(f"Error from OpenAI API: {exc}")
-            raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+            error_msg = _describe_exception(exc)
+            log_error(f"Error from OpenAI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from exc
 
     def format_function_call_results(
         self,
@@ -1183,7 +1896,19 @@ class OpenAIResponses(Model):
         runtime in _format_messages via _build_fc_id_to_call_id_map.
         """
         if len(function_call_results) > 0:
-            messages.extend(function_call_results)
+            tool_call_ids = kwargs.get("tool_call_ids")
+            # Tool results may arrive without an explicit tool_call_id when the upstream
+            # path could not propagate it (e.g. cancelled or limit-error placeholders);
+            # fall back to the positional id list passed by the base class so the
+            # result still pairs with the corresponding assistant tool_call.
+            for _fc_message_index, _fc_message in enumerate(function_call_results):
+                if (
+                    not _fc_message.tool_call_id
+                    and tool_call_ids is not None
+                    and _fc_message_index < len(tool_call_ids)
+                ):
+                    _fc_message.tool_call_id = tool_call_ids[_fc_message_index]
+                messages.append(_fc_message)
 
     def _parse_provider_response(self, response: Response, **kwargs) -> ModelResponse:
         """
@@ -1236,21 +1961,28 @@ class OpenAIResponses(Model):
             elif output.type == "function_call":
                 if model_response.tool_calls is None:
                     model_response.tool_calls = []
-                model_response.tool_calls.append(
-                    {
-                        "id": output.id,
-                        # Store additional call_id from OpenAI responses
-                        "call_id": output.call_id or output.id,
-                        "type": "function",
-                        "function": {
-                            "name": output.name,
-                            "arguments": output.arguments,
-                        },
-                    }
-                )
+                tool_call_dict: Dict[str, Any] = {
+                    "id": output.id,
+                    # Store additional call_id from OpenAI responses
+                    "call_id": output.call_id or output.id,
+                    "type": "function",
+                    "function": {
+                        "name": output.name,
+                        "arguments": output.arguments,
+                    },
+                }
+                # Preserve the namespace for deferred/namespaced tools so the follow-up request can
+                # round-trip it (the API rejects the function_call otherwise).
+                output_namespace = getattr(output, "namespace", None)
+                if output_namespace is not None:
+                    tool_call_dict["namespace"] = output_namespace
+                model_response.tool_calls.append(tool_call_dict)
 
                 model_response.extra = model_response.extra or {}
                 model_response.extra.setdefault("tool_call_ids", []).append(output.call_id)
+
+            elif output.type in {"tool_search_call", "tool_search_output"}:
+                self._append_tool_search_extra(model_response, output)
 
             # Handle reasoning output items
             elif output.type == "reasoning":
@@ -1275,6 +2007,9 @@ class OpenAIResponses(Model):
         elif self.reasoning is not None:
             model_response.reasoning_content = response.output_text
 
+        for tool_search_item in self._client_tool_search_items:
+            self._append_tool_search_extra(model_response, tool_search_item)
+
         # Add metrics
         if response.usage is not None:
             model_response.response_usage = self._get_metrics(response.usage)
@@ -1282,8 +2017,11 @@ class OpenAIResponses(Model):
         return model_response
 
     def _parse_provider_response_delta(
-        self, stream_event: ResponseStreamEvent, assistant_message: Message, tool_use: Dict[str, Any]
-    ) -> Tuple[ModelResponse, Dict[str, Any]]:
+        self,
+        stream_event: ResponseStreamEvent,
+        assistant_message: Message,
+        tool_uses: Dict[str, Dict[str, Any]],
+    ) -> Tuple[ModelResponse, Dict[str, Dict[str, Any]]]:
         """
         Parse the streaming response from the model provider into a ModelResponse object.
 
@@ -1344,37 +2082,196 @@ class OpenAIResponses(Model):
         elif stream_event.type == "response.output_item.added":
             item = stream_event.item
             if item.type == "function_call":
-                tool_use = {
-                    "id": getattr(item, "id", None),
-                    "call_id": getattr(item, "call_id", None) or getattr(item, "id", None),
-                    "type": "function",
-                    "function": {
-                        "name": item.name,
-                        "arguments": item.arguments,
-                    },
-                }
+                output_index = getattr(stream_event, "output_index", None)
+                item_arguments = getattr(item, "arguments", None)
+                tool_entry = self._find_tool_entry(
+                    tool_uses,
+                    output_index=output_index,
+                    item_id=getattr(item, "id", None),
+                    call_id=getattr(item, "call_id", None) or getattr(item, "id", None),
+                )
+                if tool_entry is None:
+                    tool_entry = self._build_tool_entry_from_item(item)
+                else:
+                    self._merge_tool_entry(
+                        tool_entry,
+                        item_id=getattr(item, "id", None),
+                        call_id=getattr(item, "call_id", None) or getattr(item, "id", None),
+                        name=getattr(item, "name", None),
+                        arguments=item_arguments if item_arguments not in (None, "") else None,
+                        namespace=getattr(item, "namespace", None),
+                    )
+                if output_index is not None:
+                    tool_entry["index"] = output_index
+                tool_uses = self._index_tool_entry(
+                    tool_uses,
+                    tool_entry,
+                    output_index=output_index,
+                    item_id=tool_entry.get("id"),
+                    call_id=tool_entry.get("call_id"),
+                )
+            elif item.type in {"tool_search_call", "tool_search_output"}:
+                self._append_tool_search_extra(model_response, item)
 
         # 4.2 Add tool call arguments
         elif stream_event.type == "response.function_call_arguments.delta":
-            tool_use["function"]["arguments"] += stream_event.delta
+            output_index = getattr(stream_event, "output_index", None)
+            tool_entry = self._find_tool_entry(
+                tool_uses,
+                output_index=output_index,
+                item_id=getattr(stream_event, "item_id", None),
+            )
+            if tool_entry is None:
+                log_warning(
+                    "Dropping OpenAI Responses tool args delta for unknown function call item "
+                    f"item_id={getattr(stream_event, 'item_id', None)} "
+                    f"output_index={getattr(stream_event, 'output_index', None)}"
+                )
+            else:
+                if output_index is not None:
+                    tool_entry["index"] = output_index
+                current_arguments = tool_entry.get("function", {}).get("arguments") or ""
+                tool_entry["function"]["arguments"] = current_arguments + stream_event.delta
+                tool_uses = self._index_tool_entry(
+                    tool_uses,
+                    tool_entry,
+                    output_index=output_index,
+                    item_id=getattr(stream_event, "item_id", None),
+                    call_id=tool_entry.get("call_id"),
+                )
+                tool_call_id = tool_entry.get("call_id") or tool_entry.get("id")
+                model_response.event = ModelResponseEvent.tool_call_args_delta.value
+                model_response.tool_call_id = tool_call_id
+                model_response.tool_name = tool_entry.get("function", {}).get("name")
+                model_response.tool_args_delta = stream_event.delta
+
+        elif stream_event.type == "response.function_call_arguments.done":
+            output_index = getattr(stream_event, "output_index", None)
+            tool_entry = self._find_tool_entry(
+                tool_uses,
+                output_index=output_index,
+                item_id=getattr(stream_event, "item_id", None),
+            )
+            if tool_entry is None:
+                tool_entry = self._merge_tool_entry(
+                    {},
+                    item_id=getattr(stream_event, "item_id", None),
+                    name=getattr(stream_event, "name", None),
+                    arguments=getattr(stream_event, "arguments", None) or "",
+                )
+            else:
+                self._merge_tool_entry(
+                    tool_entry,
+                    item_id=getattr(stream_event, "item_id", None),
+                    name=getattr(stream_event, "name", None),
+                    arguments=(
+                        getattr(stream_event, "arguments", None)
+                        if getattr(stream_event, "arguments", None) not in (None, "")
+                        else None
+                    ),
+                )
+            if output_index is not None:
+                tool_entry["index"] = output_index
+            tool_uses = self._index_tool_entry(
+                tool_uses,
+                tool_entry,
+                output_index=output_index,
+                item_id=tool_entry.get("id"),
+                call_id=tool_entry.get("call_id"),
+            )
 
         # 4.3 Add tool call completion data
-        elif stream_event.type == "response.output_item.done" and tool_use:
-            model_response.tool_calls = [tool_use]
-            if assistant_message.tool_calls is None:
-                assistant_message.tool_calls = []
-            assistant_message.tool_calls.append(tool_use)
+        elif stream_event.type == "response.output_item.done":
+            item = stream_event.item
+            if item.type == "function_call":
+                output_index = getattr(stream_event, "output_index", None)
+                item_arguments = getattr(item, "arguments", None)
+                tool_entry = self._find_tool_entry(
+                    tool_uses,
+                    output_index=output_index,
+                    item_id=getattr(item, "id", None),
+                    call_id=getattr(item, "call_id", None) or getattr(item, "id", None),
+                )
+                if tool_entry is None:
+                    tool_entry = self._build_tool_entry_from_item(item)
+                else:
+                    self._merge_tool_entry(
+                        tool_entry,
+                        item_id=getattr(item, "id", None),
+                        call_id=getattr(item, "call_id", None) or getattr(item, "id", None),
+                        name=getattr(item, "name", None),
+                        arguments=item_arguments if item_arguments not in (None, "") else None,
+                        namespace=getattr(item, "namespace", None),
+                    )
+                if output_index is not None:
+                    tool_entry["index"] = output_index
+                tool_uses = self._index_tool_entry(
+                    tool_uses,
+                    tool_entry,
+                    output_index=output_index,
+                    item_id=tool_entry.get("id"),
+                    call_id=tool_entry.get("call_id"),
+                )
+                model_response.tool_calls = [tool_entry]
+                self._append_assistant_tool_call(assistant_message, tool_entry)
 
-            model_response.extra = model_response.extra or {}
-            model_response.extra.setdefault("tool_call_ids", []).append(tool_use["call_id"])
-            tool_use = {}
+                tool_call_id = tool_entry.get("call_id") or tool_entry.get("id")
+                model_response.extra = model_response.extra or {}
+                if tool_call_id is not None:
+                    model_response.extra.setdefault("tool_call_ids", []).append(tool_call_id)
+                tool_uses = self._drop_tool_entry(tool_uses, tool_entry)
+            elif item.type in {"tool_search_call", "tool_search_output"}:
+                self._append_tool_search_extra(model_response, item)
 
         # 5. Add metrics
         elif stream_event.type == "response.completed":
             model_response = ModelResponse()
 
-            # Handle reasoning output items for ZDR mode (store=False)
-            if self.store is False:
+            completed_tool_calls: List[Dict[str, Any]] = []
+            for output in getattr(stream_event.response, "output", []) or []:
+                if getattr(output, "type", None) != "function_call":
+                    continue
+
+                output_arguments = getattr(output, "arguments", None)
+                tool_entry = self._find_tool_entry(
+                    tool_uses,
+                    item_id=getattr(output, "id", None),
+                    call_id=getattr(output, "call_id", None) or getattr(output, "id", None),
+                )
+                if tool_entry is None:
+                    tool_entry = self._build_tool_entry_from_item(output)
+                else:
+                    self._merge_tool_entry(
+                        tool_entry,
+                        item_id=getattr(output, "id", None),
+                        call_id=getattr(output, "call_id", None) or getattr(output, "id", None),
+                        name=getattr(output, "name", None),
+                        arguments=output_arguments if output_arguments not in (None, "") else None,
+                        namespace=getattr(output, "namespace", None),
+                    )
+
+                tool_call_id = tool_entry.get("call_id") or tool_entry.get("id")
+                existing_tool_call_ids = {
+                    (tool_call.get("call_id") or tool_call.get("id"))
+                    for tool_call in (assistant_message.tool_calls or [])
+                }
+                if tool_call_id not in existing_tool_call_ids:
+                    completed_tool_calls.append(tool_entry)
+                    self._append_assistant_tool_call(assistant_message, tool_entry)
+                tool_uses = self._drop_tool_entry(tool_uses, tool_entry)
+
+            if completed_tool_calls:
+                model_response.tool_calls = completed_tool_calls
+                model_response.extra = model_response.extra or {}
+                model_response.extra["tool_call_ids"] = [
+                    tool_call.get("call_id") or tool_call.get("id") for tool_call in completed_tool_calls
+                ]
+
+            for output in getattr(stream_event.response, "output", []) or []:
+                if getattr(output, "type", None) in {"tool_search_call", "tool_search_output"}:
+                    self._append_tool_search_extra(model_response, output)
+
+            if self.reasoning_summary is not None or self.store is False:
                 for out in getattr(stream_event.response, "output", []) or []:
                     if getattr(out, "type", None) == "reasoning":
                         if hasattr(out, "encrypted_content"):
@@ -1386,7 +2283,7 @@ class OpenAIResponses(Model):
             if stream_event.response.usage is not None:
                 model_response.response_usage = self._get_metrics(stream_event.response.usage)
 
-        return model_response, tool_use
+        return model_response, tool_uses
 
     def _get_metrics(self, response_usage: ResponseUsage) -> MessageMetrics:
         """
