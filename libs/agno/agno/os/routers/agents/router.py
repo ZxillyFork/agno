@@ -48,6 +48,7 @@ from agno.os.schema import (
     UnauthenticatedResponse,
     ValidationErrorResponse,
 )
+from agno.os.scopes import has_required_scopes
 from agno.os.settings import AgnoAPISettings
 from agno.os.utils import (
     classify_upload_file,
@@ -64,6 +65,7 @@ from agno.os.utils import (
 from agno.registry import Registry
 from agno.run.agent import RunErrorEvent, RunOutput
 from agno.run.base import RunStatus
+from agno.run.requirement import RunRequirement
 from agno.utils.log import log_debug, log_error, log_warning
 from agno.utils.serialize import json_serializer
 
@@ -75,6 +77,35 @@ def _require_capability(agent: Any, method: str, feature: str) -> None:
     """Raise 501 if the agent does not expose the given method."""
     if not callable(getattr(agent, method, None)):
         raise HTTPException(status_code=501, detail=f"This agent does not support {feature}")
+
+
+async def _ensure_component_approval_resolved(request: Request, db: Any, run_id: str) -> None:
+    if not getattr(request.state, "authorization_enabled", False):
+        return
+    if db is None:
+        return
+    if has_required_scopes(getattr(request.state, "scopes", []), ["approvals:write"]):
+        return
+
+    get_approvals = getattr(db, "get_approvals", None)
+    if get_approvals is None:
+        return
+
+    try:
+        if asyncio.iscoroutinefunction(get_approvals):
+            result = await get_approvals(run_id=run_id, status="pending", approval_type="required")
+        else:
+            result = get_approvals(run_id=run_id, status="pending", approval_type="required")
+        approvals = result[0] if isinstance(result, tuple) else result
+    except Exception as exc:
+        log_warning(f"Approval resolution check skipped due to error: {exc}: {exc}")
+        return
+
+    if approvals:
+        raise HTTPException(
+            status_code=403,
+            detail="This run requires admin approval before it can be continued",
+        )
 
 
 async def agent_response_streamer(
@@ -215,6 +246,7 @@ async def agent_continue_response_streamer(
     regenerate: bool = False,
     replace_original: Optional[bool] = None,
     additional_instructions: Optional[str] = None,
+    requirements: Optional[List[RunRequirement]] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
@@ -240,6 +272,7 @@ async def agent_continue_response_streamer(
             regenerate=regenerate,
             replace_original=replace_original,
             additional_instructions=additional_instructions,
+            requirements=requirements,
             session_id=session_id,
             user_id=user_id,
             stream=True,
@@ -282,6 +315,7 @@ async def agent_resumable_continue_response_streamer(
     regenerate: bool = False,
     replace_original: Optional[bool] = None,
     additional_instructions: Optional[str] = None,
+    requirements: Optional[List] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
@@ -317,6 +351,7 @@ async def agent_resumable_continue_response_streamer(
             regenerate=regenerate,
             replace_original=replace_original,
             additional_instructions=additional_instructions,
+            requirements=requirements,
             session_id=session_id,
             user_id=user_id,
             stream=True,
@@ -859,6 +894,7 @@ def get_agent_router(
             raise HTTPException(status_code=500, detail=f"Error resolving agent: {e}")
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
+        await _ensure_component_approval_resolved(request, getattr(agent, "db", None), run_id)
 
         _require_capability(agent, "acancel_run", "cancel_run")
 
@@ -928,6 +964,9 @@ def get_agent_router(
         tools: str = Form(
             "", description="JSON string of tool call results to continue the paused run"
         ),  # optional when admin approval resolved
+        requirements: str = Form(
+            "", description="JSON string of run requirements to continue the paused run"
+        ),  # preferred continuation payload
         input: Optional[str] = Form(
             None,
             description=(
@@ -1004,6 +1043,10 @@ def get_agent_router(
             tools_data = json.loads(tools) if tools else None
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in tools field")
+        try:
+            requirements_data = json.loads(requirements) if requirements else None
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in requirements field")
 
         # Factory agents: re-invoke factory to get a real agent for continue
         # (needs model/tools to resume the paused run, factory_input not available)
@@ -1062,6 +1105,16 @@ def get_agent_router(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid structure or content for tools: {str(e)}")
 
+        parsed_requirements = None
+        if requirements_data:
+            try:
+                parsed_requirements = [
+                    requirement if isinstance(requirement, RunRequirement) else RunRequirement.from_dict(requirement)
+                    for requirement in requirements_data
+                ]
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid structure or content for requirements: {str(e)}")
+
         # Extract auth token for remote agents
         auth_token = get_auth_token_from_request(request)
         stripped_continue_from = continue_from.strip()
@@ -1095,6 +1148,7 @@ def get_agent_router(
                     regenerate=regenerate,
                     replace_original=replace_original,
                     additional_instructions=additional_instructions,
+                    requirements=parsed_requirements,
                     session_id=session_id,
                     user_id=user_id,
                     background_tasks=background_tasks,
@@ -1115,6 +1169,7 @@ def get_agent_router(
                     regenerate=regenerate,
                     replace_original=replace_original,
                     additional_instructions=additional_instructions,
+                    requirements=parsed_requirements,
                     session_id=session_id,
                     user_id=user_id,
                     background_tasks=background_tasks,
@@ -1141,6 +1196,7 @@ def get_agent_router(
                         regenerate=regenerate,
                         replace_original=replace_original,
                         additional_instructions=additional_instructions,
+                        requirements=parsed_requirements,
                         session_id=session_id,
                         user_id=user_id,
                         stream=False,

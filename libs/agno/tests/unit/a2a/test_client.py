@@ -231,6 +231,28 @@ class TestParseStreamEvent:
         assert event.event_type == "completed"
         assert event.is_final
 
+    def test_parse_tool_call_status_event_uses_agno_event_type(self):
+        client = A2AClient("http://localhost:7777")
+        data = {
+            "result": {
+                "kind": "status-update",
+                "taskId": "task-123",
+                "contextId": "ctx-456",
+                "status": {"state": "working"},
+                "final": False,
+                "metadata": {
+                    "agno_event_type": "tool_call_start",
+                    "tool_call_id": "call-1",
+                    "tool_name": "lookup",
+                },
+            },
+        }
+
+        event = client._parse_stream_event(data)
+
+        assert event.event_type == "tool_call_start"
+        assert event.is_tool_call
+
 
 class TestSendMessage:
     """Test send_message method."""
@@ -443,3 +465,5 @@ class TestSchemas:
         )
         assert completed_event.is_completed
         assert completed_event.is_final
+
+        assert StreamEvent(event_type="tool_call_start").is_tool_call

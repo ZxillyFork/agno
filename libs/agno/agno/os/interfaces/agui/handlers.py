@@ -135,6 +135,25 @@ def on_tool_call_started(chunk: BaseRunOutputEvent, state: StreamState) -> List[
     if tool is None:
         return events
 
+    tool_call_id = getattr(tool, "tool_call_id", None)
+    if tool_call_id is None or tool_call_id in state.active_tool_call_ids or tool_call_id in state.ended_tool_call_ids:
+        return events
+
+    events.extend(_emit_tool_call_start(tool_call_id, getattr(tool, "tool_name", None) or "tool", state))
+    events.append(
+        ToolCallArgsEvent(
+            type=EventType.TOOL_CALL_ARGS,
+            tool_call_id=tool_call_id,
+            delta=json.dumps(getattr(tool, "tool_args", None)),
+        )
+    )
+
+    return events
+
+
+def _emit_tool_call_start(tool_call_id: str, tool_name: str, state: StreamState) -> List[BaseEvent]:
+    events: List[BaseEvent] = []
+
     # Close open text message before tool call
     if state.text_message_open:
         events.append(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=state.text_message_id))
@@ -159,21 +178,43 @@ def on_tool_call_started(chunk: BaseRunOutputEvent, state: StreamState) -> List[
     events.append(
         ToolCallStartEvent(
             type=EventType.TOOL_CALL_START,
-            tool_call_id=tool.tool_call_id,
-            tool_call_name=tool.tool_name,
+            tool_call_id=tool_call_id,
+            tool_call_name=tool_name,
             parent_message_id=parent_message_id,
         )
     )
 
+    state.start_tool_call(tool_call_id)
+    return events
+
+
+def on_tool_call_start(chunk: BaseRunOutputEvent, state: StreamState) -> List[BaseEvent]:
+    tool_call_id = getattr(chunk, "tool_call_id", None)
+    if tool_call_id is None or tool_call_id in state.active_tool_call_ids or tool_call_id in state.ended_tool_call_ids:
+        return []
+
+    tool_name = getattr(chunk, "tool_name", None) or "tool"
+    return _emit_tool_call_start(tool_call_id, tool_name, state)
+
+
+def on_tool_call_args_delta(chunk: BaseRunOutputEvent, state: StreamState) -> List[BaseEvent]:
+    events: List[BaseEvent] = []
+    tool_call_id = getattr(chunk, "tool_call_id", None)
+    delta = getattr(chunk, "delta", None)
+    if tool_call_id is None or delta is None or tool_call_id in state.ended_tool_call_ids:
+        return events
+
+    if tool_call_id not in state.active_tool_call_ids:
+        tool_name = getattr(chunk, "tool_name", None) or "tool"
+        events.extend(_emit_tool_call_start(tool_call_id, tool_name, state))
+
     events.append(
         ToolCallArgsEvent(
             type=EventType.TOOL_CALL_ARGS,
-            tool_call_id=tool.tool_call_id,
-            delta=json.dumps(tool.tool_args),
+            tool_call_id=tool_call_id,
+            delta=str(delta),
         )
     )
-
-    state.start_tool_call(tool.tool_call_id)
     return events
 
 
@@ -398,7 +439,9 @@ def _normalize_event(event: str) -> str:
 # Maps normalized event names to handler functions
 HANDLERS: Dict[str, EventHandler] = {
     RunEvent.run_content.value: on_run_content,
+    RunEvent.tool_call_start.value: on_tool_call_start,
     RunEvent.tool_call_started.value: on_tool_call_started,
+    RunEvent.tool_call_args_delta.value: on_tool_call_args_delta,
     RunEvent.tool_call_completed.value: on_tool_call_completed,
     RunEvent.reasoning_started.value: on_reasoning_started,
     RunEvent.reasoning_content_delta.value: on_reasoning_content_delta,

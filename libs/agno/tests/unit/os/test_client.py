@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agno.client import AgentOSClient
+from agno.models.response import ToolExecution
+from agno.run.requirement import RunRequirement
 
 
 def test_init_with_base_url():
@@ -625,6 +627,86 @@ async def test_headers_passed_through():
 
 
 # Streaming Methods Tests
+
+
+@pytest.mark.asyncio
+async def test_continue_team_run_sends_legacy_tools_payload():
+    client = AgentOSClient(base_url="http://localhost:7777")
+    tool = ToolExecution(tool_call_id="call-1", tool_name="approve_me", requires_confirmation=True, confirmed=True)
+
+    with patch.object(client, "_apost", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = {"run_id": "run-1", "session_id": "session-1"}
+
+        await client.continue_team_run("team-1", "run-1", tools=[tool], session_id="session-1")
+
+        endpoint, data = mock_post.call_args.args[:2]
+        assert endpoint == "/teams/team-1/runs/run-1/continue"
+        assert data["stream"] == "false"
+        assert "tools" in data
+        assert "requirements" not in data
+
+
+@pytest.mark.asyncio
+async def test_continue_team_run_preserves_requirements_positional_argument():
+    client = AgentOSClient(base_url="http://localhost:7777")
+    requirement = RunRequirement(
+        tool_execution=ToolExecution(tool_call_id="call-1", tool_name="approve_me", confirmed=True)
+    )
+
+    with patch.object(client, "_apost", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = {"run_id": "run-1", "session_id": "session-1"}
+
+        await client.continue_team_run("team-1", "run-1", [requirement], session_id="session-1")
+
+        endpoint, data = mock_post.call_args.args[:2]
+        assert endpoint == "/teams/team-1/runs/run-1/continue"
+        assert data["stream"] == "false"
+        assert "requirements" in data
+        assert "tools" not in data
+
+
+@pytest.mark.asyncio
+async def test_continue_team_run_stream_sends_legacy_tools_payload():
+    client = AgentOSClient(base_url="http://localhost:7777")
+    tool = ToolExecution(tool_call_id="call-1", tool_name="approve_me", requires_confirmation=True, confirmed=True)
+
+    async def async_generator():
+        yield 'data: {"event": "TeamRunStarted", "run_id": "run-1", "team_id": "team-1", "created_at": 123}'
+
+    with patch.object(client, "_astream_post_form_data") as mock_stream:
+        mock_stream.return_value = async_generator()
+
+        async for _ in client.continue_team_run_stream("team-1", "run-1", tools=[tool], session_id="session-1"):
+            pass
+
+        endpoint, data = mock_stream.call_args.args[:2]
+        assert endpoint == "/teams/team-1/runs/run-1/continue"
+        assert data["stream"] == "true"
+        assert "tools" in data
+        assert "requirements" not in data
+
+
+@pytest.mark.asyncio
+async def test_continue_team_run_stream_preserves_requirements_positional_argument():
+    client = AgentOSClient(base_url="http://localhost:7777")
+    requirement = RunRequirement(
+        tool_execution=ToolExecution(tool_call_id="call-1", tool_name="approve_me", confirmed=True)
+    )
+
+    async def async_generator():
+        yield 'data: {"event": "TeamRunStarted", "run_id": "run-1", "team_id": "team-1", "created_at": 123}'
+
+    with patch.object(client, "_astream_post_form_data") as mock_stream:
+        mock_stream.return_value = async_generator()
+
+        async for _ in client.continue_team_run_stream("team-1", "run-1", [requirement], session_id="session-1"):
+            pass
+
+        endpoint, data = mock_stream.call_args.args[:2]
+        assert endpoint == "/teams/team-1/runs/run-1/continue"
+        assert data["stream"] == "true"
+        assert "requirements" in data
+        assert "tools" not in data
 
 
 @pytest.mark.asyncio

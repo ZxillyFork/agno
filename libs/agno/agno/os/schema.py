@@ -31,6 +31,12 @@ from agno.workflow.remote import RemoteWorkflow
 from agno.workflow.workflow import Workflow
 
 
+def _dict_list(items: Optional[List[Any]]) -> Optional[List[dict]]:
+    if items is None:
+        return None
+    return [item.to_dict() if hasattr(item, "to_dict") else item for item in items]
+
+
 class BadRequestResponse(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": {"detail": "Bad request", "error_code": "BAD_REQUEST"}})
 
@@ -486,6 +492,7 @@ class RunSchema(BaseModel):
     metrics: Optional[dict] = Field(None, description="Performance and usage metrics")
     messages: Optional[List[dict]] = Field(None, description="Message history for the run")
     tools: Optional[List[dict]] = Field(None, description="Tools used in the run")
+    requirements: Optional[List[dict]] = Field(None, description="Requirements needed to continue a paused run")
     events: Optional[List[dict]] = Field(None, description="Events generated during the run")
     created_at: Optional[datetime] = Field(None, description="Run creation timestamp")
     references: Optional[List[dict]] = Field(None, description="References cited in the run")
@@ -538,7 +545,8 @@ class RunSchema(BaseModel):
             reasoning_steps=run_dict.get("reasoning_steps", []),
             metrics=run_dict.get("metrics", {}),
             messages=[message for message in run_dict.get("messages", [])] if run_dict.get("messages") else None,
-            tools=[tool for tool in run_dict.get("tools", [])] if run_dict.get("tools") else None,
+            tools=[tool for tool in run_dict["tools"]] if run_dict.get("tools") is not None else None,
+            requirements=_dict_list(run_dict.get("requirements")),
             events=[event for event in run_dict["events"]] if run_dict.get("events") else None,
             references=run_dict.get("references", []),
             citations=run_dict.get("citations", None),
@@ -572,6 +580,7 @@ class TeamRunSchema(BaseModel):
     run_response_format: Optional[str] = Field(None, description="Format of the response (text/json)")
     metrics: Optional[dict] = Field(None, description="Performance and usage metrics")
     tools: Optional[List[dict]] = Field(None, description="Tools used in the run")
+    requirements: Optional[List[dict]] = Field(None, description="Requirements needed to continue a paused run")
     messages: Optional[List[dict]] = Field(None, description="Message history for the run")
     events: Optional[List[dict]] = Field(None, description="Events generated during the run")
     created_at: Optional[datetime] = Field(None, description="Run creation timestamp")
@@ -623,7 +632,8 @@ class TeamRunSchema(BaseModel):
             reasoning_steps=run_dict.get("reasoning_steps", []),
             metrics=run_dict.get("metrics", {}),
             messages=[message for message in run_dict.get("messages", [])] if run_dict.get("messages") else None,
-            tools=[tool for tool in run_dict.get("tools", [])] if run_dict.get("tools") else None,
+            tools=[tool for tool in run_dict["tools"]] if run_dict.get("tools") is not None else None,
+            requirements=_dict_list(run_dict.get("requirements")),
             events=[event for event in run_dict["events"]] if run_dict.get("events") else None,
             created_at=to_utc_datetime(run_dict.get("created_at")),
             references=run_dict.get("references", []),

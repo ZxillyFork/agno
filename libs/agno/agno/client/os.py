@@ -64,6 +64,7 @@ from agno.os.schema import (
     WorkflowSummaryResponse,
 )
 from agno.run.agent import RunOutput, RunOutputEvent, run_output_event_from_dict
+from agno.run.requirement import RunRequirement
 from agno.run.team import TeamRunOutput, TeamRunOutputEvent, team_run_output_event_from_dict
 from agno.run.workflow import WorkflowRunOutput, WorkflowRunOutputEvent, workflow_run_output_event_from_dict
 from agno.utils.http import get_default_async_client, get_default_sync_client
@@ -661,7 +662,8 @@ class AgentOSClient:
         self,
         agent_id: str,
         run_id: str,
-        tools: List[ToolExecution],
+        tools: Optional[List[Union[ToolExecution, Dict[str, Any]]]] = None,
+        requirements: Optional[List[Union[RunRequirement, Dict[str, Any]]]] = None,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -672,7 +674,8 @@ class AgentOSClient:
         Args:
             agent_id: ID of the agent
             run_id: ID of the run to continue
-            tools: List of ToolExecution objects with tool results
+            tools: Optional list of ToolExecution objects with tool results
+            requirements: Optional list of RunRequirement objects with resolution data
             stream: Whether to stream the response
             session_id: Optional session ID
             user_id: Optional user ID
@@ -685,7 +688,16 @@ class AgentOSClient:
             HTTPStatusError: On HTTP errors
         """
         endpoint = f"/agents/{agent_id}/runs/{run_id}/continue"
-        data: Dict[str, Any] = {"tools": json.dumps([tool.to_dict() for tool in tools]), "stream": "false"}
+        data: Dict[str, Any] = {"stream": "false"}
+        if tools is not None:
+            data["tools"] = json.dumps([tool.to_dict() if isinstance(tool, ToolExecution) else tool for tool in tools])
+        if requirements is not None:
+            data["requirements"] = json.dumps(
+                [
+                    requirement.to_dict() if isinstance(requirement, RunRequirement) else requirement
+                    for requirement in requirements
+                ]
+            )
         if session_id is not None:
             data["session_id"] = session_id
         if user_id is not None:
@@ -704,7 +716,8 @@ class AgentOSClient:
         self,
         agent_id: str,
         run_id: str,
-        tools: List[ToolExecution],
+        tools: Optional[List[Union[ToolExecution, Dict[str, Any]]]] = None,
+        requirements: Optional[List[Union[RunRequirement, Dict[str, Any]]]] = None,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -715,7 +728,8 @@ class AgentOSClient:
         Args:
             agent_id: ID of the agent
             run_id: ID of the run to continue
-            tools: List of ToolExecution objects with tool results
+            tools: Optional list of ToolExecution objects with tool results
+            requirements: Optional list of RunRequirement objects with resolution data
             session_id: Optional session ID
             user_id: Optional user ID
             headers: HTTP headers to include in the request (optional)
@@ -727,7 +741,16 @@ class AgentOSClient:
             HTTPStatusError: On HTTP errors
         """
         endpoint = f"/agents/{agent_id}/runs/{run_id}/continue"
-        data: Dict[str, Any] = {"tools": json.dumps([tool.to_dict() for tool in tools]), "stream": "true"}
+        data: Dict[str, Any] = {"stream": "true"}
+        if tools is not None:
+            data["tools"] = json.dumps([tool.to_dict() if isinstance(tool, ToolExecution) else tool for tool in tools])
+        if requirements is not None:
+            data["requirements"] = json.dumps(
+                [
+                    requirement.to_dict() if isinstance(requirement, RunRequirement) else requirement
+                    for requirement in requirements
+                ]
+            )
         if session_id is not None:
             data["session_id"] = session_id
         if user_id is not None:
@@ -741,6 +764,83 @@ class AgentOSClient:
 
         raw_stream = self._astream_post_form_data(endpoint, data, headers=headers)
         async for event in self._parse_sse_events(raw_stream, run_output_event_from_dict):
+            yield event
+
+    async def continue_team_run(
+        self,
+        team_id: str,
+        run_id: str,
+        requirements: Optional[List[Union[RunRequirement, Dict[str, Any]]]] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        *,
+        tools: Optional[List[Union[ToolExecution, Dict[str, Any]]]] = None,
+        **kwargs: Any,
+    ) -> TeamRunOutput:
+        """Continue a paused team run with requirement resolution data."""
+        endpoint = f"/teams/{team_id}/runs/{run_id}/continue"
+        data: Dict[str, Any] = {"stream": "false"}
+        if tools is not None:
+            data["tools"] = json.dumps([tool.to_dict() if isinstance(tool, ToolExecution) else tool for tool in tools])
+        if requirements is not None:
+            data["requirements"] = json.dumps(
+                [
+                    requirement.to_dict() if isinstance(requirement, RunRequirement) else requirement
+                    for requirement in requirements
+                ]
+            )
+        if session_id is not None:
+            data["session_id"] = session_id
+        if user_id is not None:
+            data["user_id"] = user_id
+
+        for key, value in kwargs.items():
+            if isinstance(value, dict):
+                data[key] = json.dumps(value)
+            else:
+                data[key] = value
+
+        response_data = await self._apost(endpoint, data, headers=headers, as_form=True)
+        return TeamRunOutput.from_dict(response_data)
+
+    async def continue_team_run_stream(
+        self,
+        team_id: str,
+        run_id: str,
+        requirements: Optional[List[Union[RunRequirement, Dict[str, Any]]]] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        *,
+        tools: Optional[List[Union[ToolExecution, Dict[str, Any]]]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[TeamRunOutputEvent]:
+        """Stream a continued paused team run."""
+        endpoint = f"/teams/{team_id}/runs/{run_id}/continue"
+        data: Dict[str, Any] = {"stream": "true"}
+        if tools is not None:
+            data["tools"] = json.dumps([tool.to_dict() if isinstance(tool, ToolExecution) else tool for tool in tools])
+        if requirements is not None:
+            data["requirements"] = json.dumps(
+                [
+                    requirement.to_dict() if isinstance(requirement, RunRequirement) else requirement
+                    for requirement in requirements
+                ]
+            )
+        if session_id is not None:
+            data["session_id"] = session_id
+        if user_id is not None:
+            data["user_id"] = user_id
+
+        for key, value in kwargs.items():
+            if isinstance(value, dict):
+                data[key] = json.dumps(value)
+            else:
+                data[key] = value
+
+        raw_stream = self._astream_post_form_data(endpoint, data, headers=headers)
+        async for event in self._parse_sse_events(raw_stream, team_run_output_event_from_dict):
             yield event
 
     async def cancel_agent_run(self, agent_id: str, run_id: str, headers: Optional[Dict[str, str]] = None) -> None:
@@ -942,115 +1042,6 @@ class AgentOSClient:
             HTTPStatusError: On HTTP errors
         """
         await self._apost(f"/teams/{team_id}/runs/{run_id}/cancel", headers=headers)
-
-    async def continue_team_run(
-        self,
-        team_id: str,
-        run_id: str,
-        requirements: List[Any],
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-        **kwargs: Any,
-    ) -> TeamRunOutput:
-        """Continue a paused team run with requirements.
-
-        Args:
-            team_id: ID of the team
-            run_id: ID of the run to continue
-            requirements: List of RunRequirement objects with tool results
-            session_id: Optional session ID
-            user_id: Optional user ID
-            headers: HTTP headers to include in the request (optional)
-
-        Returns:
-            TeamRunOutput: The continued run response
-
-        Raises:
-            HTTPStatusError: On HTTP errors
-        """
-        from agno.run.requirement import RunRequirement
-
-        endpoint = f"/teams/{team_id}/runs/{run_id}/continue"
-        # Serialize requirements - handle both RunRequirement objects and dicts
-        serialized_requirements = []
-        for req in requirements:
-            if isinstance(req, RunRequirement):
-                serialized_requirements.append(req.to_dict())
-            elif hasattr(req, "to_dict"):
-                serialized_requirements.append(req.to_dict())
-            else:
-                serialized_requirements.append(req)
-
-        data: Dict[str, Any] = {"requirements": json.dumps(serialized_requirements), "stream": "false"}
-        if session_id is not None:
-            data["session_id"] = session_id
-        if user_id is not None:
-            data["user_id"] = user_id
-
-        for key, value in kwargs.items():
-            if isinstance(value, dict):
-                data[key] = json.dumps(value)
-            else:
-                data[key] = value
-
-        response_data = await self._apost(endpoint, data, headers=headers, as_form=True)
-        return TeamRunOutput.from_dict(response_data)
-
-    async def continue_team_run_stream(
-        self,
-        team_id: str,
-        run_id: str,
-        requirements: List[Any],
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[TeamRunOutputEvent]:
-        """Stream a continued team run response.
-
-        Args:
-            team_id: ID of the team
-            run_id: ID of the run to continue
-            requirements: List of RunRequirement objects with tool results
-            session_id: Optional session ID
-            user_id: Optional user ID
-            headers: HTTP headers to include in the request (optional)
-
-        Yields:
-            TeamRunOutputEvent: Typed event objects (team and agent events)
-
-        Raises:
-            HTTPStatusError: On HTTP errors
-        """
-        from agno.run.requirement import RunRequirement
-
-        endpoint = f"/teams/{team_id}/runs/{run_id}/continue"
-        # Serialize requirements - handle both RunRequirement objects and dicts
-        serialized_requirements = []
-        for req in requirements:
-            if isinstance(req, RunRequirement):
-                serialized_requirements.append(req.to_dict())
-            elif hasattr(req, "to_dict"):
-                serialized_requirements.append(req.to_dict())
-            else:
-                serialized_requirements.append(req)
-
-        data: Dict[str, Any] = {"requirements": json.dumps(serialized_requirements), "stream": "true"}
-        if session_id is not None:
-            data["session_id"] = session_id
-        if user_id is not None:
-            data["user_id"] = user_id
-
-        for key, value in kwargs.items():
-            if isinstance(value, dict):
-                data[key] = json.dumps(value)
-            else:
-                data[key] = value
-
-        raw_stream = self._astream_post_form_data(endpoint, data, headers=headers)
-        async for event in self._parse_sse_events(raw_stream, team_run_output_event_from_dict):
-            yield event
 
     async def list_workflows(self, headers: Optional[Dict[str, str]] = None) -> List[WorkflowSummaryResponse]:
         """List all workflows configured in the AgentOS instance.
