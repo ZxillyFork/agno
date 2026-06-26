@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterator, List, Optional, Type, Union
 import httpx
 from pydantic import BaseModel
 
-from agno.exceptions import ModelProviderError
+from agno.exceptions import ModelProviderError, _describe_exception
 from agno.metrics import MessageMetrics
 from agno.models.base import Model
 from agno.models.message import Message
@@ -291,8 +291,9 @@ class Llama(Model):
             assistant_message.metrics.stop_timer()
 
         except Exception as e:
-            log_error(f"Error from Llama API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from Llama API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke_stream(
         self,
@@ -324,8 +325,9 @@ class Llama(Model):
             assistant_message.metrics.stop_timer()
 
         except Exception as e:
-            log_error(f"Error from Llama API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from Llama API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def parse_tool_calls(self, tool_calls_data: List[EventDeltaToolCallDeltaFunction]) -> List[Dict[str, Any]]:
         """
@@ -459,7 +461,22 @@ class Llama(Model):
 
             # Add tool calls
             if isinstance(delta.delta, EventDeltaToolCallDelta):
-                model_response.tool_calls = delta.delta  # type: ignore
+                tool_call_delta = delta.delta
+                function_delta = getattr(tool_call_delta, "function", None)
+                model_response.tool_calls = [
+                    {
+                        "id": getattr(tool_call_delta, "id", None) or getattr(tool_call_delta, "call_id", None),
+                        "call_id": getattr(tool_call_delta, "call_id", None),
+                        "index": getattr(tool_call_delta, "index", None),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(function_delta, "name", None) if function_delta is not None else None,
+                            "arguments": getattr(function_delta, "arguments", None)
+                            if function_delta is not None
+                            else None,
+                        },
+                    }
+                ]
 
         return model_response
 

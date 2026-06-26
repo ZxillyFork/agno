@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterator, List, Optional, Type, Union
 import httpx
 from pydantic import BaseModel
 
-from agno.exceptions import ModelProviderError
+from agno.exceptions import ModelProviderError, _describe_exception
 from agno.metrics import MessageMetrics
 from agno.models.base import Model
 from agno.models.message import Message
@@ -234,8 +234,9 @@ class AzureAIFoundry(Model):
                 model_id=self.id,
             ) from e
         except Exception as e:
-            log_error(f"Error from Azure AI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from Azure AI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke(
         self,
@@ -272,8 +273,9 @@ class AzureAIFoundry(Model):
                 model_id=self.id,
             ) from e
         except Exception as e:
-            log_error(f"Error from Azure AI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from Azure AI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def invoke_stream(
         self,
@@ -309,8 +311,9 @@ class AzureAIFoundry(Model):
                 model_id=self.id,
             ) from e
         except Exception as e:
-            log_error(f"Error from Azure AI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from Azure AI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke_stream(
         self,
@@ -347,8 +350,9 @@ class AzureAIFoundry(Model):
                 model_id=self.id,
             ) from e
         except Exception as e:
-            log_error(f"Error from Azure AI API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error from Azure AI API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def _parse_provider_response(self, response: ChatCompletions, **kwargs) -> ModelResponse:
         """
@@ -393,8 +397,9 @@ class AzureAIFoundry(Model):
                 model_response.response_usage = self._get_metrics(response.usage)
 
         except Exception as e:
-            log_error(f"Error parsing Azure AI response: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error parsing Azure AI response: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
         return model_response
 
@@ -460,8 +465,9 @@ class AzureAIFoundry(Model):
                 model_response.response_usage = self._get_metrics(response_delta.usage)
 
         except Exception as e:
-            log_error(f"Error parsing Azure AI response delta: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error parsing Azure AI response delta: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
         return model_response
 

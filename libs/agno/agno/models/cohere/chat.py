@@ -5,7 +5,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Ty
 import httpx
 from pydantic import BaseModel
 
-from agno.exceptions import ModelProviderError
+from agno.exceptions import ModelProviderError, _describe_exception
 from agno.metrics import MessageMetrics
 from agno.models.base import Model
 from agno.models.message import Message
@@ -226,8 +226,9 @@ class Cohere(Model):
             return model_response
 
         except Exception as e:
-            log_error(f"Unexpected error calling Cohere API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Unexpected error calling Cohere API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def invoke_stream(
         self,
@@ -260,8 +261,9 @@ class Cohere(Model):
             assistant_message.metrics.stop_timer()
 
         except Exception as e:
-            log_error(f"Unexpected error calling Cohere API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Unexpected error calling Cohere API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke(
         self,
@@ -292,8 +294,9 @@ class Cohere(Model):
             return model_response
 
         except Exception as e:
-            log_error(f"Unexpected error calling Cohere API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Unexpected error calling Cohere API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke_stream(
         self,
@@ -326,8 +329,9 @@ class Cohere(Model):
             assistant_message.metrics.stop_timer()
 
         except Exception as e:
-            log_error(f"Unexpected error calling Cohere API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Unexpected error calling Cohere API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def _parse_provider_response(self, response: V2ChatResponse, **kwargs) -> ModelResponse:
         """

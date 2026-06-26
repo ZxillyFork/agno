@@ -4,7 +4,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Type, Uni
 
 from pydantic import BaseModel
 
-from agno.exceptions import ModelProviderError
+from agno.exceptions import ModelProviderError, _describe_exception
 from agno.metrics import MessageMetrics
 from agno.models.base import Model
 from agno.models.message import Message
@@ -193,8 +193,9 @@ class WatsonX(Model):
             return model_response
 
         except Exception as e:
-            log_error(f"Error calling WatsonX API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error calling WatsonX API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke(
         self,
@@ -230,8 +231,9 @@ class WatsonX(Model):
             return model_response
 
         except Exception as e:
-            log_error(f"Error calling WatsonX API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error calling WatsonX API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     def invoke_stream(
         self,
@@ -266,8 +268,9 @@ class WatsonX(Model):
             assistant_message.metrics.stop_timer()
 
         except Exception as e:
-            log_error(f"Error calling WatsonX API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error calling WatsonX API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke_stream(
         self,
@@ -304,8 +307,9 @@ class WatsonX(Model):
             assistant_message.metrics.stop_timer()
 
         except Exception as e:
-            log_error(f"Error in async streaming from WatsonX API: {str(e)}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_msg = _describe_exception(e)
+            log_error(f"Error in async streaming from WatsonX API: {error_msg}")
+            raise ModelProviderError(message=error_msg, model_name=self.name, model_id=self.id) from e
 
     # Override base method
     @staticmethod

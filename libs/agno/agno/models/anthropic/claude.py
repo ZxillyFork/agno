@@ -11,7 +11,7 @@ from agno.exceptions import ModelProviderError, ModelRateLimitError
 from agno.metrics import MessageMetrics
 from agno.models.base import Model
 from agno.models.message import Citations, DocumentCitation, Message, UrlCitation
-from agno.models.response import ModelResponse
+from agno.models.response import ModelResponse, ModelResponseEvent
 from agno.run.agent import RunOutput
 from agno.tools.function import Function
 from agno.utils.log import log_debug, log_error, log_warning
@@ -810,6 +810,7 @@ class Claude(Model):
         request_kwargs = self._prepare_request_kwargs(
             system_message, tools=tools, response_format=response_format, messages=messages
         )
+        stream_tool_use_map: Dict[int, Dict[str, str]] = {}
 
         try:
             # Beta features
@@ -821,7 +822,11 @@ class Claude(Model):
                     **request_kwargs,
                 ) as stream:
                     for chunk in stream:
-                        yield self._parse_provider_response_delta(chunk, response_format=response_format)  # type: ignore
+                        yield self._parse_provider_response_delta(
+                            chunk,
+                            response_format=response_format,
+                            stream_tool_use_map=stream_tool_use_map,
+                        )  # type: ignore
             else:
                 assistant_message.metrics.start_timer()
                 with self.get_client().messages.stream(
@@ -830,7 +835,11 @@ class Claude(Model):
                     **request_kwargs,
                 ) as stream:
                     for chunk in stream:  # type: ignore
-                        yield self._parse_provider_response_delta(chunk, response_format=response_format)  # type: ignore
+                        yield self._parse_provider_response_delta(
+                            chunk,
+                            response_format=response_format,
+                            stream_tool_use_map=stream_tool_use_map,
+                        )  # type: ignore
 
             assistant_message.metrics.stop_timer()
 
@@ -920,6 +929,7 @@ class Claude(Model):
             request_kwargs = self._prepare_request_kwargs(
                 system_message, tools=tools, response_format=response_format, messages=messages
             )
+            stream_tool_use_map: Dict[int, Dict[str, str]] = {}
 
             if self._has_beta_features(response_format=response_format, tools=tools):
                 assistant_message.metrics.start_timer()
@@ -929,7 +939,11 @@ class Claude(Model):
                     **request_kwargs,
                 ) as stream:
                     async for chunk in stream:
-                        yield self._parse_provider_response_delta(chunk, response_format=response_format)  # type: ignore
+                        yield self._parse_provider_response_delta(
+                            chunk,
+                            response_format=response_format,
+                            stream_tool_use_map=stream_tool_use_map,
+                        )  # type: ignore
             else:
                 assistant_message.metrics.start_timer()
                 async with self.get_async_client().messages.stream(
@@ -938,7 +952,11 @@ class Claude(Model):
                     **request_kwargs,
                 ) as stream:
                     async for chunk in stream:  # type: ignore
-                        yield self._parse_provider_response_delta(chunk, response_format=response_format)  # type: ignore
+                        yield self._parse_provider_response_delta(
+                            chunk,
+                            response_format=response_format,
+                            stream_tool_use_map=stream_tool_use_map,
+                        )  # type: ignore
 
             assistant_message.metrics.stop_timer()
 
@@ -1107,6 +1125,7 @@ class Claude(Model):
             ParsedBetaMessageStopEvent,
         ],
         response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
+        **kwargs,
     ) -> ModelResponse:
         """
         Parse the Claude streaming response into ModelProviderResponse objects.
@@ -1119,6 +1138,7 @@ class Claude(Model):
             ModelResponse: Iterator of parsed response data
         """
         model_response = ModelResponse()
+        stream_tool_use_map: Optional[Dict[int, Dict[str, str]]] = kwargs.get("stream_tool_use_map")
 
         if isinstance(response, (ContentBlockStartEvent, BetaRawContentBlockStartEvent)):
             # The Anthropic SDK emits "redacted_thinking" for these blocks; accept the legacy
@@ -1126,6 +1146,14 @@ class Claude(Model):
             block_type = getattr(response.content_block, "type", None)
             if block_type in ("redacted_thinking", "redacted_reasoning_content"):
                 model_response.redacted_reasoning_content = getattr(response.content_block, "data", None)
+            if block_type == "tool_use":
+                # Cache id/name for this tool_use block so subsequent input_json_delta
+                # chunks can pair their partial JSON with the right tool_call_id.
+                tool_index = getattr(response, "index", None)
+                tool_use = response.content_block  # type: ignore
+                if tool_index is not None and hasattr(tool_use, "id") and hasattr(tool_use, "name"):
+                    if stream_tool_use_map is not None:
+                        stream_tool_use_map[tool_index] = {"id": tool_use.id, "name": tool_use.name}  # type: ignore
 
         if isinstance(response, (ContentBlockDeltaEvent, BetaRawContentBlockDeltaEvent)):
             # Handle text content
@@ -1138,6 +1166,22 @@ class Claude(Model):
                 model_response.provider_data = {
                     "signature": response.delta.signature,
                 }
+            elif response.delta.type == "input_json_delta":
+                tool_index = getattr(response, "index", None)
+                tool_info = None
+                if stream_tool_use_map is not None:
+                    tool_info = stream_tool_use_map.get(tool_index) if tool_index is not None else None
+
+                partial_json = getattr(response.delta, "partial_json", None)
+                if partial_json is None:
+                    partial_json = getattr(response.delta, "input_json", None)
+
+                if partial_json is not None:
+                    model_response.event = ModelResponseEvent.tool_call_args_delta.value
+                    model_response.tool_call_id = tool_info.get("id") if tool_info else None
+                    model_response.tool_name = tool_info.get("name") if tool_info else None
+                    model_response.tool_args_delta = partial_json
+                    return model_response
 
         elif isinstance(response, (ContentBlockStopEvent, ParsedBetaContentBlockStopEvent)):
             if response.content_block.type == "tool_use":  # type: ignore
@@ -1148,8 +1192,6 @@ class Claude(Model):
                 function_def = {"name": tool_name}
                 if tool_input:
                     function_def["arguments"] = json.dumps(tool_input)
-
-                model_response.extra = model_response.extra or {}
 
                 model_response.tool_calls = [
                     {

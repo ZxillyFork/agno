@@ -39,9 +39,11 @@ from agno.run.agent import (
     RunStartedEvent,
     SessionSummaryCompletedEvent,
     SessionSummaryStartedEvent,
+    ToolCallArgsDeltaEvent,
     ToolCallCompletedEvent,
     ToolCallErrorEvent,
     ToolCallStartedEvent,
+    ToolCallStartEvent,
 )
 from agno.run.requirement import RunRequirement
 from agno.run.team import CompressionCompletedEvent as TeamCompressionCompletedEvent
@@ -81,9 +83,11 @@ from agno.run.team import TaskIterationStartedEvent as TeamTaskIterationStartedE
 from agno.run.team import TaskStateUpdatedEvent as TeamTaskStateUpdatedEvent
 from agno.run.team import TaskUpdatedEvent as TeamTaskUpdatedEvent
 from agno.run.team import TeamRunEvent, TeamRunInput, TeamRunOutput, TeamRunOutputEvent
+from agno.run.team import ToolCallArgsDeltaEvent as TeamToolCallArgsDeltaEvent
 from agno.run.team import ToolCallCompletedEvent as TeamToolCallCompletedEvent
 from agno.run.team import ToolCallErrorEvent as TeamToolCallErrorEvent
 from agno.run.team import ToolCallStartedEvent as TeamToolCallStartedEvent
+from agno.run.team import ToolCallStartEvent as TeamToolCallStartEvent
 from agno.session.summary import SessionSummary
 
 
@@ -240,7 +244,9 @@ def create_run_error_event(
     )
 
 
-def create_team_run_cancelled_event(from_run_response: TeamRunOutput, reason: str) -> TeamRunCancelledEvent:
+def create_team_run_cancelled_event(
+    from_run_response: TeamRunOutput, reason: Optional[str] = None
+) -> TeamRunCancelledEvent:
     return TeamRunCancelledEvent(
         session_id=from_run_response.session_id,
         team_id=from_run_response.team_id,  # type: ignore
@@ -276,7 +282,7 @@ def create_team_run_continued_event(from_run_response: TeamRunOutput) -> TeamRun
     )
 
 
-def create_run_cancelled_event(from_run_response: RunOutput, reason: str) -> RunCancelledEvent:
+def create_run_cancelled_event(from_run_response: RunOutput, reason: Optional[str] = None) -> RunCancelledEvent:
     return RunCancelledEvent(
         session_id=from_run_response.session_id,
         agent_id=from_run_response.agent_id,  # type: ignore
@@ -579,6 +585,36 @@ def create_team_reasoning_completed_event(
     )
 
 
+def create_tool_call_start_event(
+    from_run_response: RunOutput,
+    tool_call_id: Optional[str],
+    tool_name: Optional[str],
+) -> ToolCallStartEvent:
+    return ToolCallStartEvent(
+        session_id=from_run_response.session_id,
+        agent_id=from_run_response.agent_id,  # type: ignore
+        agent_name=from_run_response.agent_name,  # type: ignore
+        run_id=from_run_response.run_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+    )
+
+
+def create_team_tool_call_start_event(
+    from_run_response: TeamRunOutput,
+    tool_call_id: Optional[str],
+    tool_name: Optional[str],
+) -> TeamToolCallStartEvent:
+    return TeamToolCallStartEvent(
+        session_id=from_run_response.session_id,
+        team_id=from_run_response.team_id,  # type: ignore
+        team_name=from_run_response.team_name,  # type: ignore
+        run_id=from_run_response.run_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+    )
+
+
 def create_tool_call_started_event(from_run_response: RunOutput, tool: ToolExecution) -> ToolCallStartedEvent:
     return ToolCallStartedEvent(
         session_id=from_run_response.session_id,
@@ -586,6 +622,23 @@ def create_tool_call_started_event(from_run_response: RunOutput, tool: ToolExecu
         agent_name=from_run_response.agent_name,  # type: ignore
         run_id=from_run_response.run_id,
         tool=tool,
+    )
+
+
+def create_tool_call_args_delta_event(
+    from_run_response: RunOutput,
+    tool_call_id: Optional[str],
+    tool_name: Optional[str],
+    delta: Optional[str],
+) -> ToolCallArgsDeltaEvent:
+    return ToolCallArgsDeltaEvent(
+        session_id=from_run_response.session_id,
+        agent_id=from_run_response.agent_id,  # type: ignore
+        agent_name=from_run_response.agent_name,  # type: ignore
+        run_id=from_run_response.run_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        delta=delta,
     )
 
 
@@ -598,6 +651,23 @@ def create_team_tool_call_started_event(
         team_name=from_run_response.team_name,  # type: ignore
         run_id=from_run_response.run_id,
         tool=tool,
+    )
+
+
+def create_team_tool_call_args_delta_event(
+    from_run_response: TeamRunOutput,
+    tool_call_id: Optional[str],
+    tool_name: Optional[str],
+    delta: Optional[str],
+) -> TeamToolCallArgsDeltaEvent:
+    return TeamToolCallArgsDeltaEvent(
+        session_id=from_run_response.session_id,
+        team_id=from_run_response.team_id,  # type: ignore
+        team_name=from_run_response.team_name,  # type: ignore
+        run_id=from_run_response.run_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        delta=delta,
     )
 
 
