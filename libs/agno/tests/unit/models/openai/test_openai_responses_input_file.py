@@ -124,6 +124,8 @@ def test_format_file_id():
 
 def test_format_file_mime_type_guessed_from_filepath():
     """MIME type should be guessed from filepath when not explicitly set."""
+    import mimetypes
+
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
         f.write("a,b,c")
         tmp_path = f.name
@@ -132,8 +134,13 @@ def test_format_file_mime_type_guessed_from_filepath():
         file = File(filepath=tmp_path)
         result = OpenAIResponses._format_file_for_input(file)
 
+        # mimetypes.guess_type is platform-dependent (Windows reads from the registry
+        # which sometimes maps .csv to application/vnd.ms-excel); compare against the
+        # system's actual guess instead of hardcoding "text/csv".
+        expected_mime, _ = mimetypes.guess_type(tmp_path)
         assert result is not None
-        assert "text/csv" in result["file_data"]
+        assert expected_mime is not None
+        assert f"data:{expected_mime};base64," in result["file_data"]
     finally:
         Path(tmp_path).unlink()
 
