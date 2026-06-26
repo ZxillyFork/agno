@@ -6,6 +6,7 @@ from collections import deque
 from typing import (
     TYPE_CHECKING,
     AsyncIterator,
+    Any,
     Callable,
     Dict,
     Iterator,
@@ -25,9 +26,10 @@ from agno.models.response import ModelResponse, ModelResponseEvent, ToolExecutio
 from agno.run import RunContext
 from agno.run.agent import RunOutput, RunOutputEvent
 from agno.run.messages import RunMessages
+from agno.run.requirement import RunRequirement
 from agno.session import AgentSession
 from agno.tools import Toolkit
-from agno.tools.function import Function
+from agno.tools.function import Function, FunctionCall
 from agno.utils.agent import (
     collect_joint_audios,
     collect_joint_files,
@@ -74,6 +76,13 @@ def raise_if_async_tools(agent: Agent) -> None:
                     f"Async function {tool.__name__} can't be used with synchronous agent.run() or agent.print_response(). "
                     "Use agent.arun() or agent.aprint_response() instead to use this tool."
                 )
+        else:
+            is_async_searcher = getattr(tool, "is_async_searcher", None)
+            if getattr(tool, "type", None) == "tool_search" and callable(is_async_searcher) and is_async_searcher():
+                raise Exception(
+                    "Async ToolSearch searcher can't be used with synchronous agent.run() or "
+                    "agent.print_response(). Use agent.arun() or agent.aprint_response() instead."
+                )
 
 
 def _raise_if_async_tools_in_list(tools: list) -> None:
@@ -100,6 +109,17 @@ def _raise_if_async_tools_in_list(tools: list) -> None:
                     f"Async function {tool.__name__} can't be used with synchronous agent.run() or agent.print_response(). "
                     "Use agent.arun() or agent.aprint_response() instead to use this tool."
                 )
+        else:
+            is_async_searcher = getattr(tool, "is_async_searcher", None)
+            if getattr(tool, "type", None) == "tool_search" and callable(is_async_searcher) and is_async_searcher():
+                raise Exception(
+                    "Async ToolSearch searcher can't be used with synchronous agent.run() or "
+                    "agent.print_response(). Use agent.arun() or agent.aprint_response() instead."
+                )
+
+
+def _is_provider_tool_config(tool: Any) -> bool:
+    return getattr(tool, "type", None) in {"namespace", "tool_search"} and hasattr(tool, "to_dict")
 
 
 def get_tools(
@@ -343,9 +363,9 @@ def parse_tools(
     model: Model,
     run_context: Optional[RunContext] = None,
     async_mode: bool = False,
-) -> List[Union[Function, dict]]:
+) -> List[Union[Function, dict, Any]]:
     _function_names: List[str] = []
-    _functions: List[Union[Function, dict]] = []
+    _functions: List[Union[Function, dict, Any]] = []
     agent._tool_instructions = []
 
     # Get output_schema from run_context
@@ -361,8 +381,69 @@ def parse_tools(
     ):
         strict = True
 
+    def _prepare_function_for_model(_func: Function, seen_names: Optional[List[str]] = None) -> Optional[Function]:
+        # Namespace tools pass their own name scope so a namespaced function does not collide
+        # with (and silently drop) an identically named top-level tool.
+        names = seen_names if seen_names is not None else _function_names
+        if _func.name in names:
+            log_warning(f"Duplicate tool name '{_func.name}' already registered on agent; skipping the duplicate.")
+            return None
+        names.append(_func.name)
+
+        _func = _func.model_copy(deep=True)
+        effective_strict = strict if _func.strict is None else _func.strict
+        _func.process_entrypoint(strict=effective_strict)
+
+        _func._agent = agent
+        if agent._team is not None:
+            _func._team = agent._team
+        if strict and _func.strict is None:
+            _func.strict = True
+        if agent.tool_hooks is not None:
+            _func.tool_hooks = agent.tool_hooks
+
+        if _func.add_instructions and _func.instructions is not None:
+            if agent._tool_instructions is None:
+                agent._tool_instructions = []
+            agent._tool_instructions.append(_func.instructions)
+
+        return _func
+
     for tool in tools:
-        if isinstance(tool, Dict):
+        if _is_provider_tool_config(tool):
+            if getattr(tool, "type", None) == "namespace":
+                namespace_tools: List[Union[Function, Dict, Any]] = []
+                # Names are scoped to this namespace, independent of top-level and other namespaces.
+                namespace_names: List[str] = []
+                for namespace_tool in getattr(tool, "tools", []):
+                    # A bare callable inside a namespace is converted to a Function, mirroring the
+                    # top-level callable handling, so it is not passed through unprepared (which
+                    # would later crash at provider formatting).
+                    if not isinstance(namespace_tool, (Function, dict)) and callable(namespace_tool):
+                        try:
+                            namespace_tool = Function.from_callable(namespace_tool, strict=strict)
+                        except Exception as e:
+                            log_warning(f"Could not add tool {namespace_tool} from namespace: {str(e)}")
+                            continue
+                    if isinstance(namespace_tool, Function):
+                        prepared_function = _prepare_function_for_model(namespace_tool, seen_names=namespace_names)
+                        if prepared_function is not None:
+                            namespace_tools.append(prepared_function)
+                            log_debug(f"Added tool {prepared_function.name} from namespace {getattr(tool, 'name', '')}")
+                    else:
+                        namespace_tools.append(namespace_tool)
+
+                if hasattr(tool, "with_tools"):
+                    _functions.append(tool.with_tools(namespace_tools))
+                else:
+                    setattr(tool, "tools", namespace_tools)
+                    _functions.append(tool)
+                log_debug(f"Included provider namespace tool {getattr(tool, 'name', '')}")
+            else:
+                _functions.append(tool)
+                log_debug(f"Included provider tool {tool}")
+
+        elif isinstance(tool, Dict):
             # If a dict is passed, it is a builtin tool
             # that is run by the model provider and not the Agent
             _functions.append(tool)
@@ -402,29 +483,11 @@ def parse_tools(
                 agent._tool_instructions.append(tool.instructions)
 
         elif isinstance(tool, Function):
-            if tool.name in _function_names:
-                log_warning(f"Duplicate tool name '{tool.name}' already registered on agent; skipping the duplicate.")
+            prepared_function = _prepare_function_for_model(tool)
+            if prepared_function is None:
                 continue
-            _function_names.append(tool.name)
-
-            tool = tool.model_copy(deep=True)
-            # Respect the function's explicit strict setting if set
-            effective_strict = strict if tool.strict is None else tool.strict
-            tool.process_entrypoint(strict=effective_strict)
-
-            tool._agent = agent
-            if agent._team is not None:
-                tool._team = agent._team
-            if strict and tool.strict is None:
-                tool.strict = True
-            if agent.tool_hooks is not None:
-                tool.tool_hooks = agent.tool_hooks
-            _functions.append(tool)
-            log_debug(f"Added tool {tool.name}")
-
-            # Add instructions from the Function
-            if tool.add_instructions and tool.instructions is not None:
-                agent._tool_instructions.append(tool.instructions)
+            _functions.append(prepared_function)
+            log_debug(f"Added tool {prepared_function.name}")
 
         elif callable(tool):
             try:
@@ -478,8 +541,8 @@ def determine_tools_for_model(
     run_context: RunContext,
     session: AgentSession,
     async_mode: bool = False,
-) -> List[Union[Function, dict]]:
-    _functions: List[Union[Function, dict]] = []
+) -> List[Union[Function, dict, Any]]:
+    _functions: List[Union[Function, dict, Any]] = []
 
     # Get Agent tools
     if processed_tools is not None and len(processed_tools) > 0:
@@ -492,11 +555,13 @@ def determine_tools_for_model(
     if _functions:
         from inspect import signature
 
+        function_map = model._get_functions_from_tools(_functions)
+
         # Check if any functions need media before collecting
         needs_media = any(
             any(param in signature(func.entrypoint).parameters for param in ["images", "videos", "audios", "files"])
-            for func in _functions
-            if isinstance(func, Function) and func.entrypoint is not None
+            for func in function_map.values()
+            if func.entrypoint is not None
         )
 
         # Only collect media if functions actually need them
@@ -505,13 +570,12 @@ def determine_tools_for_model(
         joint_audios = collect_joint_audios(run_response.input, session) if needs_media else None
         joint_videos = collect_joint_videos(run_response.input, session) if needs_media else None
 
-        for func in _functions:  # type: ignore
-            if isinstance(func, Function):
-                func._run_context = run_context
-                func._images = joint_images
-                func._files = joint_files
-                func._audios = joint_audios
-                func._videos = joint_videos
+        for func in function_map.values():
+            func._run_context = run_context
+            func._images = joint_images
+            func._files = joint_files
+            func._audios = joint_audios
+            func._videos = joint_videos
 
     return _functions
 
@@ -522,9 +586,19 @@ def determine_tools_for_model(
 
 
 def handle_external_execution_update(agent: Agent, run_messages: RunMessages, tool: ToolExecution):
+    import json
+
     agent.model = cast(Model, agent.model)
 
-    if tool.result is not None:
+    result_provided = tool.result is not None or bool(tool.external_execution_result_provided)
+    if result_provided:
+        if tool.result is None:
+            content = "null"
+        elif isinstance(tool.result, str):
+            content = tool.result
+        else:
+            content = json.dumps(tool.result, default=str)
+
         for msg in run_messages.messages:
             # Skip if the message is already in the run_messages
             if msg.tool_call_id == tool.tool_call_id:
@@ -533,7 +607,7 @@ def handle_external_execution_update(agent: Agent, run_messages: RunMessages, to
             run_messages.messages.append(
                 Message(
                     role=agent.model.tool_message_role,
-                    content=tool.result,
+                    content=content,
                     tool_call_id=tool.tool_call_id,
                     tool_name=tool.tool_name,
                     tool_args=tool.tool_args,
@@ -542,6 +616,7 @@ def handle_external_execution_update(agent: Agent, run_messages: RunMessages, to
                 )
             )
         tool.external_execution_required = False
+        tool.external_execution_result_provided = True
     else:
         raise ValueError(f"Tool {tool.tool_name} requires external execution, cannot continue run")
 
@@ -632,6 +707,93 @@ async def _amaybe_create_audit_approval(
         )
 
 
+def _set_tool_call_resume_context(function_call: FunctionCall, tool: ToolExecution):
+    """Set per-tool resume metadata on the shared RunContext while a tool runs."""
+
+    run_context = function_call.function._run_context
+    if run_context is None:
+        return None
+
+    previous_state = (run_context.tool_call_approved, run_context.tool_call_metadata)
+    run_context.tool_call_approved = bool(tool.confirmed)
+    run_context.tool_call_metadata = tool.resume_metadata
+    return previous_state
+
+
+def _restore_tool_call_resume_context(function_call: FunctionCall, previous_state):
+    if previous_state is None:
+        return
+
+    run_context = function_call.function._run_context
+    if run_context is None:
+        return
+
+    run_context.tool_call_approved, run_context.tool_call_metadata = previous_state
+
+
+def _tool_user_input_ready(tool: ToolExecution) -> bool:
+    if tool.answered is True:
+        return True
+    if tool.user_input_schema:
+        return all(field.value is not None for field in tool.user_input_schema)
+    return False
+
+
+def _tool_user_feedback_ready(tool: ToolExecution) -> bool:
+    if tool.answered is True:
+        return True
+    if tool.user_feedback_schema:
+        return all(question.selected_options is not None for question in tool.user_feedback_schema)
+    return False
+
+
+def _record_resumed_tool_pause(
+    run_response: Any,
+    original_tool: ToolExecution,
+    paused_tool: ToolExecution,
+) -> None:
+    """Record a new pause raised while a previously paused tool is being resumed."""
+
+    if getattr(run_response, "tools", None) is None:
+        run_response.tools = []
+
+    replaced = False
+    for index, existing_tool in enumerate(run_response.tools or []):
+        if existing_tool is original_tool:
+            run_response.tools[index] = paused_tool
+            replaced = True
+            break
+
+    if not replaced:
+        for index, existing_tool in enumerate(run_response.tools or []):
+            if existing_tool.tool_call_id == original_tool.tool_call_id:
+                run_response.tools[index] = paused_tool
+                replaced = True
+                break
+
+    if not replaced:
+        run_response.tools.append(paused_tool)
+
+    if getattr(run_response, "requirements", None) is None:
+        run_response.requirements = []
+    run_response.requirements.append(RunRequirement(tool_execution=paused_tool))
+
+
+def _is_rejected_paused_tool(tool: ToolExecution) -> bool:
+    return bool(
+        tool.confirmed is False
+        and (tool.requires_confirmation or tool.requires_user_input or tool.external_execution_required)
+    )
+
+
+def _mark_rejected_tool_resolved(tool: ToolExecution) -> None:
+    tool.confirmation_note = tool.confirmation_note or "Tool call was rejected"
+    tool.tool_call_error = True
+    tool.requires_confirmation = False
+    tool.requires_user_input = False
+    tool.external_execution_required = False
+
+
 def run_tool(
     agent: Agent,
     run_response: RunOutput,
@@ -655,79 +817,95 @@ def run_tool(
     agent.model = cast(Model, agent.model)
     # Execute the tool
     function_call = agent.model.get_function_call_to_run_from_tool_execution(tool, functions)
+    previous_resume_context = _set_tool_call_resume_context(function_call, tool)
     function_call_results: List[Message] = []
 
-    for call_result in agent.model.run_function_call(
-        function_call=function_call,
-        function_call_results=function_call_results,
-    ):
-        if isinstance(call_result, ModelResponse):
-            if call_result.event == ModelResponseEvent.tool_call_started.value:
-                if stream_events:
-                    if team_mode:
-                        yield handle_event(  # type: ignore
-                            create_team_tool_call_started_event(from_run_response=run_response, tool=tool),  # type: ignore
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    else:
-                        yield handle_event(  # type: ignore
-                            create_tool_call_started_event(from_run_response=run_response, tool=tool),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-
-            if call_result.event == ModelResponseEvent.tool_call_completed.value and call_result.tool_executions:
-                tool_execution = call_result.tool_executions[0]
-                tool.result = tool_execution.result
-                tool.tool_call_error = tool_execution.tool_call_error
-                if stream_events:
-                    if team_mode:
-                        yield handle_event(  # type: ignore
-                            create_team_tool_call_completed_event(
-                                from_run_response=run_response,  # type: ignore[arg-type]
-                                tool=tool,
-                                content=call_result.content,  # type: ignore
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                        if tool.tool_call_error:
+    try:
+        for call_result in agent.model.run_function_call(
+            function_call=function_call,
+            function_call_results=function_call_results,
+        ):
+            if isinstance(call_result, ModelResponse):
+                if call_result.event == ModelResponseEvent.tool_call_started.value:
+                    if stream_events:
+                        if team_mode:
                             yield handle_event(  # type: ignore
-                                create_team_tool_call_error_event(
+                                create_team_tool_call_started_event(from_run_response=run_response, tool=tool),  # type: ignore
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        else:
+                            yield handle_event(  # type: ignore
+                                create_tool_call_started_event(from_run_response=run_response, tool=tool),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+
+                if call_result.event == ModelResponseEvent.tool_call_completed.value and call_result.tool_executions:
+                    tool_execution = call_result.tool_executions[0]
+                    tool.result = tool_execution.result
+                    tool.tool_call_error = tool_execution.tool_call_error
+                    if stream_events:
+                        if team_mode:
+                            yield handle_event(  # type: ignore
+                                create_team_tool_call_completed_event(
                                     from_run_response=run_response,  # type: ignore[arg-type]
                                     tool=tool,
-                                    error=str(tool.result),  # type: ignore
+                                    content=call_result.content,  # type: ignore
                                 ),
                                 run_response,
                                 events_to_skip=agent.events_to_skip,  # type: ignore
                                 store_events=agent.store_events,
                             )
-                    else:
-                        yield handle_event(  # type: ignore
-                            create_tool_call_completed_event(
-                                from_run_response=run_response, tool=tool, content=call_result.content
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                        if tool.tool_call_error:
+                            if tool.tool_call_error:
+                                yield handle_event(  # type: ignore
+                                    create_team_tool_call_error_event(
+                                        from_run_response=run_response,  # type: ignore[arg-type]
+                                        tool=tool,
+                                        error=str(tool.result),  # type: ignore
+                                    ),
+                                    run_response,
+                                    events_to_skip=agent.events_to_skip,  # type: ignore
+                                    store_events=agent.store_events,
+                                )
+                        else:
                             yield handle_event(  # type: ignore
-                                create_tool_call_error_event(
-                                    from_run_response=run_response, tool=tool, error=str(tool.result)
+                                create_tool_call_completed_event(
+                                    from_run_response=run_response, tool=tool, content=call_result.content
                                 ),
                                 run_response,
                                 events_to_skip=agent.events_to_skip,  # type: ignore
                                 store_events=agent.store_events,
                             )
-        # Yield CustomEvent instances from sync tool generators
-        elif isinstance(call_result, CustomEvent):
-            if stream_events:
-                yield call_result  # type: ignore
+                            if tool.tool_call_error:
+                                yield handle_event(  # type: ignore
+                                    create_tool_call_error_event(
+                                        from_run_response=run_response, tool=tool, error=str(tool.result)
+                                    ),
+                                    run_response,
+                                    events_to_skip=agent.events_to_skip,  # type: ignore
+                                    store_events=agent.store_events,
+                                )
+
+                if call_result.event == ModelResponseEvent.tool_call_paused.value and call_result.tool_executions:
+                    _record_resumed_tool_pause(run_response, tool, call_result.tool_executions[-1])
+            # Yield CustomEvent instances from sync tool generators
+            elif isinstance(call_result, CustomEvent):
+                if stream_events:
+                    call_result.agent_id = agent.id or ""
+                    call_result.agent_name = agent.name or ""
+                    call_result.session_id = run_response.session_id or ""
+                    call_result.run_id = run_response.run_id or ""
+                    yield handle_event(
+                        call_result,
+                        run_response,
+                        events_to_skip=agent.events_to_skip,  # type: ignore
+                        store_events=agent.store_events,
+                    )
+    finally:
+        _restore_tool_call_resume_context(function_call, previous_resume_context)
 
     if len(function_call_results) > 0:
         run_messages.messages.extend(function_call_results)
@@ -769,79 +947,96 @@ async def arun_tool(
 
     # Execute the tool
     function_call = agent.model.get_function_call_to_run_from_tool_execution(tool, functions)
+    previous_resume_context = _set_tool_call_resume_context(function_call, tool)
     function_call_results: List[Message] = []
 
-    async for call_result in agent.model.arun_function_calls(
-        function_calls=[function_call],
-        function_call_results=function_call_results,
-        skip_pause_check=True,
-    ):
-        if isinstance(call_result, ModelResponse):
-            if call_result.event == ModelResponseEvent.tool_call_started.value:
-                if stream_events:
-                    if team_mode:
-                        yield handle_event(  # type: ignore
-                            create_team_tool_call_started_event(from_run_response=run_response, tool=tool),  # type: ignore
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    else:
-                        yield handle_event(  # type: ignore
-                            create_tool_call_started_event(from_run_response=run_response, tool=tool),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-            if call_result.event == ModelResponseEvent.tool_call_completed.value and call_result.tool_executions:
-                tool_execution = call_result.tool_executions[0]
-                tool.result = tool_execution.result
-                tool.tool_call_error = tool_execution.tool_call_error
-                if stream_events:
-                    if team_mode:
-                        yield handle_event(  # type: ignore
-                            create_team_tool_call_completed_event(
-                                from_run_response=run_response,  # type: ignore[arg-type]
-                                tool=tool,
-                                content=call_result.content,  # type: ignore
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                        if tool.tool_call_error:
+    try:
+        async for call_result in agent.model.arun_function_calls(
+            function_calls=[function_call],
+            function_call_results=function_call_results,
+            skip_pause_check=True,
+            run_id=run_response.run_id,
+        ):
+            if isinstance(call_result, ModelResponse):
+                if call_result.event == ModelResponseEvent.tool_call_started.value:
+                    if stream_events:
+                        if team_mode:
                             yield handle_event(  # type: ignore
-                                create_team_tool_call_error_event(
+                                create_team_tool_call_started_event(from_run_response=run_response, tool=tool),  # type: ignore
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        else:
+                            yield handle_event(  # type: ignore
+                                create_tool_call_started_event(from_run_response=run_response, tool=tool),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                if call_result.event == ModelResponseEvent.tool_call_completed.value and call_result.tool_executions:
+                    tool_execution = call_result.tool_executions[0]
+                    tool.result = tool_execution.result
+                    tool.tool_call_error = tool_execution.tool_call_error
+                    if stream_events:
+                        if team_mode:
+                            yield handle_event(  # type: ignore
+                                create_team_tool_call_completed_event(
                                     from_run_response=run_response,  # type: ignore[arg-type]
                                     tool=tool,
-                                    error=str(tool.result),  # type: ignore
+                                    content=call_result.content,  # type: ignore
                                 ),
                                 run_response,
                                 events_to_skip=agent.events_to_skip,  # type: ignore
                                 store_events=agent.store_events,
                             )
-                    else:
-                        yield handle_event(  # type: ignore
-                            create_tool_call_completed_event(
-                                from_run_response=run_response, tool=tool, content=call_result.content
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                        if tool.tool_call_error:
+                            if tool.tool_call_error:
+                                yield handle_event(  # type: ignore
+                                    create_team_tool_call_error_event(
+                                        from_run_response=run_response,  # type: ignore[arg-type]
+                                        tool=tool,
+                                        error=str(tool.result),  # type: ignore
+                                    ),
+                                    run_response,
+                                    events_to_skip=agent.events_to_skip,  # type: ignore
+                                    store_events=agent.store_events,
+                                )
+                        else:
                             yield handle_event(  # type: ignore
-                                create_tool_call_error_event(
-                                    from_run_response=run_response, tool=tool, error=str(tool.result)
+                                create_tool_call_completed_event(
+                                    from_run_response=run_response, tool=tool, content=call_result.content
                                 ),
                                 run_response,
                                 events_to_skip=agent.events_to_skip,  # type: ignore
                                 store_events=agent.store_events,
                             )
-        # Yield CustomEvent instances from async tool generators
-        elif isinstance(call_result, CustomEvent):
-            if stream_events:
-                yield call_result  # type: ignore
+                            if tool.tool_call_error:
+                                yield handle_event(  # type: ignore
+                                    create_tool_call_error_event(
+                                        from_run_response=run_response, tool=tool, error=str(tool.result)
+                                    ),
+                                    run_response,
+                                    events_to_skip=agent.events_to_skip,  # type: ignore
+                                    store_events=agent.store_events,
+                                )
+
+                if call_result.event == ModelResponseEvent.tool_call_paused.value and call_result.tool_executions:
+                    _record_resumed_tool_pause(run_response, tool, call_result.tool_executions[-1])
+            # Yield CustomEvent instances from async tool generators
+            elif isinstance(call_result, CustomEvent):
+                if stream_events:
+                    call_result.agent_id = agent.id or ""
+                    call_result.agent_name = agent.name or ""
+                    call_result.session_id = run_response.session_id or ""
+                    call_result.run_id = run_response.run_id or ""
+                    yield handle_event(
+                        call_result,
+                        run_response,
+                        events_to_skip=agent.events_to_skip,  # type: ignore
+                        store_events=agent.store_events,
+                    )
+    finally:
+        _restore_tool_call_resume_context(function_call, previous_resume_context)
 
     if len(function_call_results) > 0:
         run_messages.messages.extend(function_call_results)
@@ -851,48 +1046,60 @@ def handle_tool_call_updates(
     agent: Agent, run_response: RunOutput, run_messages: RunMessages, tools: List[Union[Function, dict]]
 ):
     agent.model = cast(Model, agent.model)
-    _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
+    _functions = agent.model._get_functions_from_tools(tools, include_dynamic_functions=True)
 
-    for _t in run_response.tools or []:
+    for _t in list(run_response.tools or []):
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(agent, run_messages, _t, functions=_functions)
+            _mark_rejected_tool_resolved(_t)
+            _maybe_create_audit_approval(agent, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             # Tool is confirmed and hasn't been run before
             if _t.confirmed is not None and _t.confirmed is True and _t.result is None:
                 # Consume the generator without yielding
                 deque(run_tool(agent, run_response, run_messages, _t, functions=_functions), maxlen=0)
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(agent, run_messages, _t, functions=_functions)
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
             _maybe_create_audit_approval(agent, _t, run_response, "approved" if _t.confirmed is True else "rejected")
             _t.requires_confirmation = False
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
-            _maybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _t.result is not None or _t.external_execution_result_provided:
+                handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
+                _maybe_create_audit_approval(agent, _t, run_response, "approved")
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(agent, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
-            # Consume the generator without yielding
-            deque(run_tool(agent, run_response, run_messages, _t, functions=_functions), maxlen=0)
-            _maybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _tool_user_input_ready(_t):
+                handle_user_input_update(agent, tool=_t)
+                # Consume the generator without yielding
+                deque(run_tool(agent, run_response, run_messages, _t, functions=_functions), maxlen=0)
+                _t.requires_user_input = False
+                _t.answered = True
+                _maybe_create_audit_approval(agent, _t, run_response, "approved")
 
 
 def handle_tool_call_updates_stream(
@@ -903,9 +1110,15 @@ def handle_tool_call_updates_stream(
     stream_events: bool = False,
 ) -> Iterator[RunOutputEvent]:
     agent.model = cast(Model, agent.model)
-    _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
+    _functions = agent.model._get_functions_from_tools(tools, include_dynamic_functions=True)
 
-    for _t in run_response.tools or []:
+    for _t in list(run_response.tools or []):
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(agent, run_messages, _t, functions=_functions)
+            _mark_rejected_tool_resolved(_t)
+            _maybe_create_audit_approval(agent, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             # Tool is confirmed and hasn't been run before
@@ -913,60 +1126,74 @@ def handle_tool_call_updates_stream(
                 yield from run_tool(
                     agent, run_response, run_messages, _t, functions=_functions, stream_events=stream_events
                 )
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(agent, run_messages, _t, functions=_functions)
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
             _maybe_create_audit_approval(agent, _t, run_response, "approved" if _t.confirmed is True else "rejected")
             _t.requires_confirmation = False
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
-            _maybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _t.result is not None or _t.external_execution_result_provided:
+                handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
+                _maybe_create_audit_approval(agent, _t, run_response, "approved")
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
 
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(agent, tool=_t)
-            yield from run_tool(
-                agent, run_response, run_messages, _t, functions=_functions, stream_events=stream_events
-            )
-            _t.requires_user_input = False
-            _t.answered = True
-            _maybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _tool_user_input_ready(_t):
+                handle_user_input_update(agent, tool=_t)
+                yield from run_tool(
+                    agent, run_response, run_messages, _t, functions=_functions, stream_events=stream_events
+                )
+                _t.requires_user_input = False
+                _t.answered = True
+                _maybe_create_audit_approval(agent, _t, run_response, "approved")
 
 
 async def ahandle_tool_call_updates(
     agent: Agent, run_response: RunOutput, run_messages: RunMessages, tools: List[Union[Function, dict]]
 ):
     agent.model = cast(Model, agent.model)
-    _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
+    _functions = agent.model._get_functions_from_tools(tools, include_dynamic_functions=True)
 
-    for _t in run_response.tools or []:
+    for _t in list(run_response.tools or []):
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(agent, run_messages, _t, functions=_functions)
+            _mark_rejected_tool_resolved(_t)
+            await _amaybe_create_audit_approval(agent, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             # Tool is confirmed and hasn't been run before
             if _t.confirmed is not None and _t.confirmed is True and _t.result is None:
                 async for _ in arun_tool(agent, run_response, run_messages, _t, functions=_functions):
                     pass
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(agent, run_messages, _t, functions=_functions)
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
             await _amaybe_create_audit_approval(
                 agent, _t, run_response, "approved" if _t.confirmed is True else "rejected"
             )
@@ -974,26 +1201,30 @@ async def ahandle_tool_call_updates(
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
-            await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _t.result is not None or _t.external_execution_result_provided:
+                handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
+                await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
         # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(agent, tool=_t)
-            async for _ in arun_tool(agent, run_response, run_messages, _t, functions=_functions):
-                pass
-            _t.requires_user_input = False
-            _t.answered = True
-            await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _tool_user_input_ready(_t):
+                handle_user_input_update(agent, tool=_t)
+                async for _ in arun_tool(agent, run_response, run_messages, _t, functions=_functions):
+                    pass
+                _t.requires_user_input = False
+                _t.answered = True
+                await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
 
 
 async def ahandle_tool_call_updates_stream(
@@ -1004,9 +1235,15 @@ async def ahandle_tool_call_updates_stream(
     stream_events: bool = False,
 ) -> AsyncIterator[RunOutputEvent]:
     agent.model = cast(Model, agent.model)
-    _functions = {tool.name: tool for tool in tools if isinstance(tool, Function)}
+    _functions = agent.model._get_functions_from_tools(tools, include_dynamic_functions=True)
 
-    for _t in run_response.tools or []:
+    for _t in list(run_response.tools or []):
+        if _is_rejected_paused_tool(_t):
+            reject_tool_call(agent, run_messages, _t, functions=_functions)
+            _mark_rejected_tool_resolved(_t)
+            await _amaybe_create_audit_approval(agent, _t, run_response, "rejected")
+            continue
+
         # Case 1: Handle confirmed tools and execute them
         if _t.requires_confirmation is not None and _t.requires_confirmation is True and _functions:
             # Tool is confirmed and hasn't been run before
@@ -1015,11 +1252,13 @@ async def ahandle_tool_call_updates_stream(
                     agent, run_response, run_messages, _t, functions=_functions, stream_events=stream_events
                 ):
                     yield event
-            else:
+            elif _t.confirmed is False:
                 reject_tool_call(agent, run_messages, _t, functions=_functions)
                 _t.confirmed = False
                 _t.confirmation_note = _t.confirmation_note or "Tool call was rejected"
                 _t.tool_call_error = True
+            else:
+                continue
             await _amaybe_create_audit_approval(
                 agent, _t, run_response, "approved" if _t.confirmed is True else "rejected"
             )
@@ -1027,25 +1266,29 @@ async def ahandle_tool_call_updates_stream(
 
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
-            handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
-            await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _t.result is not None or _t.external_execution_result_provided:
+                handle_external_execution_update(agent, run_messages=run_messages, tool=_t)
+                await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_input_ready(_t):
+                handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
         # Case 3b: User feedback (ask_user) required
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
-            _t.requires_user_input = False
-            _t.answered = True
+            if _tool_user_feedback_ready(_t):
+                handle_ask_user_tool_update(agent, run_messages=run_messages, tool=_t)
+                _t.requires_user_input = False
+                _t.answered = True
         # Case 4: Handle user input required tools
         elif _t.requires_user_input is not None and _t.requires_user_input is True:
-            handle_user_input_update(agent, tool=_t)
-            async for event in arun_tool(
-                agent, run_response, run_messages, _t, functions=_functions, stream_events=stream_events
-            ):
-                yield event
-            _t.requires_user_input = False
-            _t.answered = True
-            await _amaybe_create_audit_approval(agent, _t, run_response, "approved")
+            if _tool_user_input_ready(_t):
+                handle_user_input_update(agent, tool=_t)
+                async for event in arun_tool(
+                    agent, run_response, run_messages, _t, functions=_functions, stream_events=stream_events
+                ):
+                    yield event
+                _t.requires_user_input = False
+                _t.answered = True
+                await _amaybe_create_audit_approval(agent, _t, run_response, "approved")

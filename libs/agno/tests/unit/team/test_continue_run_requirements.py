@@ -4,6 +4,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from agno.models.response import ToolExecution
 from agno.run import RunStatus
 from agno.run.requirement import RunRequirement
@@ -110,6 +112,64 @@ class TestPropagateMemberPause:
         assert original_schema[0].value is None
         # The requirement-level schema should also be isolated
         assert req.user_input_schema[0].value is None
+
+    def test_user_feedback_schema_is_deeply_copied(self):
+        """Mutating copied ask_user feedback must not affect the original."""
+        from agno.team._tools import _propagate_member_pause
+        from agno.tools.function import UserFeedbackOption, UserFeedbackQuestion
+
+        member_agent = MagicMock()
+        member_agent.name = "Agent"
+
+        req = _make_requirement(
+            requires_user_input=True,
+            user_feedback_schema=[
+                UserFeedbackQuestion(
+                    question="Deploy now?",
+                    options=[UserFeedbackOption(label="Yes"), UserFeedbackOption(label="No")],
+                )
+            ],
+        )
+        member_run_response = MagicMock()
+        member_run_response.requirements = [req]
+        member_run_response.run_id = "run-1"
+
+        run_response = MagicMock()
+        run_response.requirements = None
+
+        with patch("agno.team._tools.get_member_id", return_value="id-1"):
+            _propagate_member_pause(run_response, member_agent, member_run_response)
+
+        copied_req = run_response.requirements[0]
+        copied_req.user_feedback_schema[0].selected_options = ["Yes"]
+
+        assert req.user_feedback_schema[0].selected_options is None
+
+    def test_nested_member_run_id_is_preserved_with_routable_parent_run(self):
+        """Nested member pauses keep the leaf run id and store the immediate routed run id separately."""
+        from agno.team._tools import _propagate_member_pause
+
+        member_agent = MagicMock()
+        member_agent.name = "Sub Team"
+
+        req = _make_requirement(requires_confirmation=True)
+        req.member_agent_id = "leaf-agent-id"
+        req.member_run_id = "leaf-run-id"
+        member_run_response = MagicMock()
+        member_run_response.requirements = [req]
+        member_run_response.run_id = "sub-team-run-id"
+
+        run_response = MagicMock()
+        run_response.requirements = None
+
+        with patch("agno.team._tools.get_member_id", return_value="sub-team-id"):
+            _propagate_member_pause(run_response, member_agent, member_run_response)
+
+        copied_req = run_response.requirements[0]
+        assert copied_req.member_agent_id == "leaf-agent-id"
+        assert copied_req.member_run_id == "leaf-run-id"
+        assert copied_req.routed_member_agent_id == "sub-team-id"
+        assert copied_req.routed_member_run_id == "sub-team-run-id"
 
     def test_tool_execution_is_deeply_copied(self):
         """Mutating the copied tool_execution must not affect the original."""
@@ -429,6 +489,320 @@ class TestChainedHITLRequirements:
         assert len(final_reqs) == 1
         assert final_reqs[0] is team_req
 
+    def test_continue_dispatch_preserves_member_results_when_repausing_for_team_requirement(self, monkeypatch):
+        from agno.run.team import TeamRunOutput
+        from agno.session.team import TeamSession
+        from agno.team import _hooks, _init, _run, _run_options, _storage
+
+        team_req = _make_requirement(tool_call_id="call-team", requires_confirmation=True)
+        member_req = _make_requirement(tool_call_id="call-member", external_execution_required=True)
+        member_req.member_agent_id = "member-1"
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[team_req, member_req],
+            messages=[],
+        )
+        team = MagicMock()
+        team.session_id = "session-1"
+        team.events_to_skip = []
+        team.store_events = True
+        team.initialize_team = MagicMock()
+
+        monkeypatch.setattr(_init, "_has_async_db", lambda team: False)
+        monkeypatch.setattr(
+            _init, "_initialize_session", lambda team, session_id=None, user_id=None: (session_id, user_id)
+        )
+        monkeypatch.setattr(
+            _storage,
+            "_read_or_create_session",
+            lambda team, session_id=None, user_id=None: TeamSession(session_id=session_id, user_id=user_id),
+        )
+        monkeypatch.setattr(_storage, "_update_metadata", lambda team, session=None: None)
+        monkeypatch.setattr(_storage, "_load_session_state", lambda team, session=None, session_state=None: {})
+        monkeypatch.setattr(_run, "_resolve_run_dependencies", lambda team, run_context: None)
+        monkeypatch.setattr(_run, "_route_requirements_to_members", lambda team, **kwargs: ["[Member]: done"])
+        monkeypatch.setattr(
+            _hooks, "handle_team_run_paused", lambda team, run_response, session, run_context: run_response
+        )
+        monkeypatch.setattr(
+            _run_options,
+            "resolve_run_options",
+            lambda team, **kwargs: _run_options.ResolvedRunOptions(
+                stream=False,
+                stream_events=False,
+                yield_run_output=False,
+                add_history_to_context=False,
+                add_dependencies_to_context=False,
+                add_session_state_to_context=False,
+                dependencies=None,
+                knowledge_filters=None,
+                metadata=None,
+                output_schema=None,
+            ),
+        )
+
+        result = _run.continue_run_dispatch(team, run_response=run_response, stream=False)
+
+        assert result is run_response
+        assert run_response.additional_input is not None
+        assert "Member results" in run_response.additional_input[0].content
+        assert "[Member]: done" in run_response.additional_input[0].content
+
+    def test_continue_dispatch_preserves_newly_propagated_member_requirement(self, monkeypatch):
+        from agno.run.team import TeamRunOutput
+        from agno.session.team import TeamSession
+        from agno.team import _hooks, _init, _run, _run_options, _storage
+
+        team_req = _make_requirement(tool_call_id="call-team", requires_confirmation=True)
+        member_req = _make_requirement(tool_call_id="call-member", external_execution_required=True)
+        member_req.member_agent_id = "member-1"
+        new_member_req = _make_requirement(tool_call_id="call-member-2", requires_confirmation=True)
+        new_member_req.member_agent_id = "member-2"
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[team_req, member_req],
+            messages=[],
+        )
+        team = MagicMock()
+        team.session_id = "session-1"
+        team.events_to_skip = []
+        team.store_events = True
+        team.initialize_team = MagicMock()
+
+        def route_requirements(team, **kwargs):
+            kwargs["run_response"].requirements.append(new_member_req)
+            return []
+
+        monkeypatch.setattr(_init, "_has_async_db", lambda team: False)
+        monkeypatch.setattr(
+            _init, "_initialize_session", lambda team, session_id=None, user_id=None: (session_id, user_id)
+        )
+        monkeypatch.setattr(
+            _storage,
+            "_read_or_create_session",
+            lambda team, session_id=None, user_id=None: TeamSession(session_id=session_id, user_id=user_id),
+        )
+        monkeypatch.setattr(_storage, "_update_metadata", lambda team, session=None: None)
+        monkeypatch.setattr(_storage, "_load_session_state", lambda team, session=None, session_state=None: {})
+        monkeypatch.setattr(_run, "_resolve_run_dependencies", lambda team, run_context: None)
+        monkeypatch.setattr(_run, "_route_requirements_to_members", route_requirements)
+        monkeypatch.setattr(
+            _hooks, "handle_team_run_paused", lambda team, run_response, session, run_context: run_response
+        )
+        monkeypatch.setattr(
+            _run_options,
+            "resolve_run_options",
+            lambda team, **kwargs: _run_options.ResolvedRunOptions(
+                stream=False,
+                stream_events=False,
+                yield_run_output=False,
+                add_history_to_context=False,
+                add_dependencies_to_context=False,
+                add_session_state_to_context=False,
+                dependencies=None,
+                knowledge_filters=None,
+                metadata=None,
+                output_schema=None,
+            ),
+        )
+
+        result = _run.continue_run_dispatch(team, run_response=run_response, stream=False)
+
+        assert result is run_response
+        assert run_response.requirements == [team_req, new_member_req]
+
+    def test_continue_dispatch_preserves_member_results_when_team_tool_update_repauses(self, monkeypatch):
+        from agno.run.messages import RunMessages
+        from agno.run.team import TeamRunOutput
+        from agno.session.team import TeamSession
+        from agno.team import _hooks, _init, _response, _run, _run_options, _storage, _tools
+
+        team_req = _make_requirement(tool_call_id="call-team", requires_confirmation=True)
+        team_req.confirm()
+        member_req = _make_requirement(tool_call_id="call-member", external_execution_required=True)
+        member_req.member_agent_id = "member-1"
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[team_req, member_req],
+            messages=[],
+        )
+        team = MagicMock()
+        team.session_id = "session-1"
+        team.parser_model = None
+        team.model = MagicMock()
+        team.add_history_to_context = False
+        team.events_to_skip = []
+        team.store_events = True
+        team.initialize_team = MagicMock()
+
+        def handle_updates(team, run_response, run_messages, tools):
+            run_response.requirements = [_make_requirement(tool_call_id="call-next", requires_confirmation=True)]
+
+        monkeypatch.setattr(_init, "_has_async_db", lambda team: False)
+        monkeypatch.setattr(
+            _init, "_initialize_session", lambda team, session_id=None, user_id=None: (session_id, user_id)
+        )
+        monkeypatch.setattr(
+            _storage,
+            "_read_or_create_session",
+            lambda team, session_id=None, user_id=None: TeamSession(session_id=session_id, user_id=user_id),
+        )
+        monkeypatch.setattr(_storage, "_update_metadata", lambda team, session=None: None)
+        monkeypatch.setattr(_storage, "_load_session_state", lambda team, session=None, session_state=None: {})
+        monkeypatch.setattr(_run, "_resolve_run_dependencies", lambda team, run_context: None)
+        monkeypatch.setattr(_run, "_route_requirements_to_members", lambda team, **kwargs: ["[Member]: done"])
+        monkeypatch.setattr(_response, "get_response_format", lambda team, run_context=None: None)
+        monkeypatch.setattr(_tools, "_determine_tools_for_model", lambda *args, **kwargs: [])
+        monkeypatch.setattr(_run, "_get_continue_run_messages", lambda *args, **kwargs: RunMessages())
+        monkeypatch.setattr(_run, "_handle_team_tool_call_updates", handle_updates)
+        monkeypatch.setattr(
+            _hooks, "handle_team_run_paused", lambda team, run_response, session, run_context: run_response
+        )
+        monkeypatch.setattr(
+            _run_options,
+            "resolve_run_options",
+            lambda team, **kwargs: _run_options.ResolvedRunOptions(
+                stream=False,
+                stream_events=False,
+                yield_run_output=False,
+                add_history_to_context=False,
+                add_dependencies_to_context=False,
+                add_session_state_to_context=False,
+                dependencies=None,
+                knowledge_filters=None,
+                metadata=None,
+                output_schema=None,
+            ),
+        )
+
+        result = _run.continue_run_dispatch(team, run_response=run_response, stream=False)
+
+        assert result is run_response
+        assert run_response.additional_input is not None
+        assert "[Member]: done" in run_response.additional_input[0].content
+
+
+def test_apply_updated_tools_to_run_response_syncs_legacy_payload_to_requirement():
+    from agno.run.team import TeamRunOutput
+    from agno.team._run import _apply_updated_tools_to_run_response
+
+    paused_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="approve_me",
+        requires_confirmation=True,
+        confirmed=None,
+    )
+    run_response = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        tools=[paused_tool],
+        requirements=[RunRequirement(tool_execution=paused_tool)],
+    )
+    updated_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="approve_me",
+        requires_confirmation=True,
+        confirmed=True,
+        resume_metadata={"reason": "ok"},
+    )
+
+    _apply_updated_tools_to_run_response(run_response, [updated_tool])
+
+    assert run_response.tools == [paused_tool]
+    assert run_response.requirements is not None
+    assert run_response.requirements[0].tool_execution is run_response.tools[0]
+    assert run_response.requirements[0].confirmation is True
+    assert run_response.requirements[0].tool_execution.confirmed is True
+    assert run_response.requirements[0].approval_metadata == {"reason": "ok"}
+
+
+def test_apply_updated_tools_to_run_response_preserves_tool_context_without_requirements():
+    from agno.run.team import TeamRunOutput
+    from agno.team._run import _apply_updated_tools_to_run_response
+
+    paused_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        tool_args={"path": ".env"},
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    partial_resolution = ToolExecution(tool_call_id="call-1", confirmed=True)
+    run_response = TeamRunOutput(run_id="team-run-1", session_id="session-1", tools=[paused_tool])
+
+    _apply_updated_tools_to_run_response(run_response, [partial_resolution])
+
+    assert run_response.tools == [paused_tool]
+    assert paused_tool.tool_name == "protected"
+    assert paused_tool.tool_args == {"path": ".env"}
+    assert paused_tool.requires_confirmation is True
+    assert paused_tool.confirmed is True
+
+
+def test_team_tool_sync_does_not_replace_unidentified_tools():
+    from agno.run.team import TeamRunOutput
+    from agno.team._run import _sync_run_response_tools_from_requirements
+
+    existing_a = ToolExecution(tool_call_id=None, tool_name="a")
+    existing_b = ToolExecution(tool_call_id=None, tool_name="b")
+    requirement_tool = ToolExecution(tool_call_id=None, tool_name="paused")
+    run_response = TeamRunOutput(run_id="run-1", tools=[existing_a, existing_b])
+
+    _sync_run_response_tools_from_requirements(run_response, [RunRequirement(tool_execution=requirement_tool)])
+
+    assert run_response.tools == [existing_a, existing_b, requirement_tool]
+
+
+def test_team_tool_sync_keeps_same_call_id_tools_from_different_routes_distinct():
+    from agno.run.team import TeamRunOutput
+    from agno.team._run import _sync_run_response_tools_from_requirements
+
+    member_a_tool = ToolExecution(tool_call_id="call-1", tool_name="member_a")
+    member_b_tool = ToolExecution(tool_call_id="call-1", tool_name="member_b")
+    req_a = RunRequirement(tool_execution=member_a_tool)
+    req_a.routed_member_agent_id = "member-a"
+    req_a.routed_member_run_id = "run-a"
+    req_b = RunRequirement(tool_execution=member_b_tool)
+    req_b.routed_member_agent_id = "member-b"
+    req_b.routed_member_run_id = "run-b"
+    run_response = TeamRunOutput(run_id="run-1", tools=[member_a_tool, member_b_tool])
+
+    _sync_run_response_tools_from_requirements(run_response, [req_a, req_b])
+
+    assert run_response.tools == [member_a_tool, member_b_tool]
+
+
+def test_member_tool_merge_does_not_replace_unidentified_tools():
+    from agno.run.agent import RunOutput
+    from agno.team._run import _merge_routed_requirements_into_member_run
+
+    existing_a = ToolExecution(tool_call_id=None, tool_name="a")
+    existing_b = ToolExecution(tool_call_id=None, tool_name="b")
+    requirement_tool = ToolExecution(tool_call_id=None, tool_name="paused")
+    member_run_output = RunOutput(run_id="run-1", tools=[existing_a, existing_b])
+
+    _merge_routed_requirements_into_member_run(member_run_output, [RunRequirement(tool_execution=requirement_tool)])
+
+    assert member_run_output.tools == [existing_a, existing_b, requirement_tool]
+
+
+def test_member_tool_merge_keeps_same_call_id_tools_distinct():
+    from agno.run.agent import RunOutput
+    from agno.team._run import _merge_routed_requirements_into_member_run
+
+    existing_a = ToolExecution(tool_call_id="call-1", tool_name="a")
+    existing_b = ToolExecution(tool_call_id="call-1", tool_name="b")
+    req_a = RunRequirement(tool_execution=existing_a)
+    req_b = RunRequirement(tool_execution=existing_b)
+    member_run_output = RunOutput(run_id="run-1", tools=[existing_a, existing_b])
+
+    _merge_routed_requirements_into_member_run(member_run_output, [req_a, req_b])
+
+    assert member_run_output.tools == [existing_a, existing_b]
+
 
 # ===========================================================================
 # 7. Mixed HITL types
@@ -578,6 +952,438 @@ class TestMemberRunResponseCleanup:
         assert run_response.requirements[0]._member_run_response is member_run_response
 
 
+class TestNestedRequirementMerge:
+    def test_preserves_leaf_run_response_when_merging_parent_resolution(self):
+        from agno.team._run import _merge_routed_requirements_into_member_run
+
+        leaf_run_response = MagicMock()
+        target = _make_requirement(tool_call_id="call-1", requires_confirmation=True)
+        target.member_agent_id = "leaf-agent"
+        target.member_run_id = "leaf-run"
+        target._member_run_response = leaf_run_response
+
+        member_run_output = MagicMock()
+        member_run_output.requirements = [target]
+        member_run_output.tools = [target.tool_execution]
+
+        source = _make_requirement(tool_call_id="call-1", requires_confirmation=True)
+        source.confirm(metadata={"approver": "admin"})
+
+        _merge_routed_requirements_into_member_run(member_run_output, [source])
+
+        assert member_run_output.requirements == [target]
+        assert member_run_output.requirements[0]._member_run_response is leaf_run_response
+        assert member_run_output.requirements[0].member_agent_id == "leaf-agent"
+        assert member_run_output.requirements[0].member_run_id == "leaf-run"
+        assert member_run_output.requirements[0].confirmation is True
+        assert member_run_output.requirements[0].tool_execution.confirmed is True
+        assert member_run_output.requirements[0].tool_execution.resume_metadata == {"approver": "admin"}
+        assert member_run_output.tools == [target.tool_execution]
+
+    def test_routes_serialized_mixed_nested_requirements_to_subteam_once(self, monkeypatch):
+        from agno.team import _run, _tools
+
+        subteam_req = _make_requirement(tool_call_id="call-subteam", requires_confirmation=True)
+        subteam_req.confirm()
+        subteam_req.member_agent_id = "subteam"
+        subteam_req.member_run_id = "subteam-run"
+        subteam_req.routed_member_agent_id = "subteam"
+        subteam_req.routed_member_run_id = "subteam-run"
+        subteam_req.routed_member_is_team_level = True
+
+        leaf_req = _make_requirement(tool_call_id="call-leaf", requires_confirmation=True)
+        leaf_req.confirm()
+        leaf_req.member_agent_id = "leaf"
+        leaf_req.member_run_id = "leaf-run"
+        leaf_req.routed_member_agent_id = "subteam"
+        leaf_req.routed_member_run_id = "subteam-run"
+
+        run_response = MagicMock()
+        run_response.requirements = [subteam_req, leaf_req]
+        session = MagicMock()
+        session.session_id = "session-1"
+        team = MagicMock()
+
+        member = MagicMock()
+        member.name = "Subteam"
+        member.continue_run.return_value = MagicMock(is_paused=False, content="done")
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        results = _run._route_requirements_to_members(team, run_response=run_response, session=session)
+
+        assert results == ["[Subteam]: done"]
+        member.continue_run.assert_called_once()
+        kwargs = member.continue_run.call_args.kwargs
+        assert kwargs["run_id"] == "subteam-run"
+        assert len(kwargs["requirements"]) == 2
+        assert kwargs["requirements"][0].member_agent_id is None
+        assert kwargs["requirements"][0].member_run_id is None
+        assert kwargs["requirements"][1].member_agent_id == "leaf"
+        assert kwargs["requirements"][1].member_run_id == "leaf-run"
+
+    @pytest.mark.asyncio
+    async def test_aroutes_serialized_mixed_nested_requirements_to_subteam_once(self, monkeypatch):
+        from agno.team import _run, _tools
+
+        subteam_req = _make_requirement(tool_call_id="call-subteam", requires_confirmation=True)
+        subteam_req.confirm()
+        subteam_req.member_agent_id = "subteam"
+        subteam_req.member_run_id = "subteam-run"
+        subteam_req.routed_member_agent_id = "subteam"
+        subteam_req.routed_member_run_id = "subteam-run"
+        subteam_req.routed_member_is_team_level = True
+
+        leaf_req = _make_requirement(tool_call_id="call-leaf", requires_confirmation=True)
+        leaf_req.confirm()
+        leaf_req.member_agent_id = "leaf"
+        leaf_req.member_run_id = "leaf-run"
+        leaf_req.routed_member_agent_id = "subteam"
+        leaf_req.routed_member_run_id = "subteam-run"
+
+        run_response = MagicMock()
+        run_response.requirements = [subteam_req, leaf_req]
+        session = MagicMock()
+        session.session_id = "session-1"
+        team = MagicMock()
+
+        member = MagicMock()
+        member.name = "Subteam"
+        member.acontinue_run = AsyncMock(return_value=MagicMock(is_paused=False, content="done"))
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        results = await _run._aroute_requirements_to_members(team, run_response=run_response, session=session)
+
+        assert results == ["[Subteam]: done"]
+        member.acontinue_run.assert_awaited_once()
+        kwargs = member.acontinue_run.call_args.kwargs
+        assert kwargs["run_id"] == "subteam-run"
+        assert len(kwargs["requirements"]) == 2
+        assert kwargs["requirements"][0].member_agent_id is None
+        assert kwargs["requirements"][0].member_run_id is None
+        assert kwargs["requirements"][1].member_agent_id == "leaf"
+        assert kwargs["requirements"][1].member_run_id == "leaf-run"
+
+    def test_routes_stream_serialized_mixed_nested_requirements_to_subteam_once(self, monkeypatch):
+        from agno.team import _run, _tools
+
+        subteam_req = _make_requirement(tool_call_id="call-subteam", requires_confirmation=True)
+        subteam_req.confirm()
+        subteam_req.member_agent_id = "subteam"
+        subteam_req.member_run_id = "subteam-run"
+        subteam_req.routed_member_agent_id = "subteam"
+        subteam_req.routed_member_run_id = "subteam-run"
+        subteam_req.routed_member_is_team_level = True
+
+        leaf_req = _make_requirement(tool_call_id="call-leaf", requires_confirmation=True)
+        leaf_req.confirm()
+        leaf_req.member_agent_id = "leaf"
+        leaf_req.member_run_id = "leaf-run"
+        leaf_req.routed_member_agent_id = "subteam"
+        leaf_req.routed_member_run_id = "subteam-run"
+
+        run_response = TeamRunOutput(run_id="team-run", session_id="session-1", requirements=[subteam_req, leaf_req])
+        session = MagicMock()
+        session.session_id = "session-1"
+        session.upsert_run = MagicMock()
+        team = MagicMock()
+        team.stream_member_events = False
+
+        member = MagicMock()
+        member.name = "Subteam"
+        member.continue_run.return_value = iter([TeamRunOutput(run_id="subteam-run", content="done")])
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        member_results: list[str] = []
+        events = list(
+            _run._route_requirements_to_members_stream(
+                team, run_response=run_response, session=session, member_results=member_results
+            )
+        )
+
+        assert events == []
+        assert member_results == ["[Subteam]: done"]
+        member.continue_run.assert_called_once()
+        kwargs = member.continue_run.call_args.kwargs
+        assert kwargs["run_id"] == "subteam-run"
+        assert len(kwargs["requirements"]) == 2
+        assert kwargs["requirements"][0].member_agent_id is None
+        assert kwargs["requirements"][0].member_run_id is None
+        assert kwargs["requirements"][1].member_agent_id == "leaf"
+        assert kwargs["requirements"][1].member_run_id == "leaf-run"
+
+    @pytest.mark.asyncio
+    async def test_aroutes_stream_serialized_mixed_nested_requirements_to_subteam_once(self, monkeypatch):
+        from agno.team import _run, _tools
+
+        subteam_req = _make_requirement(tool_call_id="call-subteam", requires_confirmation=True)
+        subteam_req.confirm()
+        subteam_req.member_agent_id = "subteam"
+        subteam_req.member_run_id = "subteam-run"
+        subteam_req.routed_member_agent_id = "subteam"
+        subteam_req.routed_member_run_id = "subteam-run"
+        subteam_req.routed_member_is_team_level = True
+
+        leaf_req = _make_requirement(tool_call_id="call-leaf", requires_confirmation=True)
+        leaf_req.confirm()
+        leaf_req.member_agent_id = "leaf"
+        leaf_req.member_run_id = "leaf-run"
+        leaf_req.routed_member_agent_id = "subteam"
+        leaf_req.routed_member_run_id = "subteam-run"
+
+        run_response = TeamRunOutput(run_id="team-run", session_id="session-1", requirements=[subteam_req, leaf_req])
+        session = MagicMock()
+        session.session_id = "session-1"
+        session.upsert_run = MagicMock()
+        team = MagicMock()
+        team.stream_member_events = False
+
+        captured_kwargs = {}
+
+        async def member_stream(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield TeamRunOutput(run_id="subteam-run", content="done")
+
+        member = MagicMock()
+        member.name = "Subteam"
+        member.acontinue_run = member_stream
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        member_results: list[str] = []
+        events = []
+        async for event in _run._aroute_requirements_to_members_stream(
+            team, run_response=run_response, session=session, member_results=member_results
+        ):
+            events.append(event)
+
+        assert events == []
+        assert member_results == ["[Subteam]: done"]
+        requirements = captured_kwargs["requirements"]
+        assert captured_kwargs["run_id"] == "subteam-run"
+        assert len(requirements) == 2
+        assert requirements[0].member_agent_id is None
+        assert requirements[0].member_run_id is None
+        assert requirements[1].member_agent_id == "leaf"
+        assert requirements[1].member_run_id == "leaf-run"
+
+    def test_unroutable_member_requirement_is_marked_for_repause(self, monkeypatch):
+        from agno.team import _run, _tools
+
+        req = _make_requirement(tool_call_id="call-member", requires_confirmation=True)
+        req.member_agent_id = "missing-member"
+        run_response = MagicMock()
+        run_response.requirements = [req]
+        session = MagicMock()
+        session.session_id = "session-1"
+        team = MagicMock()
+
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: None)
+
+        results = _run._route_requirements_to_members(team, run_response=run_response, session=session)
+
+        assert results == ["[missing-member]: Could not route requirement - member not found"]
+        assert req._routing_failed is True
+        assert not req.is_resolved()
+
+    def test_routing_failed_resolved_requirement_still_blocks_continue(self):
+        from agno.team import _run
+
+        req = _make_requirement(requires_confirmation=True)
+        req.member_agent_id = "member-1"
+        req.confirm()
+        req._routing_failed = True
+
+        remaining = _run._remaining_original_member_requirements([req], {id(req)})
+
+        assert remaining == [req]
+        assert _run._unresolved_member_requirements([req]) == [req]
+
+    def test_member_run_id_fallback_replaces_parent_member_response(self, monkeypatch):
+        from agno.run import RunStatus
+        from agno.run.agent import RunOutput
+        from agno.run.team import TeamRunOutput
+        from agno.team import _run, _tools
+
+        req = _make_requirement(tool_call_id="call-member", requires_confirmation=True)
+        req.confirm()
+        req.member_agent_id = "member-1"
+        req.member_run_id = "member-run"
+        old_member_response = RunOutput(run_id="member-run", agent_id="member-1", status=RunStatus.paused)
+        new_member_response = RunOutput(
+            run_id="member-run",
+            agent_id="member-1",
+            status=RunStatus.completed,
+            content="done",
+        )
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[req],
+            member_responses=[old_member_response],
+        )
+        session = MagicMock()
+        session.session_id = "session-1"
+        team = MagicMock()
+        member = MagicMock()
+        member.name = "Member"
+        member.continue_run.return_value = new_member_response
+
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        results = _run._route_requirements_to_members(team, run_response=run_response, session=session)
+
+        assert results == ["[Member]: done"]
+        assert run_response.member_responses == [new_member_response]
+        member.continue_run.assert_called_once()
+
+    def test_routes_same_member_requirements_for_different_paused_runs_separately(self, monkeypatch):
+        from agno.run import RunStatus
+        from agno.run.agent import RunOutput
+        from agno.run.team import TeamRunOutput
+        from agno.team import _run, _tools
+
+        first_req = _make_requirement(tool_call_id="call-first", requires_confirmation=True)
+        first_req.confirm()
+        first_req.member_agent_id = "member-1"
+        first_req.member_run_id = "member-run-1"
+        first_paused = RunOutput(run_id="member-run-1", agent_id="member-1", status=RunStatus.paused)
+        first_paused.requirements = [first_req]
+        first_req._member_run_response = first_paused
+
+        second_req = _make_requirement(tool_call_id="call-second", requires_confirmation=True)
+        second_req.confirm()
+        second_req.member_agent_id = "member-1"
+        second_req.member_run_id = "member-run-2"
+        second_paused = RunOutput(run_id="member-run-2", agent_id="member-1", status=RunStatus.paused)
+        second_paused.requirements = [second_req]
+        second_req._member_run_response = second_paused
+
+        first_done = RunOutput(
+            run_id="member-run-1",
+            agent_id="member-1",
+            status=RunStatus.completed,
+            content="first done",
+        )
+        second_done = RunOutput(
+            run_id="member-run-2",
+            agent_id="member-1",
+            status=RunStatus.completed,
+            content="second done",
+        )
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[first_req, second_req],
+            member_responses=[first_paused, second_paused],
+        )
+        session = MagicMock()
+        session.session_id = "session-1"
+        team = MagicMock()
+        member = MagicMock()
+        member.name = "Member"
+        member.continue_run.side_effect = [first_done, second_done]
+
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        results = _run._route_requirements_to_members(team, run_response=run_response, session=session)
+
+        assert results == ["[Member]: first done", "[Member]: second done"]
+        assert member.continue_run.call_count == 2
+        assert member.continue_run.call_args_list[0].kwargs["run_response"] is first_paused
+        assert member.continue_run.call_args_list[0].kwargs["requirements"][0].is_resolved()
+        assert member.continue_run.call_args_list[1].kwargs["run_response"] is second_paused
+        assert member.continue_run.call_args_list[1].kwargs["requirements"][0].is_resolved()
+        assert run_response.member_responses == [first_done, second_done]
+
+    @pytest.mark.asyncio
+    async def test_aroutes_same_member_requirements_for_different_paused_runs_separately(self, monkeypatch):
+        from agno.run import RunStatus
+        from agno.run.agent import RunOutput
+        from agno.run.team import TeamRunOutput
+        from agno.team import _run, _tools
+
+        first_req = _make_requirement(tool_call_id="call-first", requires_confirmation=True)
+        first_req.confirm()
+        first_req.member_agent_id = "member-1"
+        first_req.member_run_id = "member-run-1"
+        first_paused = RunOutput(run_id="member-run-1", agent_id="member-1", status=RunStatus.paused)
+        first_req._member_run_response = first_paused
+
+        second_req = _make_requirement(tool_call_id="call-second", requires_confirmation=True)
+        second_req.confirm()
+        second_req.member_agent_id = "member-1"
+        second_req.member_run_id = "member-run-2"
+        second_paused = RunOutput(run_id="member-run-2", agent_id="member-1", status=RunStatus.paused)
+        second_req._member_run_response = second_paused
+
+        first_done = RunOutput(
+            run_id="member-run-1",
+            agent_id="member-1",
+            status=RunStatus.completed,
+            content="first done",
+        )
+        second_done = RunOutput(
+            run_id="member-run-2",
+            agent_id="member-1",
+            status=RunStatus.completed,
+            content="second done",
+        )
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[first_req, second_req],
+            member_responses=[first_paused, second_paused],
+        )
+        session = MagicMock()
+        session.session_id = "session-1"
+        team = MagicMock()
+        member = MagicMock()
+        member.name = "Member"
+        member.acontinue_run = AsyncMock(side_effect=[first_done, second_done])
+
+        monkeypatch.setattr(_tools, "_find_member_route_by_id", lambda *args, **kwargs: (0, member))
+
+        results = await _run._aroute_requirements_to_members(team, run_response=run_response, session=session)
+
+        assert results == ["[Member]: first done", "[Member]: second done"]
+        assert member.acontinue_run.await_count == 2
+        routed_run_responses = [call.kwargs["run_response"] for call in member.acontinue_run.call_args_list]
+        assert first_paused in routed_run_responses
+        assert second_paused in routed_run_responses
+        assert all(call.kwargs["requirements"][0].is_resolved() for call in member.acontinue_run.call_args_list)
+        assert run_response.member_responses == [first_done, second_done]
+
+    def test_supplied_requirement_resolution_preserves_existing_member_run_response(self):
+        from agno.run import RunStatus
+        from agno.run.agent import RunOutput
+        from agno.run.team import TeamRunOutput
+        from agno.team import _run
+
+        paused_req = _make_requirement(tool_call_id="call-member", requires_confirmation=True)
+        paused_req.member_agent_id = "member-1"
+        paused_req.member_run_id = "member-run"
+        member_run_response = RunOutput(run_id="member-run", agent_id="member-1", status=RunStatus.paused)
+        paused_req._member_run_response = member_run_response
+
+        resolved_req = _make_requirement(tool_call_id="call-member", requires_confirmation=True)
+        resolved_req.id = paused_req.id
+        resolved_req.member_agent_id = "member-1"
+        resolved_req.member_run_id = "member-run"
+        resolved_req.confirm(metadata={"approver": "admin"})
+
+        run_response = TeamRunOutput(
+            run_id="team-run",
+            session_id="session-1",
+            requirements=[paused_req],
+        )
+
+        _run._apply_requirements_to_run_response(run_response, [resolved_req])
+
+        assert run_response.requirements == [paused_req]
+        assert run_response.requirements[0]._member_run_response is member_run_response
+        assert run_response.requirements[0].is_resolved()
+        assert run_response.tools == [paused_req.tool_execution]
+
+
 # ===========================================================================
 # 10. Unresolved team-level requirements guard
 # ===========================================================================
@@ -628,8 +1434,57 @@ class TestUnresolvedTeamLevelRequirements:
         assert unresolved[0] is team_unresolved
 
 
+@pytest.mark.asyncio
+async def test_aroute_requirements_to_members_swallows_member_continue_failure(monkeypatch):
+    """A single member's continue_run failure must NOT abort the team-level
+    continuation or cancel its sibling members; the exception is logged and the
+    member's result is dropped from the returned list.
+    """
+    from agno.team import _run, _tools
+
+    failing_req = _make_requirement(external_execution_required=True)
+    failing_req.member_agent_id = "member-fail"
+    ok_req = _make_requirement(external_execution_required=True)
+    ok_req.member_agent_id = "member-ok"
+
+    run_response = MagicMock()
+    run_response.requirements = [failing_req, ok_req]
+    run_response.member_responses = None
+    session = MagicMock()
+    session.session_id = "session-1"
+    session.upsert_run = MagicMock()
+    team = MagicMock()
+
+    failing_member = MagicMock()
+    failing_member.name = "FailMember"
+    failing_member.acontinue_run = AsyncMock(side_effect=RuntimeError("member failed"))
+
+    ok_member = MagicMock()
+    ok_member.name = "OkMember"
+    ok_response = MagicMock()
+    ok_response.is_paused = False
+    ok_response.content = "done"
+    ok_member.acontinue_run = AsyncMock(return_value=ok_response)
+
+    members_by_id = {"member-fail": failing_member, "member-ok": ok_member}
+    monkeypatch.setattr(
+        _tools,
+        "_find_member_route_by_id",
+        lambda team, member_id, **kwargs: (0, members_by_id[member_id]),
+    )
+    warnings = []
+    monkeypatch.setattr(_run, "log_warning", warnings.append)
+
+    results = await _run._aroute_requirements_to_members(team, run_response=run_response, session=session)
+
+    # Failing member's exception was swallowed; sibling completed normally.
+    assert any("member failed" in warning for warning in warnings)
+    assert any("[OkMember]: done" in r for r in results)
+    assert not any("FailMember" in r for r in results)
+
+
 # ===========================================================================
-# 11. asyncio.gather error handling in _aroute_requirements_to_members
+# 12. Streaming continuation routing regressions
 # ===========================================================================
 
 
@@ -1270,3 +2125,163 @@ class TestRoutingForwardsRunContextToMembers:
         assert "dependencies" not in kwargs
         assert "metadata" not in kwargs
         assert "knowledge_filters" not in kwargs
+
+
+def test_team_level_stream_continue_defers_tool_updates_to_stream_generator(monkeypatch):
+    from agno.run.messages import RunMessages
+    from agno.run.team import TeamRunOutput
+    from agno.session.team import TeamSession
+    from agno.team import _init, _response, _run, _run_options, _storage, _tools
+
+    req = _make_requirement(requires_confirmation=True)
+    req.confirm()
+    run_response = TeamRunOutput(run_id="team-run", session_id="session-1", requirements=[req], messages=[])
+    team = MagicMock()
+    team.session_id = "session-1"
+    team.parser_model = None
+    team.model = MagicMock()
+    team.add_history_to_context = False
+    team.initialize_team = MagicMock()
+
+    handle_updates = MagicMock()
+    continue_stream = MagicMock(return_value=iter(["continued"]))
+
+    monkeypatch.setattr(_init, "_has_async_db", lambda team: False)
+    monkeypatch.setattr(_init, "_initialize_session", lambda team, session_id=None, user_id=None: (session_id, user_id))
+    monkeypatch.setattr(
+        _storage,
+        "_read_or_create_session",
+        lambda team, session_id=None, user_id=None: TeamSession(session_id=session_id, user_id=user_id),
+    )
+    monkeypatch.setattr(_storage, "_update_metadata", lambda team, session=None: None)
+    monkeypatch.setattr(_storage, "_load_session_state", lambda team, session=None, session_state=None: {})
+    monkeypatch.setattr(_run, "_resolve_run_dependencies", lambda team, run_context: None)
+    monkeypatch.setattr(_response, "get_response_format", lambda team, run_context=None: None)
+    monkeypatch.setattr(_tools, "_determine_tools_for_model", lambda *args, **kwargs: [])
+    monkeypatch.setattr(_run, "_get_continue_run_messages", lambda *args, **kwargs: RunMessages())
+    monkeypatch.setattr(_run, "_handle_team_tool_call_updates", handle_updates)
+    monkeypatch.setattr(_run, "_continue_run_stream", continue_stream)
+    monkeypatch.setattr(
+        _run_options,
+        "resolve_run_options",
+        lambda team, **kwargs: _run_options.ResolvedRunOptions(
+            stream=True,
+            stream_events=True,
+            yield_run_output=kwargs.get("yield_run_output") or False,
+            add_history_to_context=False,
+            add_dependencies_to_context=False,
+            add_session_state_to_context=False,
+            dependencies=None,
+            knowledge_filters=None,
+            metadata=None,
+            output_schema=None,
+        ),
+    )
+
+    result = _run.continue_run_dispatch(
+        team,
+        run_response=run_response,
+        stream=True,
+        stream_events=True,
+    )
+
+    assert list(result) == ["continued"]
+    handle_updates.assert_not_called()
+    continue_stream.assert_called_once()
+
+
+def test_team_level_sync_chained_repause_records_team_run_continued(monkeypatch):
+    from agno.run.messages import RunMessages
+    from agno.run.team import TeamRunOutput
+    from agno.session.team import TeamSession
+    from agno.team import _hooks, _init, _response, _run, _run_options, _storage, _tools
+
+    req = _make_requirement(requires_confirmation=True)
+    req.confirm()
+    run_response = TeamRunOutput(run_id="team-run", session_id="session-1", requirements=[req], messages=[])
+    team = MagicMock()
+    team.session_id = "session-1"
+    team.parser_model = None
+    team.model = MagicMock()
+    team.add_history_to_context = False
+    team.events_to_skip = []
+    team.store_events = True
+    team.initialize_team = MagicMock()
+
+    def handle_updates(team, run_response, run_messages, tools):
+        run_response.requirements = [_make_requirement(requires_confirmation=True)]
+
+    monkeypatch.setattr(_init, "_has_async_db", lambda team: False)
+    monkeypatch.setattr(_init, "_initialize_session", lambda team, session_id=None, user_id=None: (session_id, user_id))
+    monkeypatch.setattr(
+        _storage,
+        "_read_or_create_session",
+        lambda team, session_id=None, user_id=None: TeamSession(session_id=session_id, user_id=user_id),
+    )
+    monkeypatch.setattr(_storage, "_update_metadata", lambda team, session=None: None)
+    monkeypatch.setattr(_storage, "_load_session_state", lambda team, session=None, session_state=None: {})
+    monkeypatch.setattr(_run, "_resolve_run_dependencies", lambda team, run_context: None)
+    monkeypatch.setattr(_response, "get_response_format", lambda team, run_context=None: None)
+    monkeypatch.setattr(_tools, "_determine_tools_for_model", lambda *args, **kwargs: [])
+    monkeypatch.setattr(_run, "_get_continue_run_messages", lambda *args, **kwargs: RunMessages())
+    monkeypatch.setattr(_run, "_handle_team_tool_call_updates", handle_updates)
+    monkeypatch.setattr(_hooks, "handle_team_run_paused", lambda team, run_response, session, run_context: run_response)
+    monkeypatch.setattr(
+        _run_options,
+        "resolve_run_options",
+        lambda team, **kwargs: _run_options.ResolvedRunOptions(
+            stream=False,
+            stream_events=False,
+            yield_run_output=False,
+            add_history_to_context=False,
+            add_dependencies_to_context=False,
+            add_session_state_to_context=False,
+            dependencies=None,
+            knowledge_filters=None,
+            metadata=None,
+            output_schema=None,
+        ),
+    )
+
+    result = _run.continue_run_dispatch(team, run_response=run_response, stream=False)
+
+    assert result is run_response
+    assert any(getattr(event, "event", None) == "TeamRunContinued" for event in run_response.events or [])
+
+
+@pytest.mark.asyncio
+async def test_async_non_stream_unresolved_continue_does_not_emit_run_continued(monkeypatch):
+    from agno.run.team import TeamRunOutput
+    from agno.session.team import TeamSession
+    from agno.team import _init, _hooks, _response, _run
+
+    req = _make_requirement(requires_confirmation=True)
+    run_response = TeamRunOutput(run_id="team-run", session_id="session-1", requirements=[req])
+    team = MagicMock()
+    team.parser_model = None
+    team.retries = 0
+    team.events_to_skip = []
+    team.store_events = True
+    team.initialize_team = MagicMock()
+
+    async def fake_paused(team, run_response, session, run_context):
+        return run_response
+
+    monkeypatch.setattr(
+        _run,
+        "_asetup_session",
+        AsyncMock(return_value=TeamSession(session_id="session-1", user_id=None)),
+    )
+    monkeypatch.setattr(_run, "aregister_run", AsyncMock())
+    monkeypatch.setattr(_hooks, "ahandle_team_run_paused", fake_paused)
+    monkeypatch.setattr(_response, "get_response_format", lambda team, run_context=None: None)
+    monkeypatch.setattr(_init, "_disconnect_connectable_tools", lambda team: None)
+    monkeypatch.setattr(_init, "_disconnect_mcp_tools", AsyncMock())
+    monkeypatch.setattr(_run, "acleanup_run", AsyncMock())
+
+    result = await _run.acontinue_run_dispatch(team, run_response=run_response, stream=False)
+
+    assert result is run_response
+    assert not run_response.events or all(
+        getattr(event, "event", None) != "TeamRunContinued" for event in run_response.events
+    )

@@ -36,7 +36,7 @@ from agno.models.base import Model
 from agno.models.fallback import FallbackConfig
 from agno.models.message import Message
 from agno.models.metrics import RunMetrics
-from agno.models.response import ModelResponse
+from agno.models.response import ModelResponse, ToolExecution
 from agno.registry.registry import Registry
 from agno.run import RunContext, RunStatus
 from agno.run.agent import RunEvent, RunOutput, RunOutputEvent
@@ -1007,6 +1007,7 @@ class Team:
         run_response: Optional[TeamRunOutput] = None,
         *,
         run_id: Optional[str] = None,
+        updated_tools: Optional[List[ToolExecution]] = None,
         requirements: Optional[List[Any]] = None,
         stream: Literal[False] = False,
         stream_events: Optional[bool] = None,
@@ -1025,6 +1026,7 @@ class Team:
         run_response: Optional[TeamRunOutput] = None,
         *,
         run_id: Optional[str] = None,
+        updated_tools: Optional[List[ToolExecution]] = None,
         requirements: Optional[List[Any]] = None,
         stream: Literal[True] = True,
         stream_events: Optional[bool] = False,
@@ -1042,6 +1044,7 @@ class Team:
         run_response: Optional[TeamRunOutput] = None,
         *,
         run_id: Optional[str] = None,
+        updated_tools: Optional[List[ToolExecution]] = None,
         requirements: Optional[List[Any]] = None,
         # --- Snapshot dispatch sugar (mirrors Agent.continue_run) ---
         input: Optional[str] = None,
@@ -1066,6 +1069,7 @@ class Team:
             self,
             run_response=run_response,
             run_id=run_id,
+            updated_tools=updated_tools,
             requirements=requirements,
             input=input,
             continue_from=continue_from,
@@ -1094,6 +1098,7 @@ class Team:
         stream: Literal[False] = False,
         stream_events: Optional[bool] = None,
         run_id: Optional[str] = None,
+        updated_tools: Optional[List[ToolExecution]] = None,
         requirements: Optional[List[Any]] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -1112,6 +1117,7 @@ class Team:
         stream: Literal[True] = True,
         stream_events: Optional[bool] = None,
         run_id: Optional[str] = None,
+        updated_tools: Optional[List[ToolExecution]] = None,
         requirements: Optional[List[Any]] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -1127,6 +1133,7 @@ class Team:
         run_response: Optional[TeamRunOutput] = None,
         *,
         run_id: Optional[str] = None,
+        updated_tools: Optional[List[ToolExecution]] = None,
         requirements: Optional[List[Any]] = None,
         # --- Snapshot dispatch sugar (mirrors Agent.acontinue_run) ---
         input: Optional[str] = None,
@@ -1152,6 +1159,7 @@ class Team:
             self,
             run_response=run_response,
             run_id=run_id,
+            updated_tools=updated_tools,
             requirements=requirements,
             input=input,
             continue_from=continue_from,

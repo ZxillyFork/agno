@@ -38,6 +38,7 @@ from agno.exceptions import (
     RunCancelledException,
     RunNotContinuableError,
     RunNotFoundError,
+    _describe_exception,
 )
 from agno.filters import FilterExpr
 from agno.media import Audio, File, Image, Video
@@ -55,7 +56,9 @@ from agno.run.agent import (
     RunOutputEvent,
 )
 from agno.run.approval import (
+    acheck_and_apply_approval_resolution,
     acreate_approval_from_pause,
+    check_and_apply_approval_resolution,
     create_approval_from_pause,
 )
 from agno.run.cancel import (
@@ -113,7 +116,6 @@ from agno.utils.log import (
     log_info,
     log_warning,
 )
-from agno.utils.response import get_paused_content
 
 # Strong references to background tasks so they aren't garbage-collected mid-execution.
 # See: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
@@ -125,6 +127,369 @@ _CANCEL_BYPASS_EVENT_TYPES = (
     RunCancelledEvent,
     RunCompletedEvent,
 )
+
+
+def _get_cancel_reason(exc: Optional[BaseException] = None) -> Optional[str]:
+    if exc is None:
+        return None
+    reason = str(exc).strip()
+    return reason or None
+
+
+def _normalize_requirements_payload(requirements: List[Any]) -> List[RunRequirement]:
+    normalized = []
+    for requirement in requirements:
+        if isinstance(requirement, dict):
+            normalized.append(RunRequirement.from_dict(requirement))
+        else:
+            normalized.append(requirement)
+    return normalized
+
+
+def _apply_requirement_resolution(target: RunRequirement, source: RunRequirement) -> None:
+    """Copy client-provided resolution fields without dropping existing requirement context."""
+
+    if target.tool_execution is not None and source.tool_execution is not None:
+        target.tool_execution.confirmed = source.tool_execution.confirmed
+        target.tool_execution.confirmation_note = source.tool_execution.confirmation_note
+        target.tool_execution.result = source.tool_execution.result
+        target.tool_execution.external_execution_result_provided = (
+            source.tool_execution.external_execution_result_provided
+        )
+        target.tool_execution.resume_metadata = source.tool_execution.resume_metadata
+
+        if source.tool_execution.user_input_schema is not None:
+            target.tool_execution.user_input_schema = source.tool_execution.user_input_schema
+        if source.tool_execution.user_feedback_schema is not None:
+            target.tool_execution.user_feedback_schema = source.tool_execution.user_feedback_schema
+        target.tool_execution.answered = source.tool_execution.answered
+
+    target.confirmation = source.confirmation
+    target.confirmation_note = source.confirmation_note
+    target.external_execution_result = source.external_execution_result
+    target.external_execution_result_provided = source.external_execution_result_provided
+    target.approval_metadata = source.approval_metadata
+    if target.approval_metadata is None and source.tool_execution is not None:
+        target.approval_metadata = source.tool_execution.resume_metadata
+
+    if source.user_input_schema is not None:
+        target.user_input_schema = source.user_input_schema
+    if source.user_feedback_schema is not None:
+        target.user_feedback_schema = source.user_feedback_schema
+
+
+def _apply_tool_resolution_to_requirement(target: RunRequirement, source_tool: ToolExecution) -> None:
+    """Copy legacy updated_tools resolution data into a matching RunRequirement."""
+
+    if target.tool_execution is not None:
+        target.tool_execution.confirmed = source_tool.confirmed
+        target.tool_execution.confirmation_note = source_tool.confirmation_note
+        target.tool_execution.result = source_tool.result
+        target.tool_execution.external_execution_result_provided = source_tool.external_execution_result_provided
+        target.tool_execution.resume_metadata = source_tool.resume_metadata
+
+        if source_tool.user_input_schema is not None:
+            target.tool_execution.user_input_schema = source_tool.user_input_schema
+        if source_tool.user_feedback_schema is not None:
+            target.tool_execution.user_feedback_schema = source_tool.user_feedback_schema
+        target.tool_execution.answered = source_tool.answered
+
+    if source_tool.confirmed is not None:
+        target.confirmation = source_tool.confirmed
+        target.confirmation_note = source_tool.confirmation_note
+    if source_tool.resume_metadata is not None:
+        target.approval_metadata = source_tool.resume_metadata
+    if source_tool.user_input_schema is not None:
+        target.user_input_schema = source_tool.user_input_schema
+    if source_tool.user_feedback_schema is not None:
+        target.user_feedback_schema = source_tool.user_feedback_schema
+    if source_tool.external_execution_result_provided or (
+        source_tool.external_execution_required and source_tool.result is not None
+    ):
+        target.external_execution_result = source_tool.result
+        target.external_execution_result_provided = True
+
+
+def _apply_tool_resolution_to_tool(target: ToolExecution, source: ToolExecution) -> None:
+    """Apply legacy ToolExecution resolution fields without dropping stored tool context."""
+
+    if source.confirmed is not None:
+        target.confirmed = source.confirmed
+    if source.confirmation_note is not None:
+        target.confirmation_note = source.confirmation_note
+    if source.resume_metadata is not None:
+        target.resume_metadata = source.resume_metadata
+    if source.user_input_schema is not None:
+        target.user_input_schema = source.user_input_schema
+    if source.user_feedback_schema is not None:
+        target.user_feedback_schema = source.user_feedback_schema
+    if source.answered is not None:
+        target.answered = source.answered
+    if source.external_execution_result_provided or source.result is not None:
+        target.result = source.result
+    if source.external_execution_result_provided is not None:
+        target.external_execution_result_provided = source.external_execution_result_provided
+
+
+def _carry_stored_tool_context(target: ToolExecution, stored: ToolExecution) -> None:
+    """Fill context fields on a returned ToolExecution without overriding its resolution."""
+
+    for field_name in (
+        "tool_call_id",
+        "tool_name",
+        "tool_args",
+        "requires_confirmation",
+        "requires_user_input",
+        "user_input_schema",
+        "user_feedback_schema",
+        "external_execution_required",
+        "external_execution_silent",
+        "approval_type",
+        "approval_id",
+        "metadata",
+        "child_run_id",
+        "stop_after_tool_call",
+    ):
+        if getattr(target, field_name, None) is None:
+            setattr(target, field_name, getattr(stored, field_name, None))
+
+    if target.metrics is None:
+        target.metrics = stored.metrics
+    if target.created_at is None:
+        target.created_at = stored.created_at
+
+
+def _normalize_legacy_tool_resolution(tool: ToolExecution) -> None:
+    if tool.requires_user_input and tool.answered is None:
+        user_input_schema = tool.user_input_schema or []
+        user_feedback_schema = tool.user_feedback_schema or []
+        input_ready = bool(user_input_schema) and all(field.value is not None for field in user_input_schema)
+        feedback_ready = bool(user_feedback_schema) and all(
+            question.selected_options is not None for question in user_feedback_schema
+        )
+        if (
+            input_ready
+            or feedback_ready
+            or (not user_input_schema and not user_feedback_schema and tool.result is not None)
+        ):
+            tool.answered = True
+
+    if tool.external_execution_required and tool.result is not None and tool.external_execution_result_provided is None:
+        tool.external_execution_result_provided = True
+
+
+def _is_requirement_resolved(requirement: RunRequirement) -> bool:
+    try:
+        return requirement.is_resolved()
+    except Exception:
+        return False
+
+
+def _requirements_have_same_tool_call(target: RunRequirement, source: RunRequirement) -> bool:
+    target_tool = getattr(target, "tool_execution", None)
+    source_tool = getattr(source, "tool_execution", None)
+    target_tool_call_id = getattr(target_tool, "tool_call_id", None)
+    source_tool_call_id = getattr(source_tool, "tool_call_id", None)
+    return target_tool_call_id is not None and target_tool_call_id == source_tool_call_id
+
+
+def _find_requirement_resolution_target(
+    existing_requirements: List[RunRequirement],
+    source: RunRequirement,
+    matched_existing_ids: set[int],
+) -> Optional[RunRequirement]:
+    source_id = getattr(source, "id", None)
+    if source_id is not None:
+        exact_match = next(
+            (
+                existing
+                for existing in existing_requirements
+                if id(existing) not in matched_existing_ids and getattr(existing, "id", None) == source_id
+            ),
+            None,
+        )
+        if exact_match is not None:
+            return exact_match
+
+    candidates = [
+        existing
+        for existing in existing_requirements
+        if id(existing) not in matched_existing_ids and _requirements_have_same_tool_call(existing, source)
+    ]
+    if not candidates:
+        return None
+
+    unresolved_candidates = [candidate for candidate in candidates if not _is_requirement_resolved(candidate)]
+    if unresolved_candidates:
+        return unresolved_candidates[-1]
+    return candidates[-1]
+
+
+def _sync_run_response_tools_from_requirements(run_response: RunOutput, requirements: List[RunRequirement]) -> None:
+    unresolved_requirement_tools = [
+        req.tool_execution
+        for req in requirements
+        if req.tool_execution is not None and not _is_requirement_resolved(req)
+    ]
+    requirement_tools = unresolved_requirement_tools or [
+        req.tool_execution for req in requirements if req.tool_execution is not None
+    ]
+    if not requirement_tools:
+        return
+
+    if not run_response.tools:
+        run_response.tools = requirement_tools
+        return
+
+    synced_tools = list(run_response.tools)
+    current_tool_object_ids = {id(tool) for tool in synced_tools}
+    requirement_tools = sorted(requirement_tools, key=lambda tool: id(tool) not in current_tool_object_ids)
+    matched_tool_indexes: set[int] = set()
+    for requirement_tool in requirement_tools:
+        matched = False
+        for index, existing_tool in enumerate(synced_tools):
+            if index in matched_tool_indexes:
+                continue
+            if existing_tool is requirement_tool:
+                matched_tool_indexes.add(index)
+                matched = True
+                break
+            if (
+                existing_tool.tool_call_id is not None
+                and requirement_tool.tool_call_id is not None
+                and existing_tool.tool_call_id == requirement_tool.tool_call_id
+            ):
+                synced_tools[index] = requirement_tool
+                matched_tool_indexes.add(index)
+                matched = True
+                break
+        if (
+            not matched
+            and requirement_tool.tool_call_id is not None
+            and not any(
+                existing_tool.tool_call_id == requirement_tool.tool_call_id
+                for existing_tool in synced_tools
+                if existing_tool.tool_call_id is not None
+            )
+        ):
+            synced_tools.append(requirement_tool)
+
+    run_response.tools = synced_tools
+
+
+def _find_matching_tool(tool_execution: ToolExecution, tools: Optional[List[ToolExecution]]) -> Optional[ToolExecution]:
+    if not tools or tool_execution.tool_call_id is None:
+        return None
+
+    return next(
+        (tool for tool in tools if tool.tool_call_id is not None and tool.tool_call_id == tool_execution.tool_call_id),
+        None,
+    )
+
+
+def _hydrate_requirement_tool_context_from_run_tools(
+    requirements: List[RunRequirement], tools: Optional[List[ToolExecution]]
+) -> None:
+    for requirement in requirements:
+        if requirement.tool_execution is None:
+            continue
+
+        matching_tool = _find_matching_tool(requirement.tool_execution, tools)
+        if matching_tool is None or matching_tool is requirement.tool_execution:
+            continue
+
+        _apply_tool_resolution_to_tool(matching_tool, requirement.tool_execution)
+        requirement.tool_execution = matching_tool
+
+
+def _run_response_has_unresolved_requirements(run_response: RunOutput) -> bool:
+    return bool(run_response.requirements and any(not req.is_resolved() for req in run_response.requirements))
+
+
+def _run_response_has_paused_tools(run_response: RunOutput) -> bool:
+    if run_response.requirements:
+        return False
+    return bool(any(tool_call.is_paused for tool_call in run_response.tools or []))
+
+
+def _run_response_is_paused(run_response: RunOutput) -> bool:
+    return _run_response_has_unresolved_requirements(run_response) or _run_response_has_paused_tools(run_response)
+
+
+def _apply_tool_resolution_payload(
+    run_response: RunOutput,
+    *,
+    updated_tools: Optional[List[ToolExecution]] = None,
+    requirements: Optional[List[Any]] = None,
+) -> None:
+    if updated_tools is not None:
+        if run_response.tools:
+            existing_tools = list(run_response.tools)
+            merged_tools = list(existing_tools)
+            matched_indexes: set[int] = set()
+            for updated_tool in updated_tools:
+                _normalize_legacy_tool_resolution(updated_tool)
+                for index, existing_tool in enumerate(existing_tools):
+                    if index in matched_indexes:
+                        continue
+                    if (
+                        existing_tool.tool_call_id is not None
+                        and updated_tool.tool_call_id is not None
+                        and existing_tool.tool_call_id == updated_tool.tool_call_id
+                    ):
+                        _carry_stored_tool_context(updated_tool, existing_tool)
+                        merged_tools[index] = updated_tool
+                        matched_indexes.add(index)
+                        break
+                else:
+                    merged_tools.append(updated_tool)
+            run_response.tools = merged_tools
+        else:
+            for updated_tool in updated_tools:
+                _normalize_legacy_tool_resolution(updated_tool)
+            run_response.tools = updated_tools
+
+        if run_response.requirements:
+            matched_updated_requirement_ids: set[int] = set()
+            existing_requirements = list(run_response.requirements)
+            for updated_tool in run_response.tools:
+                source = RunRequirement(updated_tool)
+                target = _find_requirement_resolution_target(
+                    existing_requirements, source, matched_updated_requirement_ids
+                )
+                if target is None:
+                    continue
+                matched_updated_requirement_ids.add(id(target))
+                target.tool_execution = updated_tool
+                _apply_tool_resolution_to_requirement(target, updated_tool)
+            _sync_run_response_tools_from_requirements(run_response, existing_requirements)
+        return
+
+    if requirements is None:
+        return
+
+    normalized_requirements = _normalize_requirements_payload(requirements)
+    _hydrate_requirement_tool_context_from_run_tools(normalized_requirements, run_response.tools)
+    existing_requirements = list(run_response.requirements or [])
+    if not existing_requirements:
+        run_response.requirements = normalized_requirements
+        _sync_run_response_tools_from_requirements(run_response, normalized_requirements)
+        return
+
+    matched_requirement_ids: set[int] = set()
+    merged_requirements = list(existing_requirements)
+    for source in normalized_requirements:
+        target = _find_requirement_resolution_target(existing_requirements, source, matched_requirement_ids)
+        if target is None:
+            merged_requirements.append(source)
+            continue
+
+        matched_requirement_ids.add(id(target))
+        _apply_requirement_resolution(target, source)
+
+    run_response.requirements = merged_requirements
+    _sync_run_response_tools_from_requirements(run_response, merged_requirements)
+
 
 # ---------------------------------------------------------------------------
 # Run dependency resolution
@@ -205,6 +570,39 @@ async def aresolve_run_dependencies(agent: Agent, run_context: RunContext) -> No
 # ---------------------------------------------------------------------------
 
 
+def _get_agent_paused_content(run_response: RunOutput) -> str:
+    active_requirements = [req for req in run_response.requirements or [] if not req.is_resolved()]
+    if active_requirements:
+        parts: List[str] = []
+        for req in active_requirements:
+            tool_execution = req.tool_execution
+            tool_name = tool_execution.tool_name if tool_execution else "unknown"
+            if req.needs_confirmation:
+                parts.append(f"- {tool_name} requires confirmation")
+            elif req.needs_user_input:
+                parts.append(f"- {tool_name} requires user input")
+            elif req.needs_external_execution:
+                parts.append(f"- {tool_name} requires external execution")
+        if parts:
+            return "Run paused. The following require input:\n" + "\n".join(parts)
+
+    paused_tools = [tool for tool in run_response.tools or [] if getattr(tool, "is_paused", False)]
+    if paused_tools:
+        parts = []
+        for tool in paused_tools:
+            tool_name = tool.tool_name or "unknown"
+            if tool.requires_confirmation:
+                parts.append(f"- {tool_name} requires confirmation")
+            elif tool.requires_user_input:
+                parts.append(f"- {tool_name} requires user input")
+            elif tool.external_execution_required:
+                parts.append(f"- {tool_name} requires external execution")
+        if parts:
+            return "Run paused. The following require input:\n" + "\n".join(parts)
+
+    return "Run paused."
+
+
 def handle_agent_run_paused(
     agent: Agent,
     run_response: RunOutput,
@@ -213,12 +611,23 @@ def handle_agent_run_paused(
     run_context: Optional[RunContext] = None,
 ) -> RunOutput:
     run_response.status = RunStatus.paused
-    if not run_response.content:
-        run_response.content = get_paused_content(run_response)
+    if run_response.content is None:
+        run_response.content = _get_agent_paused_content(run_response)
 
     # Stamp approval_id on tools before storing so the DB has the complete data.
     create_approval_from_pause(
         db=agent.db, run_response=run_response, agent_id=agent.id, agent_name=agent.name, user_id=user_id
+    )
+
+    handle_event(
+        create_run_paused_event(
+            from_run_response=run_response,
+            tools=run_response.tools,
+            requirements=run_response.requirements,
+        ),
+        run_response,
+        events_to_skip=agent.events_to_skip,  # type: ignore
+        store_events=agent.store_events,
     )
 
     cleanup_and_store(agent, run_response=run_response, session=session, run_context=run_context, user_id=user_id)
@@ -238,8 +647,8 @@ def handle_agent_run_paused_stream(
     yield_run_output: bool = False,
 ) -> Iterator[Union[RunOutputEvent, RunOutput]]:
     run_response.status = RunStatus.paused
-    if not run_response.content:
-        run_response.content = get_paused_content(run_response)
+    if run_response.content is None:
+        run_response.content = _get_agent_paused_content(run_response)
 
     # Stamp approval_id on tools before storing so the DB has the complete data.
     create_approval_from_pause(
@@ -277,13 +686,25 @@ async def ahandle_agent_run_paused(
     run_context: Optional[RunContext] = None,
 ) -> RunOutput:
     run_response.status = RunStatus.paused
-    if not run_response.content:
-        run_response.content = get_paused_content(run_response)
+    if run_response.content is None:
+        run_response.content = _get_agent_paused_content(run_response)
 
     # Stamp approval_id on tools before storing so the DB has the complete data.
     await acreate_approval_from_pause(
         db=agent.db, run_response=run_response, agent_id=agent.id, agent_name=agent.name, user_id=user_id
     )
+
+    handle_event(
+        create_run_paused_event(
+            from_run_response=run_response,
+            tools=run_response.tools,
+            requirements=run_response.requirements,
+        ),
+        run_response,
+        events_to_skip=agent.events_to_skip,  # type: ignore
+        store_events=agent.store_events,
+    )
+
     await acleanup_and_store(
         agent, run_response=run_response, session=session, run_context=run_context, user_id=user_id
     )
@@ -303,8 +724,8 @@ async def ahandle_agent_run_paused_stream(
     yield_run_output: bool = False,
 ) -> AsyncIterator[Union[RunOutputEvent, RunOutput]]:
     run_response.status = RunStatus.paused
-    if not run_response.content:
-        run_response.content = get_paused_content(run_response)
+    if run_response.content is None:
+        run_response.content = _get_agent_paused_content(run_response)
 
     # Stamp approval_id on tools before storing so the DB has the complete data.
     await acreate_approval_from_pause(
@@ -537,6 +958,7 @@ def _run(
                     tool_call_limit=agent.tool_call_limit,
                     response_format=response_format,
                     run_response=run_response,
+                    run_context=run_context,
                     send_media_to_model=agent.send_media_to_model,
                     compression_manager=agent.compression_manager if agent.compress_tool_results else None,
                     after_tool_results=build_after_tool_results_callback(
@@ -569,7 +991,7 @@ def _run(
                 )
 
                 # We should break out of the run function
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     wait_for_open_threads(
                         memory_future=memory_future,  # type: ignore
                         cultural_knowledge_future=cultural_knowledge_future,  # type: ignore
@@ -715,10 +1137,11 @@ def _run(
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
 
                 # If the content is None, set it to the error message
+                error_msg = _describe_exception(e)
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -1032,7 +1455,7 @@ def _run_stream(
                     yield event
 
                 # We should break out of the run function
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     yield from wait_for_thread_tasks_stream(
                         memory_future=memory_future,  # type: ignore
                         cultural_knowledge_future=cultural_knowledge_future,  # type: ignore
@@ -1253,14 +1676,15 @@ def _run_stream(
                 run_response.status = RunStatus.error
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
                 # Add error event to list of events
-                run_error = create_run_error_event(run_response, error=str(e))
+                error_msg = _describe_exception(e)
+                run_error = create_run_error_event(run_response, error=error_msg)
                 run_response.events = add_error_event(error=run_error, events=run_response.events)
 
                 # If the content is None, set it to the error message
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -1677,6 +2101,7 @@ async def _arun(
                     response_format=response_format,
                     send_media_to_model=agent.send_media_to_model,
                     run_response=run_response,
+                    run_context=run_context,
                     compression_manager=agent.compression_manager if agent.compress_tool_results else None,
                     after_tool_results=abuild_after_tool_results_callback(
                         agent,
@@ -1714,7 +2139,7 @@ async def _arun(
                 )
 
                 # We should break out of the run function
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     await await_for_open_threads(
                         memory_task=memory_task,
                         cultural_knowledge_task=cultural_knowledge_task,
@@ -1875,10 +2300,11 @@ async def _arun(
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
 
                 # If the content is None, set it to the error message
+                error_msg = _describe_exception(e)
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -2441,7 +2867,7 @@ async def _arun_stream(
                     )
 
                 # Break out of the run function if a tool call is paused
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     async for item in await_for_thread_tasks_stream(
                         memory_task=memory_task,
                         cultural_knowledge_task=cultural_knowledge_task,
@@ -2682,14 +3108,15 @@ async def _arun_stream(
                 run_response.status = RunStatus.error
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
                 # Add error event to list of events
-                run_error = create_run_error_event(run_response, error=str(e))
+                error_msg = _describe_exception(e)
+                run_error = create_run_error_event(run_response, error=error_msg)
                 run_response.events = add_error_event(error=run_error, events=run_response.events)
 
                 # If the content is None, set it to the error message
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -3368,6 +3795,7 @@ def continue_run_dispatch(
     if run_response is not None:
         if run_response.status == RunStatus.cancelled:
             raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+        approval_lookup_run_id = run_response.run_id
         # The run is continued from a provided run_response. This contains the updated tools.
         continue_index: Optional[int] = _resolve_continue_from(
             run_response,
@@ -3399,6 +3827,23 @@ def continue_run_dispatch(
                         r.status = RunStatus.regenerated
                         break
         input_messages = run_response.messages or []
+        if updated_tools is not None:
+            warnings.warn(
+                "The 'updated_tools' parameter is deprecated and will be removed in future versions. Use 'requirements' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        _apply_tool_resolution_payload(run_response, updated_tools=updated_tools, requirements=requirements)
+        if updated_tools is None and requirements is None and _run_response_is_paused(run_response):
+            if approval_lookup_run_id is None:
+                raise RunNotFoundError("Cannot resolve approval for a run without a run_id")
+            try:
+                check_and_apply_approval_resolution(agent.db, approval_lookup_run_id, run_response)
+            except RuntimeError:
+                raise ValueError(
+                    "Run has unresolved HITL requirements. Provide the `requirements` parameter "
+                    "(or resolve an admin approval first)."
+                )
     elif run_id is not None:
         # The run is continued from a run_id.
         runs = agent_session.runs or []
@@ -3462,18 +3907,11 @@ def continue_run_dispatch(
                 DeprecationWarning,
                 stacklevel=2,
             )
-            run_response.tools = updated_tools
-            _sync_requirements_with_tools(run_response, updated_tools)
+            _apply_tool_resolution_payload(run_response, updated_tools=updated_tools)
 
         # If we have requirements, get the updated tools and set them in the run_response
         elif requirements is not None:
-            run_response.requirements = requirements
-            updated_tools = [req.tool_execution for req in requirements if req.tool_execution is not None]
-            if updated_tools and run_response.tools:
-                updated_tools_map = {tool.tool_call_id: tool for tool in updated_tools}
-                run_response.tools = [updated_tools_map.get(tool.tool_call_id, tool) for tool in run_response.tools]
-            else:
-                run_response.tools = updated_tools
+            _apply_tool_resolution_payload(run_response, requirements=requirements)
 
         else:
             # No tools / requirements in the body. Two cases:
@@ -3485,8 +3923,6 @@ def continue_run_dispatch(
             #    (ADR-003, ADR-004).
             has_unresolved_requirements = any(not req.is_resolved() for req in (run_response.requirements or []))
             if has_unresolved_requirements:
-                from agno.run.approval import check_and_apply_approval_resolution
-
                 try:
                     # This will apply resolution_data to tools if approval is resolved.
                     # Approval lookup still uses the ORIGINAL run_id, even when we
@@ -3622,8 +4058,23 @@ def _continue_run(
 
     agent.model = cast(Model, agent.model)
 
+    handle_event(
+        create_run_continued_event(run_response),
+        run_response,
+        events_to_skip=agent.events_to_skip,  # type: ignore
+        store_events=agent.store_events,
+    )
+
     # 1. Handle the updated tools
     handle_tool_call_updates(agent, run_response=run_response, run_messages=run_messages, tools=tools)
+    if _run_response_is_paused(run_response):
+        try:
+            return handle_agent_run_paused(
+                agent, run_response=run_response, session=session, run_context=run_context, user_id=user_id
+            )
+        finally:
+            disconnect_connectable_tools(agent)
+            cleanup_run(run_response.run_id)  # type: ignore
 
     try:
         num_attempts = agent.retries + 1
@@ -3643,6 +4094,7 @@ def _continue_run(
                     tool_choice=agent.tool_choice,
                     tool_call_limit=agent.tool_call_limit,
                     run_response=run_response,
+                    run_context=run_context,
                     send_media_to_model=agent.send_media_to_model,
                     compression_manager=agent.compression_manager if agent.compress_tool_results else None,
                     after_tool_results=build_after_tool_results_callback(
@@ -3675,7 +4127,7 @@ def _continue_run(
                 )
 
                 # We should break out of the run function
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     return handle_agent_run_paused(
                         agent, run_response=run_response, session=session, run_context=run_context, user_id=user_id
                     )
@@ -3782,10 +4234,11 @@ def _continue_run(
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
 
                 # If the content is None, set it to the error message
+                error_msg = _describe_exception(e)
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 cleanup_and_store(
@@ -3848,14 +4301,17 @@ def _continue_run_stream(
                 if run_context.dependencies is not None:
                     resolve_run_dependencies(agent, run_context=run_context)
 
-                # Start the Run by yielding a RunContinued event
-                if stream_events:
-                    yield handle_event(  # type: ignore
+                run_continued_event = cast(
+                    RunOutputEvent,
+                    handle_event(  # type: ignore
                         create_run_continued_event(run_response),
                         run_response,
                         events_to_skip=agent.events_to_skip,  # type: ignore
                         store_events=agent.store_events,
-                    )
+                    ),
+                )
+                if stream_events:
+                    yield run_continued_event
 
                 # 2. Handle the updated tools
                 for event in handle_tool_call_updates_stream(
@@ -3868,6 +4324,16 @@ def _continue_run_stream(
                     if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
                         raise_if_cancelled(run_response.run_id)  # type: ignore
                     yield event
+                if _run_response_is_paused(run_response):
+                    yield from handle_agent_run_paused_stream(
+                        agent,
+                        run_response=run_response,
+                        session=session,
+                        run_context=run_context,
+                        user_id=user_id,
+                        yield_run_output=yield_run_output or False,
+                    )
+                    return
 
                 # 3. Process model response
                 for event in handle_model_response_stream(
@@ -3917,7 +4383,7 @@ def _continue_run_stream(
                     )
 
                 # We should break out of the run function
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     yield from handle_agent_run_paused_stream(
                         agent,
                         run_response=run_response,
@@ -4089,14 +4555,15 @@ def _continue_run_stream(
                 run_response.status = RunStatus.error
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
                 # Add error event to list of events
-                run_error = create_run_error_event(run_response, error=str(e))
+                error_msg = _describe_exception(e)
+                run_error = create_run_error_event(run_response, error=error_msg)
                 run_response.events = add_error_event(error=run_error, events=run_response.events)
 
                 # If the content is None, set it to the error message
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 cleanup_and_store(
@@ -4563,6 +5030,7 @@ async def _acontinue_run(
                 if run_response is not None:
                     if run_response.status == RunStatus.cancelled:
                         raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+                    approval_lookup_run_id = run_response.run_id
                     # The run is continued from a provided run_response. This contains the updated tools.
                     continue_index: Optional[int] = _resolve_continue_from(
                         run_response,
@@ -4590,6 +5058,17 @@ async def _acontinue_run(
                                     r.status = RunStatus.regenerated
                                     break
                     input_messages = run_response.messages or []
+                    _apply_tool_resolution_payload(run_response, updated_tools=updated_tools, requirements=requirements)
+                    if updated_tools is None and requirements is None and _run_response_is_paused(run_response):
+                        if approval_lookup_run_id is None:
+                            raise RunNotFoundError("Cannot resolve approval for a run without a run_id")
+                        try:
+                            await acheck_and_apply_approval_resolution(agent.db, approval_lookup_run_id, run_response)
+                        except RuntimeError:
+                            raise ValueError(
+                                "Run has unresolved HITL requirements. Provide the `requirements` parameter "
+                                "(or resolve an admin approval first)."
+                            )
                 elif run_id is not None:
                     # The run is continued from a run_id.
                     runs = agent_session.runs or []
@@ -4641,20 +5120,11 @@ async def _acontinue_run(
 
                     # If we have updated_tools, set them in the run_response
                     if updated_tools is not None:
-                        run_response.tools = updated_tools
-                        _sync_requirements_with_tools(run_response, updated_tools)
+                        _apply_tool_resolution_payload(run_response, updated_tools=updated_tools)
 
                     # If we have requirements, get the updated tools and set them in the run_response
                     elif requirements is not None:
-                        run_response.requirements = requirements
-                        updated_tools = [req.tool_execution for req in requirements if req.tool_execution is not None]
-                        if updated_tools and run_response.tools:
-                            updated_tools_map = {tool.tool_call_id: tool for tool in updated_tools}
-                            run_response.tools = [
-                                updated_tools_map.get(tool.tool_call_id, tool) for tool in run_response.tools
-                            ]
-                        else:
-                            run_response.tools = updated_tools
+                        _apply_tool_resolution_payload(run_response, requirements=requirements)
 
                     else:
                         # No tools / requirements in the body. Two cases:
@@ -4667,8 +5137,6 @@ async def _acontinue_run(
                             not req.is_resolved() for req in (run_response.requirements or [])
                         )
                         if has_unresolved_requirements:
-                            from agno.run.approval import acheck_and_apply_approval_resolution
-
                             try:
                                 # This will apply resolution_data to tools if approval is resolved
                                 await acheck_and_apply_approval_resolution(agent.db, run_id, run_response)
@@ -4724,10 +5192,25 @@ async def _acontinue_run(
                 # Register run for cancellation tracking
                 await aregister_run(run_response.run_id)  # type: ignore
 
+                handle_event(
+                    create_run_continued_event(run_response),
+                    run_response,
+                    events_to_skip=agent.events_to_skip,  # type: ignore
+                    store_events=agent.store_events,
+                )
+
                 # 7. Handle the updated tools
                 await ahandle_tool_call_updates(
                     agent, run_response=run_response, run_messages=run_messages, tools=_tools
                 )
+                if _run_response_is_paused(run_response):
+                    return await ahandle_agent_run_paused(
+                        agent,
+                        run_response=run_response,
+                        session=agent_session,
+                        run_context=run_context,
+                        user_id=user_id,
+                    )
 
                 # 8. Get model response
                 model_response: ModelResponse = await acall_model_with_fallback(
@@ -4739,6 +5222,7 @@ async def _acontinue_run(
                     tool_choice=agent.tool_choice,
                     tool_call_limit=agent.tool_call_limit,
                     run_response=run_response,
+                    run_context=run_context,
                     send_media_to_model=agent.send_media_to_model,
                     compression_manager=agent.compression_manager if agent.compress_tool_results else None,
                     after_tool_results=abuild_after_tool_results_callback(
@@ -4776,7 +5260,7 @@ async def _acontinue_run(
                 )
 
                 # Break out of the run function if a tool call is paused
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     return await ahandle_agent_run_paused(
                         agent,
                         run_response=run_response,
@@ -4932,14 +5416,15 @@ async def _acontinue_run(
                 run_response.status = RunStatus.error
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
                 # Add error event to list of events
-                run_error = create_run_error_event(run_response, error=str(e))  # type: ignore
+                error_msg = _describe_exception(e)
+                run_error = create_run_error_event(run_response, error=error_msg)  # type: ignore
                 run_response.events = add_error_event(error=run_error, events=run_response.events)  # type: ignore
 
                 # If the content is None, set it to the error message
                 if run_response.content is None:  # type: ignore
-                    run_response.content = str(e)  # type: ignore
+                    run_response.content = error_msg  # type: ignore
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -5053,6 +5538,7 @@ async def _acontinue_run_stream(
                 if run_response is not None:
                     if run_response.status == RunStatus.cancelled:
                         raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+                    approval_lookup_run_id = run_response.run_id
                     # The run is continued from a provided run_response. This contains the updated tools.
                     continue_index: Optional[int] = _resolve_continue_from(
                         run_response,
@@ -5080,6 +5566,17 @@ async def _acontinue_run_stream(
                                     r.status = RunStatus.regenerated
                                     break
                     input_messages = run_response.messages or []
+                    _apply_tool_resolution_payload(run_response, updated_tools=updated_tools, requirements=requirements)
+                    if updated_tools is None and requirements is None and _run_response_is_paused(run_response):
+                        if approval_lookup_run_id is None:
+                            raise RunNotFoundError("Cannot resolve approval for a run without a run_id")
+                        try:
+                            await acheck_and_apply_approval_resolution(agent.db, approval_lookup_run_id, run_response)
+                        except RuntimeError:
+                            raise ValueError(
+                                "Run has unresolved HITL requirements. Provide the `requirements` parameter "
+                                "(or resolve an admin approval first)."
+                            )
 
                 elif run_id is not None:
                     # The run is continued from a run_id.
@@ -5132,20 +5629,11 @@ async def _acontinue_run_stream(
 
                     # If we have updated_tools, set them in the run_response
                     if updated_tools is not None:
-                        run_response.tools = updated_tools
-                        _sync_requirements_with_tools(run_response, updated_tools)
+                        _apply_tool_resolution_payload(run_response, updated_tools=updated_tools)
 
                     # If we have requirements, get the updated tools and set them in the run_response
                     elif requirements is not None:
-                        run_response.requirements = requirements
-                        updated_tools = [req.tool_execution for req in requirements if req.tool_execution is not None]
-                        if updated_tools and run_response.tools:
-                            updated_tools_map = {tool.tool_call_id: tool for tool in updated_tools}
-                            run_response.tools = [
-                                updated_tools_map.get(tool.tool_call_id, tool) for tool in run_response.tools
-                            ]
-                        else:
-                            run_response.tools = updated_tools
+                        _apply_tool_resolution_payload(run_response, requirements=requirements)
 
                     else:
                         # No tools / requirements in the body. Two cases:
@@ -5158,8 +5646,6 @@ async def _acontinue_run_stream(
                             not req.is_resolved() for req in (run_response.requirements or [])
                         )
                         if has_unresolved_requirements:
-                            from agno.run.approval import acheck_and_apply_approval_resolution
-
                             try:
                                 # This will apply resolution_data to tools if approval is resolved
                                 await acheck_and_apply_approval_resolution(agent.db, run_id, run_response)
@@ -5215,14 +5701,17 @@ async def _acontinue_run_stream(
                 # Register run for cancellation tracking
                 await aregister_run(run_response.run_id)  # type: ignore
 
-                # Start the Run by yielding a RunContinued event
-                if stream_events:
-                    yield handle_event(  # type: ignore
+                run_continued_event = cast(
+                    RunOutputEvent,
+                    handle_event(  # type: ignore
                         create_run_continued_event(run_response),
                         run_response,
                         events_to_skip=agent.events_to_skip,  # type: ignore
                         store_events=agent.store_events,
-                    )
+                    ),
+                )
+                if stream_events:
+                    yield run_continued_event
 
                 # 7. Handle the updated tools
                 async for event in ahandle_tool_call_updates_stream(
@@ -5235,6 +5724,17 @@ async def _acontinue_run_stream(
                     if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
                         await araise_if_cancelled(run_response.run_id)  # type: ignore
                     yield event
+                if _run_response_is_paused(run_response):
+                    async for item in ahandle_agent_run_paused_stream(
+                        agent,
+                        run_response=run_response,
+                        session=agent_session,
+                        run_context=run_context,
+                        user_id=user_id,
+                        yield_run_output=yield_run_output or False,
+                    ):
+                        yield item
+                    return
 
                 # 8. Process model response
                 if agent.output_model is None:
@@ -5325,7 +5825,7 @@ async def _acontinue_run_stream(
                     )
 
                 # Break out of the run function if a tool call is paused
-                if any(tool_call.is_paused for tool_call in run_response.tools or []):
+                if _run_response_is_paused(run_response):
                     async for item in ahandle_agent_run_paused_stream(
                         agent,
                         run_response=run_response,
@@ -5543,14 +6043,15 @@ async def _acontinue_run_stream(
                 run_response.status = RunStatus.error
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
                 # Add error event to list of events
-                run_error = create_run_error_event(run_response, error=str(e))
+                error_msg = _describe_exception(e)
+                run_error = create_run_error_event(run_response, error=error_msg)
                 run_response.events = add_error_event(error=run_error, events=run_response.events)
 
                 # If the content is None, set it to the error message
                 if run_response.content is None:
-                    run_response.content = str(e)
+                    run_response.content = error_msg
 
-                log_error(f"Error in Agent run: {str(e)}")
+                log_error(f"Error in Agent run: {error_msg}")
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -5635,6 +6136,77 @@ def scrub_run_output_for_storage(agent: Agent, run_response: RunOutput) -> None:
         scrub_history_messages_from_run_output(run_response)
 
 
+def _get_tool_call_response_ids(tool_call: Dict[str, Any]) -> set[str]:
+    """Return all ids that may identify the same tool call result."""
+    response_ids: set[str] = set()
+
+    tool_call_id = tool_call.get("id")
+    if isinstance(tool_call_id, str):
+        response_ids.add(tool_call_id)
+
+    call_id = tool_call.get("call_id")
+    if isinstance(call_id, str):
+        response_ids.add(call_id)
+
+    return response_ids
+
+
+def repair_orphaned_tool_calls(run_response: RunOutput) -> None:
+    """Add synthetic tool-result messages for any tool calls that have no response.
+
+    When a run is cancelled mid-execution a tool call may have been emitted by the
+    model but the corresponding tool-result message was never appended.  If the run
+    is later included in history (``include_cancelled_history=True``) the provider
+    will reject the message list with an error like:
+    "An assistant message with 'tool_calls' must be followed by tool messages
+    responding to each 'tool_call_id'."
+
+    This function repairs the message list in-place by injecting a placeholder
+    tool-result message for every orphaned tool_call_id.
+    """
+    if not run_response.is_cancelled:
+        return
+
+    if not run_response.messages:
+        return
+
+    # Collect tool_call_ids that already have a result message.
+    answered_ids: set[str] = set()
+    for msg in run_response.messages:
+        if msg.role == "tool" and msg.tool_call_id:
+            answered_ids.add(msg.tool_call_id)
+
+    # Walk the message list and insert synthetic results right after each
+    # assistant message that contains unanswered tool calls.
+    patched: List[Message] = []
+    for msg in run_response.messages:
+        patched.append(msg)
+        if msg.role == "assistant" and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                response_ids = _get_tool_call_response_ids(tool_call)
+                if not response_ids:
+                    continue
+
+                if not response_ids.intersection(answered_ids):
+                    call_id = tool_call.get("id") or tool_call.get("call_id")
+                    if not isinstance(call_id, str):
+                        continue
+
+                    function_name = tool_call.get("function", {}).get("name", "unknown")
+                    patched.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=call_id,
+                            content=f"Tool call '{function_name}' was cancelled before it could complete.",
+                            tool_call_error=True,
+                            from_history=msg.from_history,
+                        )
+                    )
+                answered_ids.update(response_ids)
+
+    run_response.messages = patched
+
+
 def _normalize_cancellation_reason(
     run_response: RunOutput,
     error: Union[RunCancelledException, KeyboardInterrupt],
@@ -5651,12 +6223,9 @@ def _handle_run_cancellation(
     run_messages: Optional["RunMessages"] = None,
 ) -> RunOutput:
     """Prepare a run response for cancellation: set status, preserve content and messages."""
-    reason = _normalize_cancellation_reason(run_response, error)
     log_debug(f"Run {run_response.run_id} was cancelled")
     run_response.status = RunStatus.cancelled
     has_partial_content = bool(run_response.content)
-    if not run_response.content:
-        run_response.content = reason
     if run_response.messages is None and run_messages is not None:
         messages_for_run_response = [msg for msg in run_messages.messages if msg.add_to_agent_memory]
         # Preserve partial streamed content as the assistant message, filling an empty trailing one if present
@@ -5742,6 +6311,7 @@ def _scrub_and_propagate_session_state(
     """
     import copy
 
+    repair_orphaned_tool_calls(run_response)
     storage_copy = copy.copy(run_response)
     if isolate_inflight and not agent.store_media:
         isolate_media_scrub_targets(storage_copy)

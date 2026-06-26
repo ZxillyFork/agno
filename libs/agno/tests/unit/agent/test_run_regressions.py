@@ -1,11 +1,15 @@
 import inspect
 from typing import Any, Optional
+from unittest.mock import AsyncMock
 
 import pytest
 
-from agno.agent import _init, _messages, _response, _run, _session, _storage, _tools
+from agno.agent import _init, _messages, _response, _run, _session, _storage, _telemetry, _tools
 from agno.agent.agent import Agent
 from agno.db.base import SessionType
+from agno.exceptions import RunCancelledException
+from agno.models.message import Message
+from agno.models.response import ModelResponse, ToolExecution
 from agno.run import RunContext
 from agno.run.agent import RunErrorEvent, RunOutput
 from agno.run.base import RunStatus
@@ -20,6 +24,7 @@ from agno.run.cancel import (
 )
 from agno.run.cancellation_management.in_memory_cancellation_manager import InMemoryRunCancellationManager
 from agno.run.messages import RunMessages
+from agno.run.requirement import RunRequirement
 from agno.session import AgentSession
 
 
@@ -31,6 +36,122 @@ def reset_cancellation_manager():
         yield
     finally:
         set_cancellation_manager(original_manager)
+
+
+def _orphaned_tool_call_messages() -> list[Message]:
+    return [
+        Message(
+            role="assistant",
+            content="Calling a tool",
+            tool_calls=[
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "send_email",
+                        "arguments": '{"to":"john@doe.com"}',
+                    },
+                }
+            ],
+        )
+    ]
+
+
+def test_repair_orphaned_tool_calls_only_runs_for_cancelled_status():
+    run_response = RunOutput(
+        status=RunStatus.cancelled,
+        messages=_orphaned_tool_call_messages(),
+    )
+
+    _run.repair_orphaned_tool_calls(run_response)
+
+    assert run_response.messages is not None
+    assert len(run_response.messages) == 2
+    assert run_response.messages[1].role == "tool"
+    assert run_response.messages[1].tool_call_id == "call_123"
+    assert run_response.messages[1].tool_call_error is True
+
+
+def test_repair_orphaned_tool_calls_skips_paused_external_execution_runs():
+    run_response = RunOutput(
+        status=RunStatus.paused,
+        messages=_orphaned_tool_call_messages(),
+    )
+
+    _run.repair_orphaned_tool_calls(run_response)
+
+    assert run_response.messages is not None
+    assert len(run_response.messages) == 1
+    assert run_response.messages[0].role == "assistant"
+
+
+def test_repair_orphaned_tool_calls_recognizes_responses_call_id_result():
+    run_response = RunOutput(
+        status=RunStatus.cancelled,
+        messages=[
+            Message(
+                role="assistant",
+                content="Calling a tool",
+                tool_calls=[
+                    {
+                        "id": "fc_123",
+                        "call_id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            ),
+            Message(role="tool", tool_call_id="call_123", content="tool result"),
+        ],
+    )
+
+    _run.repair_orphaned_tool_calls(run_response)
+
+    assert run_response.messages is not None
+    assert len(run_response.messages) == 2
+    assert [msg.tool_call_id for msg in run_response.messages if msg.role == "tool"] == ["call_123"]
+
+
+def test_repair_orphaned_tool_calls_preserves_history_marker_on_synthetic_results():
+    run_response = RunOutput(
+        status=RunStatus.cancelled,
+        messages=[
+            Message(
+                role="assistant",
+                content="Calling a historical tool",
+                from_history=True,
+                tool_calls=[
+                    {
+                        "id": "fc_history",
+                        "call_id": "call_history",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            ),
+            Message(role="user", content="continue"),
+        ],
+    )
+
+    _run.repair_orphaned_tool_calls(run_response)
+
+    assert run_response.messages is not None
+    assert len(run_response.messages) == 3
+    assert run_response.messages[1].role == "tool"
+    assert run_response.messages[1].from_history is True
+
+    _run.scrub_run_output_for_storage(Agent(name="test-agent"), run_response)
+
+    assert run_response.messages is not None
+    assert len(run_response.messages) == 1
+    assert run_response.messages[0].role == "user"
+    assert run_response.messages[0].content == "continue"
 
 
 def _patch_sync_dispatch_dependencies(
@@ -203,6 +324,44 @@ async def test_acontinue_run_stream_yields_error_event_without_attribute_error(
     assert events[0].run_id == run_id
     assert events[0].content is not None
     assert "No runs found for run ID missing-stream-run" in events[0].content
+
+
+@pytest.mark.asyncio
+async def test_ahandle_model_response_stream_preserves_partial_assistant_message_on_cancellation():
+    agent = Agent(name="test-agent")
+
+    class FakeModel:
+        id = "fake-model"
+        provider = "fake-provider"
+
+        async def aresponse_stream(self, **kwargs):
+            yield ModelResponse(content="partial content")
+            raise RunCancelledException("cancelled")
+
+    agent.model = FakeModel()
+    session = AgentSession(session_id="session-1")
+    run_messages = RunMessages(messages=[Message(role="user", content="hello")])
+    run_response = RunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        agent_id=agent.id,
+        agent_name=agent.name,
+    )
+
+    with pytest.raises(RunCancelledException, match="cancelled"):
+        async for _ in _response.ahandle_model_response_stream(
+            agent=agent,
+            session=session,
+            run_response=run_response,
+            run_messages=run_messages,
+        ):
+            pass
+
+    assert run_response.messages is not None
+    assert len(run_response.messages) == 2
+    assert run_response.messages[0].role == "user"
+    assert run_response.messages[1].role == "assistant"
+    assert run_response.messages[1].content == "partial content"
 
 
 @pytest.mark.asyncio
@@ -647,6 +806,348 @@ def test_continue_run_dispatch_respects_run_context_precedence(monkeypatch: pyte
     assert empty_context.metadata == {"agent_meta": "default"}
 
 
+def test_continue_run_dispatch_applies_admin_approval_for_provided_run_response(monkeypatch: pytest.MonkeyPatch):
+    agent = _make_precedence_test_agent()
+    _patch_continue_dispatch_dependencies(agent, monkeypatch)
+    tool_execution = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        approval_type="required",
+        requires_confirmation=True,
+    )
+    run_response = RunOutput(run_id="approved-run", session_id="session-1", messages=[], tools=[tool_execution])
+    applied: dict[str, bool] = {}
+
+    def fake_check_and_apply(db, run_id, run_response):
+        applied["called"] = True
+        tool_execution.confirmed = True
+
+    def fake_continue_run(
+        agent,
+        run_response,
+        run_messages,
+        run_context,
+        session,
+        tools,
+        **kwargs,
+    ):
+        assert run_messages is not None
+        assert run_context is not None
+        assert session is not None
+        assert tools == []
+        return run_response
+
+    monkeypatch.setattr(_run, "check_and_apply_approval_resolution", fake_check_and_apply)
+    monkeypatch.setattr(_run, "_continue_run", fake_continue_run)
+
+    result = _run.continue_run_dispatch(agent=agent, run_response=run_response, stream=False)
+
+    assert result is run_response
+    assert applied["called"] is True
+    assert tool_execution.confirmed is True
+
+
+def test_apply_tool_resolution_payload_merges_partial_requirements():
+    first = RunRequirement(
+        ToolExecution(
+            tool_call_id="call-1",
+            tool_name="first",
+            requires_confirmation=True,
+        )
+    )
+    second = RunRequirement(
+        ToolExecution(
+            tool_call_id="call-2",
+            tool_name="second",
+            requires_confirmation=True,
+        )
+    )
+    resolved_first = RunRequirement(
+        ToolExecution(
+            tool_call_id="call-1",
+            tool_name="first",
+            requires_confirmation=True,
+        )
+    )
+    resolved_first.id = first.id
+    resolved_first.confirm(metadata={"approver": "admin"})
+    run_response = RunOutput(
+        run_id="partial-run",
+        session_id="session-1",
+        messages=[],
+        requirements=[first, second],
+        tools=[first.tool_execution, second.tool_execution],
+    )
+
+    _run._apply_tool_resolution_payload(run_response, requirements=[resolved_first])
+
+    assert run_response.requirements == [first, second]
+    assert run_response.requirements[0].is_resolved()
+    assert not run_response.requirements[1].is_resolved()
+    assert run_response.tools == [first.tool_execution, second.tool_execution]
+
+
+def test_apply_tool_resolution_payload_syncs_deprecated_updated_tools_to_requirements():
+    paused_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    requirement = RunRequirement(paused_tool)
+    updated_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        requires_confirmation=True,
+        confirmed=True,
+        approval_type="required",
+        resume_metadata={"approver": "admin"},
+    )
+    run_response = RunOutput(
+        run_id="legacy-tools-run",
+        session_id="session-1",
+        messages=[],
+        tools=[paused_tool],
+        requirements=[requirement],
+    )
+
+    _run._apply_tool_resolution_payload(run_response, updated_tools=[updated_tool])
+
+    assert run_response.tools == [updated_tool]
+    assert run_response.requirements == [requirement]
+    assert requirement.tool_execution is updated_tool
+    assert requirement.is_resolved()
+    assert requirement.confirmation is True
+    assert requirement.approval_metadata == {"approver": "admin"}
+
+
+def test_apply_tool_resolution_payload_syncs_serialized_updated_tools_to_requirements():
+    paused_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="external",
+        external_execution_required=True,
+    )
+    requirement = RunRequirement.from_dict(RunRequirement(paused_tool).to_dict())
+    updated_tool = ToolExecution.from_dict(
+        {
+            "tool_call_id": "call-1",
+            "tool_name": "external",
+            "external_execution_required": True,
+            "external_execution_result_provided": True,
+            "result": {"ok": True},
+        }
+    )
+    run_response = RunOutput(
+        run_id="serialized-legacy-tools-run",
+        session_id="session-1",
+        messages=[],
+        tools=[paused_tool],
+        requirements=[requirement],
+    )
+
+    _run._apply_tool_resolution_payload(run_response, updated_tools=[updated_tool])
+
+    assert run_response.requirements == [requirement]
+    assert requirement.is_resolved()
+    assert requirement.external_execution_result == {"ok": True}
+    assert requirement.tool_execution.external_execution_result_provided is True
+
+
+def test_deprecated_updated_tools_partial_update_preserves_unresolved_tools():
+    first_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="first",
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    second_tool = ToolExecution(
+        tool_call_id="call-2",
+        tool_name="second",
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    first_requirement = RunRequirement(first_tool)
+    second_requirement = RunRequirement(second_tool)
+    resolved_first = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="first",
+        requires_confirmation=True,
+        approval_type="required",
+        confirmed=True,
+    )
+    run_response = RunOutput(
+        run_id="partial-legacy-tools-run",
+        session_id="session-1",
+        messages=[],
+        tools=[first_tool, second_tool],
+        requirements=[first_requirement, second_requirement],
+    )
+
+    _run._apply_tool_resolution_payload(run_response, updated_tools=[resolved_first])
+
+    assert run_response.tools == [resolved_first, second_tool]
+    assert first_requirement.tool_execution is resolved_first
+    assert second_requirement.tool_execution is second_tool
+    assert first_requirement.is_resolved()
+    assert not second_requirement.is_resolved()
+
+
+def test_deprecated_updated_tools_partial_update_preserves_tool_context_without_requirements():
+    paused_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        tool_args={"path": ".env"},
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    partial_resolution = ToolExecution(tool_call_id="call-1", confirmed=True)
+    run_response = RunOutput(run_id="legacy-partial-run", session_id="session-1", messages=[], tools=[paused_tool])
+
+    _run._apply_tool_resolution_payload(run_response, updated_tools=[partial_resolution])
+
+    assert run_response.tools == [partial_resolution]
+    assert partial_resolution.tool_name == "protected"
+    assert partial_resolution.tool_args == {"path": ".env"}
+    assert partial_resolution.requires_confirmation is True
+    assert partial_resolution.confirmed is True
+
+
+def test_requirements_payload_preserves_tool_context_without_existing_requirements():
+    paused_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        tool_args={"path": ".env"},
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    partial_tool = ToolExecution(tool_call_id="call-1", confirmed=True)
+    partial_requirement = RunRequirement(partial_tool)
+    run_response = RunOutput(run_id="partial-requirement-run", session_id="session-1", messages=[], tools=[paused_tool])
+
+    _run._apply_tool_resolution_payload(run_response, requirements=[partial_requirement])
+
+    assert run_response.tools == [paused_tool]
+    assert run_response.requirements is not None
+    assert run_response.requirements[0].tool_execution is paused_tool
+    assert paused_tool.tool_name == "protected"
+    assert paused_tool.tool_args == {"path": ".env"}
+    assert paused_tool.requires_confirmation is True
+    assert paused_tool.confirmed is True
+
+
+def test_apply_tool_resolution_payload_prefers_latest_unresolved_requirement_for_same_tool_call_id():
+    old_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        requires_confirmation=True,
+        approval_type="required",
+        confirmed=True,
+    )
+    old_requirement = RunRequirement(old_tool)
+    old_requirement.confirmation = True
+    new_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    new_requirement = RunRequirement(new_tool)
+    resolved_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        requires_confirmation=True,
+        approval_type="required",
+        confirmed=True,
+        resume_metadata={"round": 2},
+    )
+    payload_requirement = RunRequirement(resolved_tool)
+    payload_requirement.id = "client-lost-the-active-id"
+    run_response = RunOutput(
+        run_id="same-call-id-run",
+        session_id="session-1",
+        messages=[],
+        tools=[old_tool, new_tool],
+        requirements=[old_requirement, new_requirement],
+    )
+
+    _run._apply_tool_resolution_payload(run_response, requirements=[payload_requirement])
+
+    assert old_requirement.approval_metadata is None
+    assert new_requirement.is_resolved()
+    assert new_requirement.approval_metadata == {"round": 2}
+
+
+def test_requirements_sync_keeps_active_tool_for_repeated_pause_same_tool_call_id():
+    old_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        requires_confirmation=True,
+        approval_type="required",
+        confirmed=True,
+    )
+    old_requirement = RunRequirement(old_tool)
+    old_requirement.confirmation = True
+    new_tool = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        tool_args={"round": 2},
+        requires_confirmation=True,
+        approval_type="required",
+    )
+    new_requirement = RunRequirement(new_tool)
+    payload_requirement = RunRequirement(ToolExecution(tool_call_id="call-1", confirmed=True))
+    run_response = RunOutput(
+        run_id="same-call-id-run",
+        session_id="session-1",
+        messages=[],
+        tools=[new_tool],
+        requirements=[old_requirement, new_requirement],
+    )
+
+    _run._apply_tool_resolution_payload(run_response, requirements=[payload_requirement])
+
+    assert run_response.tools == [new_tool]
+    assert run_response.tools[0].tool_args == {"round": 2}
+    assert new_requirement.tool_execution is new_tool
+    assert new_tool.confirmed is True
+
+
+def test_continue_run_dispatch_stores_run_continued_event(monkeypatch: pytest.MonkeyPatch):
+    agent = _make_precedence_test_agent()
+    _patch_continue_dispatch_dependencies(agent, monkeypatch)
+    monkeypatch.setattr(_init, "disconnect_connectable_tools", lambda agent: None)
+    monkeypatch.setattr(_run, "register_run", lambda run_id: None)
+    monkeypatch.setattr(_run, "cleanup_run", lambda run_id: None)
+    monkeypatch.setattr(_tools, "handle_tool_call_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_run, "call_model_with_fallback", lambda *args, **kwargs: ModelResponse(content="done"))
+    monkeypatch.setattr(_response, "generate_response_with_output_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_response, "parse_response_with_parser_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_response, "update_run_response", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_response, "convert_response_to_structured_format", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_run, "store_media_util", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_response, "generate_followups", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_telemetry, "log_agent_telemetry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_run, "cleanup_and_store", lambda *args, **kwargs: None)
+    agent.store_events = True
+    requirement = RunRequirement(
+        ToolExecution(
+            tool_call_id="call-1",
+            tool_name="protected",
+            approval_type="required",
+            requires_confirmation=True,
+        )
+    )
+    requirement.confirm()
+    run_response = RunOutput(run_id="continued-run", session_id="session-1", messages=[], requirements=[requirement])
+
+    result = _run.continue_run_dispatch(
+        agent=agent, run_response=run_response, stream=False, requirements=[requirement]
+    )
+
+    assert result is run_response
+    assert any(getattr(event, "event", None) == "RunContinued" for event in run_response.events or [])
+
+
 @pytest.mark.asyncio
 async def test_acontinue_run_dispatch_respects_run_context_precedence(monkeypatch: pytest.MonkeyPatch):
     agent = _make_precedence_test_agent()
@@ -729,6 +1230,73 @@ async def test_acontinue_run_dispatch_respects_run_context_precedence(monkeypatc
     assert empty_context.metadata == {"agent_meta": "default"}
 
 
+@pytest.mark.asyncio
+async def test_acontinue_run_dispatch_applies_admin_approval_for_provided_run_response(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = _make_precedence_test_agent()
+    tool_execution = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="protected",
+        approval_type="required",
+        requires_confirmation=True,
+    )
+    run_response = RunOutput(run_id="approved-run", session_id="session-1", messages=[], tools=[tool_execution])
+    applied: dict[str, bool] = {}
+
+    async def fake_check_and_apply(db, run_id, run_response):
+        applied["called"] = True
+        tool_execution.confirmed = True
+
+    async def fake_aread_or_create_session(agent, session_id, user_id=None):
+        return AgentSession(session_id=session_id, user_id=user_id, runs=[])
+
+    async def fake_acall_model_with_fallback(*args, **kwargs):
+        return ModelResponse(content="done")
+
+    async def noop_async(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(agent, "initialize_agent", lambda debug_mode=None: None)
+    monkeypatch.setattr(agent, "aget_tools", AsyncMock(return_value=[]))
+    monkeypatch.setattr(_response, "get_response_format", lambda agent, run_context=None: None)
+    monkeypatch.setattr(_storage, "aread_or_create_session", fake_aread_or_create_session)
+    monkeypatch.setattr(_storage, "load_session_state", lambda agent, session=None, session_state=None: session_state)
+    monkeypatch.setattr(_storage, "update_metadata", lambda agent, session=None: None)
+    monkeypatch.setattr(_tools, "determine_tools_for_model", lambda agent, **kwargs: [])
+    monkeypatch.setattr(
+        _messages, "get_continue_run_messages", lambda agent, input=None, **kwargs: RunMessages(messages=[])
+    )
+    monkeypatch.setattr(_run, "acheck_and_apply_approval_resolution", fake_check_and_apply)
+    monkeypatch.setattr(_run, "aregister_run", noop_async)
+    monkeypatch.setattr(_tools, "ahandle_tool_call_updates", noop_async)
+    monkeypatch.setattr(_run, "acall_model_with_fallback", fake_acall_model_with_fallback)
+    monkeypatch.setattr(_run, "araise_if_cancelled", noop_async)
+    monkeypatch.setattr(_response, "agenerate_response_with_output_model", noop_async)
+    monkeypatch.setattr(_response, "aparse_response_with_parser_model", noop_async)
+    monkeypatch.setattr(
+        _response,
+        "update_run_response",
+        lambda agent, model_response, run_response, run_messages, run_context: setattr(
+            run_response, "content", model_response.content
+        ),
+    )
+    monkeypatch.setattr(_response, "convert_response_to_structured_format", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_response, "agenerate_followups", noop_async)
+    monkeypatch.setattr(_run, "store_media_util", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_run, "acleanup_and_store", noop_async)
+    monkeypatch.setattr(_telemetry, "alog_agent_telemetry", noop_async)
+    monkeypatch.setattr(_init, "disconnect_connectable_tools", lambda agent: None)
+    monkeypatch.setattr(_init, "disconnect_mcp_tools", noop_async)
+    monkeypatch.setattr(_run, "acleanup_run", noop_async)
+
+    result = await _run.acontinue_run_dispatch(agent=agent, run_response=run_response, stream=False)
+
+    assert result is run_response
+    assert applied["called"] is True
+    assert tool_execution.confirmed is True
+
+
 def test_all_pause_handlers_accept_run_context():
     for fn in [
         _run.handle_agent_run_paused,
@@ -763,6 +1331,24 @@ def test_handle_agent_run_paused_forwards_run_context_to_cleanup(monkeypatch: py
     assert captured["run_context"] is run_context
 
 
+def test_handle_agent_run_paused_stores_run_paused_event(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(_run, "cleanup_and_store", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_run, "create_approval_from_pause", lambda **kwargs: None)
+
+    agent = Agent(name="test-hitl")
+    agent.store_events = True
+    run_response = RunOutput(run_id="r1", session_id="s1", messages=[])
+
+    _run.handle_agent_run_paused(
+        agent=agent,
+        run_response=run_response,
+        session=AgentSession(session_id="s1"),
+    )
+
+    assert run_response.events is not None
+    assert any(getattr(event, "event", None) == "RunPaused" for event in run_response.events)
+
+
 @pytest.mark.asyncio
 async def test_ahandle_agent_run_paused_forwards_run_context_to_cleanup(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, Any] = {}
@@ -788,6 +1374,31 @@ async def test_ahandle_agent_run_paused_forwards_run_context_to_cleanup(monkeypa
     )
 
     assert captured["run_context"] is run_context
+
+
+@pytest.mark.asyncio
+async def test_ahandle_agent_run_paused_stores_run_paused_event(monkeypatch: pytest.MonkeyPatch):
+    async def noop_acleanup_and_store(*args, **kwargs):
+        return None
+
+    async def noop_acreate_approval(**kwargs):
+        return None
+
+    monkeypatch.setattr(_run, "acleanup_and_store", noop_acleanup_and_store)
+    monkeypatch.setattr(_run, "acreate_approval_from_pause", noop_acreate_approval)
+
+    agent = Agent(name="test-hitl-async")
+    agent.store_events = True
+    run_response = RunOutput(run_id="r1", session_id="s1", messages=[])
+
+    await _run.ahandle_agent_run_paused(
+        agent=agent,
+        run_response=run_response,
+        session=AgentSession(session_id="s1"),
+    )
+
+    assert run_response.events is not None
+    assert any(getattr(event, "event", None) == "RunPaused" for event in run_response.events)
 
 
 def test_handle_agent_run_paused_persists_session_state(monkeypatch: pytest.MonkeyPatch):
