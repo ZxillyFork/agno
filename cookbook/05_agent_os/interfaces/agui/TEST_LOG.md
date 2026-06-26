@@ -14,9 +14,11 @@
 
 ### agent_with_silent_tools.py
 
-**Status:** PENDING
+**Status:** PASS
 
 **Description:** Silent External Tools - Suppress verbose messages in frontends.
+
+**Result:** Static validation passed; cookbook imports and AG-UI silent tool configuration are valid.
 
 ---
 

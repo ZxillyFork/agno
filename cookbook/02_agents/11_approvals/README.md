@@ -28,6 +28,8 @@ Creates an approval record **after** the HITL interaction resolves. The record h
 | `approval_list_and_resolve.py` | Simulates the full API workflow: pause, list pending, resolve via DB, continue |
 | `approval_user_input.py` | Approval with user input - `@approval` + `@tool(requires_user_input=True)` |
 | `approval_external_execution.py` | Approval with external execution - `@approval` + `@tool(external_execution=True)` |
+| `dynamic_approval_required.py` | Dynamic approval raised from inside a tool only when sensitive arguments require review |
+| `dynamic_call_deferred.py` | Dynamic deferred execution raised from inside a tool when external work is required |
 
 ### `@approval(type="audit")` (Audit-Logged Approvals)
 
