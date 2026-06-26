@@ -55,8 +55,8 @@ class AzureOpenAI(OpenAILike):
     default_headers: Optional[Dict[str, str]] = None
     default_query: Optional[Dict[str, Any]] = None
 
-    client: Optional[AzureOpenAIClient] = None
-    async_client: Optional[AsyncAzureOpenAIClient] = None
+    client: Optional[Any] = None
+    async_client: Optional[Any] = None
 
     def __deepcopy__(self, memo: dict) -> "AzureOpenAI":
         """Create a deep copy that preserves client references.
