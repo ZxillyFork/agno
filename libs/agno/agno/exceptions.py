@@ -5,6 +5,30 @@ from typing import Any, Dict, List, Optional, Union
 from agno.models.message import Message
 
 
+def _rebuild_tool_approval_required(
+    metadata: Optional[Dict[str, Any]],
+    message: str,
+    approval_type: Optional[str],
+) -> "ToolApprovalRequired":
+    return ToolApprovalRequired(metadata, message=message, approval_type=approval_type)
+
+
+def _rebuild_tool_call_deferred(metadata: Optional[Dict[str, Any]], message: str) -> "ToolCallDeferred":
+    return ToolCallDeferred(metadata, message=message)
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """Return a non-empty description for any exception.
+
+    Falls back to the type name when ``str(exc)`` is empty, which happens
+    with ``asyncio.TimeoutError()``, ``ConnectionResetError()``, etc.
+    """
+    desc = str(exc)
+    if desc:
+        return desc
+    return type(exc).__name__
+
+
 class AgentRunException(Exception):
     def __init__(
         self,
@@ -55,11 +79,61 @@ class StopAgentRun(AgentRunException):
         self.error_id = "stop_agent_run_error"
 
 
+class ToolApprovalRequired(Exception):
+    """Signal that a tool call should pause and wait for human approval.
+
+    This is intended to be raised from inside a tool when the need for approval
+    can only be decided at runtime. When the run is continued after approval, the
+    tool is executed again with ``run_context.tool_call_approved`` set to True.
+    """
+
+    def __init__(
+        self,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        message: str = "Tool call requires approval",
+        approval_type: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.metadata = metadata
+        self.approval_type = approval_type
+
+    def __reduce__(self):
+        return _rebuild_tool_approval_required, (self.metadata, self.message, self.approval_type)
+
+
+class ToolCallDeferred(Exception):
+    """Signal that a tool call should pause for external execution.
+
+    The original tool is not executed again when the run is continued. Instead,
+    callers provide the external result on the corresponding RunRequirement.
+    """
+
+    def __init__(
+        self,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        message: str = "Tool call deferred",
+    ):
+        super().__init__(message)
+        self.message = message
+        self.metadata = metadata
+
+    def __reduce__(self):
+        return _rebuild_tool_call_deferred, (self.metadata, self.message)
+
+
+# Short aliases matching the terminology used by Pydantic AI.
+ApprovalRequired = ToolApprovalRequired
+CallDeferred = ToolCallDeferred
+
+
 class RunCancelledException(Exception):
     """Exception raised when a run is cancelled."""
 
-    def __init__(self, message: str = "Operation cancelled by user"):
-        super().__init__(message)
+    def __init__(self, message: Optional[str] = None):
+        super().__init__(message or "")
         self.type = "run_cancelled_error"
         self.error_id = "run_cancelled_error"
 

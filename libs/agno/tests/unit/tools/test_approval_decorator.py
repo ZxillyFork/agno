@@ -47,6 +47,24 @@ def test_approval_below_tool():
     assert delete_file.requires_confirmation is True
 
 
+def test_reused_tool_decorator_does_not_leak_approval_settings():
+    shared_tool = tool()
+
+    @shared_tool
+    @approval
+    def approved_action() -> str:
+        return "approved"
+
+    @shared_tool
+    def ordinary_action() -> str:
+        return "ordinary"
+
+    assert approved_action.approval_type == "required"
+    assert approved_action.requires_confirmation is True
+    assert ordinary_action.approval_type is None
+    assert ordinary_action.requires_confirmation is not True
+
+
 # =============================================================================
 # Test 3: @approval() with parens works in both orderings
 # =============================================================================
@@ -202,20 +220,51 @@ def test_approval_with_external_execution():
 
 
 # =============================================================================
-# Test 8: @tool(requires_approval=True) raises ValueError
+# Test 8: @tool(requires_approval=True) aliases requires_confirmation
 # =============================================================================
 
 
-def test_old_requires_approval_raises():
-    """The old requires_approval kwarg has been removed from VALID_KWARGS,
-    so passing it should raise a ValueError."""
+def test_requires_approval_alias_sets_requires_confirmation():
+    """The Pydantic AI-style requires_approval alias maps to requires_confirmation."""
 
-    with pytest.raises(ValueError, match="Invalid tool configuration arguments"):
+    @tool(requires_approval=True)
+    def old_style(x: int) -> int:
+        """Old style approval."""
+        return x
 
-        @tool(requires_approval=True)
-        def old_style(x: int) -> int:
-            """Old style approval."""
+    assert isinstance(old_style, Function)
+    assert old_style.requires_confirmation is True
+
+
+def test_requires_approval_conflicts_with_requires_confirmation():
+    """The alias cannot disagree with requires_confirmation."""
+
+    with pytest.raises(ValueError, match="alias for 'requires_confirmation'"):
+
+        @tool(requires_approval=True, requires_confirmation=False)
+        def conflicting_alias(x: int) -> int:
+            """Conflicting approval configuration."""
             return x
+
+
+def test_dynamic_approval_is_not_logged_as_tool_error(monkeypatch):
+    """Dynamic HITL exceptions are control flow, not tool failures."""
+
+    from agno.exceptions import ToolApprovalRequired
+    import agno.tools.decorator as tool_decorator
+
+    logged_errors = []
+    monkeypatch.setattr(tool_decorator, "log_error", lambda *args, **kwargs: logged_errors.append((args, kwargs)))
+
+    @tool
+    def dynamic_pause() -> str:
+        """Pause dynamically."""
+        raise ToolApprovalRequired(metadata={"reason": "review"})
+
+    with pytest.raises(ToolApprovalRequired):
+        dynamic_pause.entrypoint()
+
+    assert logged_errors == []
 
 
 # =============================================================================

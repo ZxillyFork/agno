@@ -117,6 +117,19 @@ def test_function_from_callable():
     assert "param2" not in func.parameters["required"]  # Because it has a default value
 
 
+def test_function_from_callable_excludes_function_call_param_from_required():
+    """FunctionCall injection must not leak into the provider JSON schema."""
+
+    def test_func(fc: FunctionCall, value: str) -> str:
+        return value
+
+    func = Function.from_callable(test_func)
+
+    assert "fc" not in func.parameters["properties"]
+    assert "fc" not in func.parameters["required"]
+    assert "value" in func.parameters["required"]
+
+
 def test_wrap_callable():
     """Test wrapping a callable."""
 
@@ -361,15 +374,19 @@ def test_function_cache_key_dict_order_independence():
     assert cache_key1 == cache_key2 == cache_key3
 
 
-def test_function_cache_file_path():
+def test_function_cache_file_path(tmp_path):
     """Test generation of cache file paths."""
-    func = Function(name="test_func", cache_results=True, cache_dir="/tmp")
+    from pathlib import Path
+
+    func = Function(name="test_func", cache_results=True, cache_dir=str(tmp_path))
 
     cache_key = "test_key"
     cache_file = func._get_cache_file_path(cache_key)
-    assert cache_file.startswith("/tmp/")
-    assert "test_func" in cache_file
-    assert "test_key" in cache_file
+    # Use Path comparison rather than string prefix to stay platform-independent
+    cache_path = Path(cache_file)
+    assert tmp_path in cache_path.parents
+    assert "test_func" in cache_path.parts
+    assert cache_path.name == "test_key.json"
 
 
 def test_function_cache_operations(tmp_path):

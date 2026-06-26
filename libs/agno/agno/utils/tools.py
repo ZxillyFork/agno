@@ -9,7 +9,9 @@ def get_function_call_for_tool_call(
     tool_call: Dict[str, Any], functions: Optional[Dict[str, Function]] = None
 ) -> Optional[FunctionCall]:
     if tool_call.get("type") == "function":
-        _tool_call_id = tool_call.get("id")
+        # Prefer call_id over id for consistency with OpenAI Responses API
+        # which uses call_id (fc_xxx format) as the canonical tool call identifier
+        _tool_call_id = tool_call.get("call_id") or tool_call.get("id")
         _tool_call_function = tool_call.get("function")
         if _tool_call_function is not None:
             _tool_call_function_name = _tool_call_function.get("name")

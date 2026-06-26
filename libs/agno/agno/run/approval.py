@@ -10,6 +10,38 @@ from agno.utils.dttm import now_epoch_s
 from agno.utils.log import log_debug, log_warning
 
 
+def _approval_belongs_to_run(approval: Any, run_response: Any) -> bool:
+    return bool(
+        isinstance(approval, dict)
+        and approval.get("run_id") == getattr(run_response, "run_id", None)
+        and approval.get("approval_type", "required") == "required"
+    )
+
+
+def _get_existing_approval_for_run(db: Any, approval_id: str, run_response: Any) -> Optional[Dict[str, Any]]:
+    get_approval = getattr(db, "get_approval", None)
+    if get_approval is None:
+        return None
+    try:
+        approval = get_approval(approval_id)
+    except Exception:
+        return None
+    return approval if _approval_belongs_to_run(approval, run_response) else None
+
+
+async def _aget_existing_approval_for_run(db: Any, approval_id: str, run_response: Any) -> Optional[Dict[str, Any]]:
+    get_approval = getattr(db, "get_approval", None)
+    if get_approval is None:
+        return None
+    try:
+        from inspect import iscoroutinefunction
+
+        approval = await get_approval(approval_id) if iscoroutinefunction(get_approval) else get_approval(approval_id)
+    except Exception:
+        return None
+    return approval if _approval_belongs_to_run(approval, run_response) else None
+
+
 def _get_pause_type(tool_execution: Any) -> str:
     """Determine the pause type from a tool execution's HITL flags."""
     if getattr(tool_execution, "requires_user_input", False):
@@ -33,6 +65,50 @@ def _get_first_approval_tool(tools: Optional[List[Any]], requirements: Optional[
     return None
 
 
+def _is_active_approval_tool(tool: Any) -> bool:
+    if tool is None or getattr(tool, "approval_type", None) != "required":
+        return False
+
+    if getattr(tool, "requires_confirmation", None) is True:
+        return getattr(tool, "confirmed", None) is None
+    if getattr(tool, "requires_user_input", None) is True:
+        return getattr(tool, "answered", None) is not True
+    if getattr(tool, "external_execution_required", None) is True:
+        return getattr(tool, "external_execution_result_provided", None) is not True
+
+    if (
+        getattr(tool, "requires_confirmation", None) is False
+        or getattr(tool, "requires_user_input", None) is False
+        or getattr(tool, "external_execution_required", None) is False
+        or getattr(tool, "confirmed", None) is not None
+        or getattr(tool, "answered", None) is not None
+        or getattr(tool, "external_execution_result_provided", None) is not None
+    ):
+        return False
+
+    # Backwards-compatible default: older paused approval tools may only carry
+    # approval_type="required", which semantically means confirmation.
+    return True
+
+
+def _tool_feedback_answered(tool: Any) -> bool:
+    feedback_schema = getattr(tool, "user_feedback_schema", None) or []
+    return bool(feedback_schema and all(question.selected_options is not None for question in feedback_schema))
+
+
+def _get_first_active_approval_tool(tools: Optional[List[Any]], requirements: Optional[List[Any]] = None) -> Any:
+    if tools:
+        for tool in tools:
+            if _is_active_approval_tool(tool):
+                return tool
+    if requirements:
+        for req in requirements:
+            te = getattr(req, "tool_execution", None)
+            if te and _is_active_approval_tool(te):
+                return te
+    return None
+
+
 def _has_approval_requirement(tools: Optional[List[Any]], requirements: Optional[List[Any]] = None) -> bool:
     """Check if any paused tool execution has approval_type set.
 
@@ -46,16 +122,35 @@ def _has_approval_requirement(tools: Optional[List[Any]], requirements: Optional
 def _stamp_approval_id_on_tools(
     tools: Optional[List[Any]], requirements: Optional[List[Any]], approval_id: str
 ) -> None:
-    """Stamp approval_id on every tool that has approval_type set."""
+    """Stamp approval_id on active approval tools for the current pause."""
     if tools:
         for tool in tools:
-            if getattr(tool, "approval_type", None) is not None:
+            if _is_active_approval_tool(tool):
                 tool.approval_id = approval_id
     if requirements:
         for req in requirements:
             te = getattr(req, "tool_execution", None)
-            if te and getattr(te, "approval_type", None) is not None:
+            if te is not None and _is_active_approval_tool(te):
                 te.approval_id = approval_id
+
+
+def _get_existing_approval_id(tools: Optional[List[Any]], requirements: Optional[List[Any]]) -> Optional[str]:
+    if tools:
+        for tool in tools:
+            if not _is_active_approval_tool(tool):
+                continue
+            approval_id = getattr(tool, "approval_id", None)
+            if approval_id:
+                return approval_id
+    if requirements:
+        for req in requirements:
+            te = getattr(req, "tool_execution", None)
+            if te is None or not _is_active_approval_tool(te):
+                continue
+            approval_id = getattr(te, "approval_id", None)
+            if approval_id:
+                return approval_id
+    return None
 
 
 def _build_approval_dict(
@@ -94,7 +189,7 @@ def _build_approval_dict(
     # Find the first approval tool to extract pause_type, tool_name, tool_args
     tools = getattr(run_response, "tools", None)
     requirements = getattr(run_response, "requirements", None)
-    first_tool = _get_first_approval_tool(tools, requirements)
+    first_tool = _get_first_active_approval_tool(tools, requirements) or _get_first_approval_tool(tools, requirements)
 
     pause_type = _get_pause_type(first_tool) if first_tool else "confirmation"
     tool_name = getattr(first_tool, "tool_name", None) if first_tool else None
@@ -172,13 +267,12 @@ def create_approval_from_pause(
 
     tools = getattr(run_response, "tools", None)
     requirements = getattr(run_response, "requirements", None)
-    if not _has_approval_requirement(tools, requirements):
+    if _get_first_active_approval_tool(tools, requirements) is None:
         return None
-
-    # Skip if an approval_id is already stamped (avoids duplicates when pause hook fires twice)
-    for t in tools or []:
-        if getattr(t, "approval_type", None) == "required" and getattr(t, "approval_id", None) is not None:
-            return getattr(t, "approval_id", None)
+    existing_approval_id = _get_existing_approval_id(tools, requirements)
+    if existing_approval_id:
+        if _get_existing_approval_for_run(db, existing_approval_id, run_response) is not None:
+            return existing_approval_id
 
     try:
         approval_data = _build_approval_dict(
@@ -195,7 +289,7 @@ def create_approval_from_pause(
         )
         db.create_approval(approval_data)
         approval_id: str = approval_data["id"]
-        # Stamp the approval_id on all tools with approval_type
+        # Stamp the approval_id only on tools that are still actively paused
         _stamp_approval_id_on_tools(tools, requirements, approval_id)
         log_debug(f"Created approval {approval_id} for run {approval_data['run_id']}")
         return approval_id
@@ -228,13 +322,12 @@ async def acreate_approval_from_pause(
 
     tools = getattr(run_response, "tools", None)
     requirements = getattr(run_response, "requirements", None)
-    if not _has_approval_requirement(tools, requirements):
+    if _get_first_active_approval_tool(tools, requirements) is None:
         return None
-
-    # Skip if an approval_id is already stamped (avoids duplicates when pause hook fires twice)
-    for t in tools or []:
-        if getattr(t, "approval_type", None) == "required" and getattr(t, "approval_id", None) is not None:
-            return getattr(t, "approval_id", None)
+    existing_approval_id = _get_existing_approval_id(tools, requirements)
+    if existing_approval_id:
+        if await _aget_existing_approval_for_run(db, existing_approval_id, run_response) is not None:
+            return existing_approval_id
 
     try:
         approval_data = _build_approval_dict(
@@ -281,6 +374,7 @@ def create_audit_approval(
     team_id: Optional[str] = None,
     team_name: Optional[str] = None,
     user_id: Optional[str] = None,
+    pause_type: Optional[str] = None,
 ) -> None:
     """Create an audit approval record AFTER a HITL interaction resolves.
 
@@ -299,7 +393,7 @@ def create_audit_approval(
 
         tool_name = getattr(tool_execution, "tool_name", None)
         tool_args = getattr(tool_execution, "tool_args", None)
-        pause_type = _get_pause_type(tool_execution)
+        pause_type = pause_type or _get_pause_type(tool_execution)
 
         context: Dict[str, Any] = {}
         if tool_name:
@@ -339,58 +433,319 @@ def create_audit_approval(
 # ---------------------------------------------------------------------------
 
 
+def _tool_user_input_ready(tool: Any) -> bool:
+    user_input_schema = getattr(tool, "user_input_schema", None) or []
+    return bool(user_input_schema) and all(getattr(field, "value", None) is not None for field in user_input_schema)
+
+
+def _tool_user_feedback_ready(tool: Any) -> bool:
+    user_feedback_schema = getattr(tool, "user_feedback_schema", None) or []
+    return bool(user_feedback_schema) and all(
+        getattr(question, "selected_options", None) is not None for question in user_feedback_schema
+    )
+
+
+def _mapping_value(value: Any) -> Optional[Dict[str, Any]]:
+    return value if isinstance(value, dict) else None
+
+
+def _resolution_values_and_selections(
+    resolution_data: Optional[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if not isinstance(resolution_data, dict):
+        return None, None
+
+    values = _mapping_value(resolution_data.get("values"))
+    selections = _mapping_value(resolution_data.get("selections"))
+    if selections is None:
+        selections = _mapping_value(resolution_data.get("feedback"))
+
+    if values is None and selections is None:
+        values = _mapping_value(resolution_data)
+    if selections is None:
+        selections = values
+    return values, selections
+
+
+def _has_non_null_value(values: Optional[Dict[str, Any]], name: Any) -> bool:
+    return values is not None and name in values and values[name] is not None
+
+
+def _is_valid_feedback_selection(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _has_valid_feedback_selection(selections: Optional[Dict[str, Any]], question: Any) -> bool:
+    return selections is not None and question in selections and _is_valid_feedback_selection(selections[question])
+
+
+def _has_usable_approval_resolution(tool: Any, approval_status: str, resolution_data: Optional[Dict[str, Any]]) -> bool:
+    if approval_status == "rejected":
+        return True
+
+    if approval_status != "approved":
+        return False
+
+    if getattr(tool, "requires_confirmation", False):
+        return True
+
+    if getattr(tool, "requires_user_input", False):
+        if _tool_user_input_ready(tool) or _tool_user_feedback_ready(tool):
+            return True
+        if not isinstance(resolution_data, dict) or not resolution_data:
+            return False
+
+        values, selections = _resolution_values_and_selections(resolution_data)
+        user_input_schema = getattr(tool, "user_input_schema", None) or []
+        user_feedback_schema = getattr(tool, "user_feedback_schema", None) or []
+
+        input_ready = bool(user_input_schema) and all(
+            getattr(field, "value", None) is not None or _has_non_null_value(values, getattr(field, "name", None))
+            for field in user_input_schema
+        )
+        feedback_ready = bool(user_feedback_schema) and all(
+            getattr(question, "selected_options", None) is not None
+            or _has_valid_feedback_selection(selections, getattr(question, "question", None))
+            for question in user_feedback_schema
+        )
+        schema_less_ready = not user_input_schema and not user_feedback_schema
+        return input_ready or feedback_ready or schema_less_ready
+
+    if getattr(tool, "external_execution_required", False):
+        return isinstance(resolution_data, dict) and "result" in resolution_data
+
+    # Backwards-compatible default approval tools are confirmation approvals.
+    return True
+
+
 def _apply_approval_to_tools(tools: List[Any], approval_status: str, resolution_data: Optional[Dict[str, Any]]) -> None:
     """Apply approval resolution status to tools that require approval.
 
     For 'approved': sets confirmed=True, applies resolution_data to user_input/external_execution fields.
     For 'rejected': sets confirmed=False.
     """
+    resume_metadata = None
+    if isinstance(resolution_data, dict):
+        resume_metadata = resolution_data.get("metadata", resolution_data.get("approval_metadata"))
+
     for tool in tools:
         if getattr(tool, "approval_type", None) != "required":
             continue
 
         if approval_status == "approved":
+            if (
+                not getattr(tool, "requires_confirmation", False)
+                and not getattr(tool, "requires_user_input", False)
+                and not getattr(tool, "external_execution_required", False)
+            ):
+                tool.requires_confirmation = True
+
             # Confirmation tools
             if getattr(tool, "requires_confirmation", False):
                 tool.confirmed = True
+                if resume_metadata is not None:
+                    tool.resume_metadata = resume_metadata
 
             # User input tools: apply resolution_data values to user_input_schema
             if getattr(tool, "requires_user_input", False) and resolution_data:
-                values = resolution_data.get("values", resolution_data)
+                values, selections = _resolution_values_and_selections(resolution_data)
+                values = values or {}
+                selections = selections or {}
                 for ufield in tool.user_input_schema or []:
-                    if ufield.name in values:
+                    if _has_non_null_value(values, ufield.name):
                         ufield.value = values[ufield.name]
+                for question in getattr(tool, "user_feedback_schema", None) or []:
+                    if _has_valid_feedback_selection(selections, question.question):
+                        question.selected_options = selections[question.question]
+                        if question.options:
+                            for option in question.options:
+                                option.selected = option.label in question.selected_options
+                if (
+                    (tool.user_input_schema and all(field.value is not None for field in tool.user_input_schema))
+                    or _tool_feedback_answered(tool)
+                    or (
+                        not getattr(tool, "user_input_schema", None) and not getattr(tool, "user_feedback_schema", None)
+                    )
+                ):
+                    tool.answered = True
+                if resume_metadata is not None:
+                    tool.resume_metadata = resume_metadata
 
             # External execution tools: apply resolution_data result
             if getattr(tool, "external_execution_required", False) and resolution_data:
                 if "result" in resolution_data:
                     tool.result = resolution_data["result"]
+                    tool.external_execution_result_provided = True
+                if resume_metadata is not None:
+                    tool.resume_metadata = resume_metadata
 
         elif approval_status == "rejected":
+            note = None
+            if isinstance(resolution_data, dict):
+                note = resolution_data.get("note") or resolution_data.get("reason")
+            if (
+                not getattr(tool, "requires_confirmation", False)
+                and not getattr(tool, "requires_user_input", False)
+                and not getattr(tool, "external_execution_required", False)
+            ):
+                tool.requires_confirmation = True
             if getattr(tool, "requires_confirmation", False):
                 tool.confirmed = False
+                if note:
+                    tool.confirmation_note = note
             if getattr(tool, "requires_user_input", False):
                 tool.confirmed = False
+                if note:
+                    tool.confirmation_note = note
+                tool.answered = True
             if getattr(tool, "external_execution_required", False):
                 tool.confirmed = False
+                if note:
+                    tool.confirmation_note = note
+                if not getattr(tool, "external_execution_result_provided", False):
+                    tool.result = note or "Tool call was rejected"
+                    tool.external_execution_result_provided = True
 
 
-def _get_approval_for_run(db: Any, run_id: str) -> Optional[Dict[str, Any]]:
-    """Look up the most recent 'required' approval for a run_id (sync)."""
+def _sync_requirements_from_tools(run_response: Any) -> None:
+    requirements = getattr(run_response, "requirements", None) or []
+    tools = getattr(run_response, "tools", None) or []
+    if not requirements:
+        return
+
+    matched_tool_indexes: set[int] = set()
+    for requirement in requirements:
+        tool_execution = getattr(requirement, "tool_execution", None)
+        if tool_execution is None:
+            continue
+        resolved_tool = None
+        for index, tool in enumerate(tools):
+            if index in matched_tool_indexes:
+                continue
+            if tool is tool_execution:
+                resolved_tool = tool
+                matched_tool_indexes.add(index)
+                break
+
+        if resolved_tool is None:
+            requirement_approval_id = getattr(tool_execution, "approval_id", None)
+            fallback_match = None
+            fallback_index = None
+            for index, tool in enumerate(tools):
+                if index in matched_tool_indexes:
+                    continue
+                if getattr(tool, "tool_call_id", None) is None:
+                    continue
+                if getattr(tool, "tool_call_id", None) != getattr(tool_execution, "tool_call_id", None):
+                    continue
+                tool_approval_id = getattr(tool, "approval_id", None)
+                if requirement_approval_id is not None and tool_approval_id not in (requirement_approval_id, None):
+                    continue
+                if (
+                    requirement_approval_id is None
+                    and getattr(tool_execution, "confirmed", None) is not None
+                    and getattr(tool, "confirmed", None) is None
+                ):
+                    continue
+                if _is_active_approval_tool(tool_execution) and _is_active_approval_tool(tool):
+                    resolved_tool = tool
+                    matched_tool_indexes.add(index)
+                    break
+                if fallback_match is None:
+                    fallback_match = tool
+                    fallback_index = index
+            if resolved_tool is None and fallback_match is not None and fallback_index is not None:
+                resolved_tool = fallback_match
+                matched_tool_indexes.add(fallback_index)
+
+        resolved_tool = resolved_tool or tool_execution
+        if resolved_tool is not None:
+            requirement.tool_execution = resolved_tool
+            if getattr(resolved_tool, "resume_metadata", None) is not None:
+                requirement.approval_metadata = getattr(resolved_tool, "resume_metadata", None)
+            if getattr(resolved_tool, "confirmed", None) is not None:
+                requirement.confirmation = resolved_tool.confirmed
+                requirement.confirmation_note = getattr(resolved_tool, "confirmation_note", None)
+            if getattr(resolved_tool, "external_execution_result_provided", None):
+                requirement.external_execution_result = getattr(resolved_tool, "result", None)
+                requirement.external_execution_result_provided = True
+            if getattr(resolved_tool, "user_input_schema", None) is not None:
+                requirement.user_input_schema = resolved_tool.user_input_schema
+            if getattr(resolved_tool, "user_feedback_schema", None) is not None:
+                requirement.user_feedback_schema = resolved_tool.user_feedback_schema
+
+    requirement_tools = [req.tool_execution for req in requirements if getattr(req, "tool_execution", None) is not None]
+    if requirement_tools and not getattr(run_response, "tools", None):
+        run_response.tools = requirement_tools
+
+
+def _get_active_approval_id(approval_tools: List[Any]) -> Optional[str]:
+    for tool in approval_tools:
+        if _is_active_approval_tool(tool):
+            approval_id = getattr(tool, "approval_id", None)
+            if approval_id:
+                return approval_id
+    return None
+
+
+def _approval_tools_for_resolution(approval_tools: List[Any], approval_id: Optional[str]) -> List[Any]:
+    active_tools = [tool for tool in approval_tools if _is_active_approval_tool(tool)]
+    if approval_id is None:
+        return active_tools
+
+    matching_tools = [tool for tool in active_tools if getattr(tool, "approval_id", None) == approval_id]
+    if matching_tools:
+        return matching_tools
+
+    # Legacy paused runs may predate per-tool approval ids. Only fall back to
+    # unbound tools when no active tool carries any explicit approval id.
+    if not any(getattr(tool, "approval_id", None) is not None for tool in active_tools):
+        return active_tools
+
+    return []
+
+
+def _get_approval_for_run(db: Any, run_id: str, approval_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Look up the active approval for a run_id (sync)."""
     try:
+        if approval_id:
+            get_approval = getattr(db, "get_approval", None)
+            if get_approval is not None:
+                approval = get_approval(approval_id)
+                if (
+                    isinstance(approval, dict)
+                    and approval.get("run_id") == run_id
+                    and approval.get("approval_type", "required") == "required"
+                ):
+                    return approval
         approvals, _ = db.get_approvals(run_id=run_id, approval_type="required", limit=1)
         return approvals[0] if approvals else None
     except (NotImplementedError, Exception):
         return None
 
 
-async def _aget_approval_for_run(db: Any, run_id: str) -> Optional[Dict[str, Any]]:
-    """Look up the most recent 'required' approval for a run_id (async)."""
+async def _aget_approval_for_run(db: Any, run_id: str, approval_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Look up the active approval for a run_id (async)."""
     try:
+        from inspect import iscoroutinefunction
+
+        if approval_id:
+            get_approval = getattr(db, "get_approval", None)
+            if get_approval is not None:
+                if iscoroutinefunction(get_approval):
+                    approval = await get_approval(approval_id)
+                else:
+                    approval = get_approval(approval_id)
+                if (
+                    isinstance(approval, dict)
+                    and approval.get("run_id") == run_id
+                    and approval.get("approval_type", "required") == "required"
+                ):
+                    return approval
+
         get_fn = getattr(db, "get_approvals", None)
         if get_fn is None:
             return None
-        from inspect import iscoroutinefunction
 
         if iscoroutinefunction(get_fn):
             approvals, _ = await get_fn(run_id=run_id, approval_type="required", limit=1)
@@ -457,14 +812,16 @@ def check_and_apply_approval_resolution(db: Any, run_id: str, run_response: Any)
     if db is None:
         return
 
-    all_approval_tools = _collect_all_approval_tools(run_response)
-    if not any(getattr(t, "approval_type", None) == "required" for t in all_approval_tools):
+    approval_tools = _collect_all_approval_tools(run_response)
+    if not any(getattr(t, "approval_type", None) == "required" for t in approval_tools):
         return
 
-    all_run_ids = _collect_all_run_ids(run_id, run_response)
+    # Approvals may be stored under the team's run_id or any member agent's run_id;
+    # also try the active approval_id stamped on the tool.
+    active_approval_id = _get_active_approval_id(approval_tools)
     approval = None
-    for rid in all_run_ids:
-        approval = _get_approval_for_run(db, rid)
+    for rid in _collect_all_run_ids(run_id, run_response):
+        approval = _get_approval_for_run(db, rid, approval_id=active_approval_id)
         if approval is not None:
             break
     if approval is None:
@@ -476,9 +833,18 @@ def check_and_apply_approval_resolution(db: Any, run_id: str, run_response: Any)
     if status == "pending":
         raise RuntimeError("Approval is still pending. Resolve the approval before continuing this run.")
 
+    resolution_tools = _approval_tools_for_resolution(approval_tools, approval.get("id") or active_approval_id)
+    if not resolution_tools:
+        raise RuntimeError("Resolved approval does not match the active HITL requirement for this run.")
     resolution_data = approval.get("resolution_data")
-    _apply_approval_to_tools(all_approval_tools, status, resolution_data)
+    unresolved_tools = [
+        tool for tool in resolution_tools if not _has_usable_approval_resolution(tool, status, resolution_data)
+    ]
+    if unresolved_tools:
+        raise RuntimeError("Approval resolution data is incomplete. Resolve the approval before continuing this run.")
 
+    _apply_approval_to_tools(resolution_tools, status, resolution_data)
+    _sync_requirements_from_tools(run_response)
     _attach_resolved_approval(run_response, approval)
 
 
@@ -487,15 +853,16 @@ async def acheck_and_apply_approval_resolution(db: Any, run_id: str, run_respons
     if db is None:
         return
 
-    all_approval_tools = _collect_all_approval_tools(run_response)
-    if not any(getattr(t, "approval_type", None) == "required" for t in all_approval_tools):
+    approval_tools = _collect_all_approval_tools(run_response)
+    if not any(getattr(t, "approval_type", None) == "required" for t in approval_tools):
         return
 
-    # Search by team run_id first, then fall back to member run_ids
-    all_run_ids = _collect_all_run_ids(run_id, run_response)
+    # Approvals may be stored under the team's run_id or any member agent's run_id;
+    # also try the active approval_id stamped on the tool.
+    active_approval_id = _get_active_approval_id(approval_tools)
     approval = None
-    for rid in all_run_ids:
-        approval = await _aget_approval_for_run(db, rid)
+    for rid in _collect_all_run_ids(run_id, run_response):
+        approval = await _aget_approval_for_run(db, rid, approval_id=active_approval_id)
         if approval is not None:
             break
     if approval is None:
@@ -507,9 +874,18 @@ async def acheck_and_apply_approval_resolution(db: Any, run_id: str, run_respons
     if status == "pending":
         raise RuntimeError("Approval is still pending. Resolve the approval before continuing this run.")
 
+    resolution_tools = _approval_tools_for_resolution(approval_tools, approval.get("id") or active_approval_id)
+    if not resolution_tools:
+        raise RuntimeError("Resolved approval does not match the active HITL requirement for this run.")
     resolution_data = approval.get("resolution_data")
-    _apply_approval_to_tools(all_approval_tools, status, resolution_data)
+    unresolved_tools = [
+        tool for tool in resolution_tools if not _has_usable_approval_resolution(tool, status, resolution_data)
+    ]
+    if unresolved_tools:
+        raise RuntimeError("Approval resolution data is incomplete. Resolve the approval before continuing this run.")
 
+    _apply_approval_to_tools(resolution_tools, status, resolution_data)
+    _sync_requirements_from_tools(run_response)
     _attach_resolved_approval(run_response, approval)
 
 
@@ -523,6 +899,7 @@ async def acreate_audit_approval(
     team_id: Optional[str] = None,
     team_name: Optional[str] = None,
     user_id: Optional[str] = None,
+    pause_type: Optional[str] = None,
 ) -> None:
     """Async variant of create_audit_approval."""
     if db is None:
@@ -536,7 +913,7 @@ async def acreate_audit_approval(
 
         tool_name = getattr(tool_execution, "tool_name", None)
         tool_args = getattr(tool_execution, "tool_args", None)
-        pause_type = _get_pause_type(tool_execution)
+        pause_type = pause_type or _get_pause_type(tool_execution)
 
         context: Dict[str, Any] = {}
         if tool_name:

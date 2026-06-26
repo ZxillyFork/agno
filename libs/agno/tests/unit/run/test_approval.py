@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agno.models.response import ToolExecution
 from agno.run.approval import (
     _apply_approval_to_tools,
     _build_approval_dict,
@@ -19,6 +20,7 @@ from agno.run.approval import (
     create_approval_from_pause,
     create_audit_approval,
 )
+from agno.run.requirement import RunRequirement
 
 # =============================================================================
 # Helpers: lightweight stand-ins for ToolExecution / RunResponse / UserInputField
@@ -35,8 +37,13 @@ class FakeToolExecution:
     requires_user_input: Optional[bool] = None
     external_execution_required: Optional[bool] = None
     user_input_schema: Optional[list] = None
+    user_feedback_schema: Optional[list] = None
     confirmed: Optional[bool] = None
+    answered: Optional[bool] = None
     result: Optional[str] = None
+    external_execution_result_provided: Optional[bool] = None
+    resume_metadata: Optional[Dict[str, Any]] = None
+    confirmation_note: Optional[str] = None
 
 
 @dataclass
@@ -60,6 +67,19 @@ class FakeRunResponse:
 class FakeUserInputField:
     name: str = ""
     value: Optional[str] = None
+
+
+@dataclass
+class FakeFeedbackOption:
+    label: str = ""
+    selected: bool = False
+
+
+@dataclass
+class FakeFeedbackQuestion:
+    question: str = ""
+    selected_options: Optional[list] = None
+    options: Optional[list] = None
 
 
 # =============================================================================
@@ -282,6 +302,67 @@ class TestCreateApprovalFromPause:
         # approval_id must also be stamped on the tool itself
         assert tool.approval_id == result
 
+    def test_reuses_existing_approval_id(self):
+        db = MagicMock()
+        db.get_approval.return_value = {
+            "id": "approval-1",
+            "run_id": "run-123",
+            "approval_type": "required",
+            "status": "pending",
+        }
+        tool = FakeToolExecution(
+            tool_name="delete",
+            approval_type="required",
+            approval_id="approval-1",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        result = create_approval_from_pause(db=db, run_response=rr)
+
+        assert result == "approval-1"
+        db.create_approval.assert_not_called()
+
+    def test_copied_approval_id_from_other_run_does_not_suppress_new_approval(self):
+        db = MagicMock()
+        db.get_approval.return_value = {
+            "id": "member-approval",
+            "run_id": "member-run",
+            "approval_type": "required",
+            "status": "pending",
+        }
+        tool = FakeToolExecution(
+            tool_name="delete",
+            approval_type="required",
+            approval_id="member-approval",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(run_id="team-run", tools=[tool])
+
+        result = create_approval_from_pause(db=db, run_response=rr)
+
+        assert result is not None
+        assert result != "member-approval"
+        assert tool.approval_id == result
+        db.create_approval.assert_called_once()
+
+    def test_old_resolved_approval_id_does_not_suppress_new_pause(self):
+        db = MagicMock()
+        old_tool = FakeToolExecution(
+            tool_name="old_tool",
+            approval_type="required",
+            approval_id="old-approval",
+            requires_confirmation=False,
+        )
+        new_tool = FakeToolExecution(tool_name="new_tool", approval_type="required", requires_confirmation=True)
+        rr = FakeRunResponse(tools=[old_tool, new_tool])
+
+        result = create_approval_from_pause(db=db, run_response=rr)
+
+        assert result != "old-approval"
+        assert new_tool.approval_id == result
+        db.create_approval.assert_called_once()
+
 
 # =============================================================================
 # acreate_approval_from_pause (async)
@@ -330,6 +411,33 @@ class TestAsyncCreateApprovalFromPause:
         # approval_id must also be stamped on the tool itself
         assert tool.approval_id == result
 
+    @pytest.mark.asyncio
+    async def test_copied_approval_id_from_other_run_does_not_suppress_new_approval_async(self):
+        db = MagicMock()
+        db.create_approval = AsyncMock()
+        db.get_approval = AsyncMock(
+            return_value={
+                "id": "member-approval",
+                "run_id": "member-run",
+                "approval_type": "required",
+                "status": "pending",
+            }
+        )
+        tool = FakeToolExecution(
+            tool_name="delete",
+            approval_type="required",
+            approval_id="member-approval",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(run_id="team-run", tools=[tool])
+
+        result = await acreate_approval_from_pause(db=db, run_response=rr)
+
+        assert result is not None
+        assert result != "member-approval"
+        assert tool.approval_id == result
+        db.create_approval.assert_awaited_once()
+
 
 # =============================================================================
 # create_audit_approval (sync)
@@ -376,6 +484,20 @@ class TestCreateAuditApproval:
         create_audit_approval(db=db, tool_execution=te, run_response=rr, status="rejected")
         data = db.create_approval.call_args[0][0]
         assert data["status"] == "rejected"
+
+    def test_explicit_pause_type_is_preserved_after_tool_flags_are_cleared(self):
+        db = MagicMock()
+        te = FakeToolExecution(tool_name="external", external_execution_required=False)
+        rr = FakeRunResponse()
+        create_audit_approval(
+            db=db,
+            tool_execution=te,
+            run_response=rr,
+            status="approved",
+            pause_type="external_execution",
+        )
+        data = db.create_approval.call_args[0][0]
+        assert data["pause_type"] == "external_execution"
 
     def test_silently_handles_not_implemented(self):
         db = MagicMock()
@@ -428,6 +550,22 @@ class TestAsyncCreateAuditApproval:
         await acreate_audit_approval(db=db, tool_execution=te, run_response=rr, status="approved")
         db.create_approval.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_explicit_pause_type_is_preserved_after_tool_flags_are_cleared_async(self):
+        db = MagicMock()
+        db.create_approval = AsyncMock()
+        te = FakeToolExecution(tool_name="input", requires_user_input=False)
+        rr = FakeRunResponse()
+        await acreate_audit_approval(
+            db=db,
+            tool_execution=te,
+            run_response=rr,
+            status="approved",
+            pause_type="user_input",
+        )
+        data = db.create_approval.call_args[0][0]
+        assert data["pause_type"] == "user_input"
+
 
 # =============================================================================
 # _apply_approval_to_tools
@@ -437,8 +575,9 @@ class TestAsyncCreateAuditApproval:
 class TestApplyApprovalToTools:
     def test_approved_sets_confirmed_true(self):
         t = FakeToolExecution(approval_type="required", requires_confirmation=True)
-        _apply_approval_to_tools([t], "approved", None)
+        _apply_approval_to_tools([t], "approved", {"metadata": {"approver": "admin"}})
         assert t.confirmed is True
+        assert t.resume_metadata == {"approver": "admin"}
 
     def test_rejected_sets_confirmed_false(self):
         t = FakeToolExecution(approval_type="required", requires_confirmation=True)
@@ -459,6 +598,65 @@ class TestApplyApprovalToTools:
         )
         _apply_approval_to_tools([t], "approved", {"values": {"reason": "looks good"}})
         assert ufield.value == "looks good"
+        assert t.answered is True
+
+    def test_approved_applies_user_feedback_selections(self):
+        yes = FakeFeedbackOption(label="Yes")
+        no = FakeFeedbackOption(label="No")
+        question = FakeFeedbackQuestion(question="Deploy?", options=[yes, no])
+        t = FakeToolExecution(
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[question],
+        )
+
+        _apply_approval_to_tools([t], "approved", {"selections": {"Deploy?": ["Yes"]}})
+
+        assert question.selected_options == ["Yes"]
+        assert yes.selected is True
+        assert no.selected is False
+        assert t.answered is True
+
+    def test_approved_applies_user_feedback_key(self):
+        yes = FakeFeedbackOption(label="Yes")
+        question = FakeFeedbackQuestion(question="Deploy?", options=[yes])
+        t = FakeToolExecution(
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[question],
+        )
+
+        _apply_approval_to_tools([t], "approved", {"feedback": {"Deploy?": ["Yes"]}})
+
+        assert question.selected_options == ["Yes"]
+        assert yes.selected is True
+        assert t.answered is True
+
+    def test_direct_user_feedback_rejects_non_list_selection(self):
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="ask_feedback",
+                requires_user_input=True,
+                user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+            )
+        )
+
+        with pytest.raises(ValueError, match="lists of option labels"):
+            requirement.provide_user_feedback({"Deploy?": "Yes"})  # type: ignore[arg-type]
+
+    def test_approved_legacy_confirmation_tool_sets_confirmed_true(self):
+        t = FakeToolExecution(approval_type="required")
+        _apply_approval_to_tools([t], "approved", None)
+        assert t.requires_confirmation is True
+        assert t.confirmed is True
+
+    def test_rejected_legacy_confirmation_tool_sets_confirmed_false(self):
+        t = FakeToolExecution(approval_type="required")
+        _apply_approval_to_tools([t], "rejected", {"reason": "no"})
+        assert t.requires_confirmation is True
+        assert t.confirmed is False
+        assert t.confirmation_note == "no"
 
     def test_approved_applies_external_execution_result(self):
         t = FakeToolExecution(approval_type="required", external_execution_required=True)
@@ -467,13 +665,17 @@ class TestApplyApprovalToTools:
 
     def test_rejected_user_input_sets_confirmed_false(self):
         t = FakeToolExecution(approval_type="required", requires_user_input=True)
-        _apply_approval_to_tools([t], "rejected", None)
+        _apply_approval_to_tools([t], "rejected", {"reason": "not needed"})
         assert t.confirmed is False
+        assert t.answered is True
+        assert t.confirmation_note == "not needed"
 
     def test_rejected_external_execution_sets_confirmed_false(self):
         t = FakeToolExecution(approval_type="required", external_execution_required=True)
-        _apply_approval_to_tools([t], "rejected", None)
+        _apply_approval_to_tools([t], "rejected", {"reason": "unsafe"})
         assert t.confirmed is False
+        assert t.external_execution_result_provided is True
+        assert t.result == "unsafe"
 
 
 # =============================================================================
@@ -513,6 +715,411 @@ class TestCheckAndApplyApprovalResolution:
         rr = FakeRunResponse(tools=[t])
         check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
         assert t.confirmed is True
+
+    def test_applies_approved_status_to_requirements(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": {"result": None}}], 1)
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="dynamic_tool",
+            approval_type="required",
+            external_execution_required=True,
+        )
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="dynamic_tool",
+                approval_type="required",
+                external_execution_required=True,
+            )
+        )
+        rr = FakeRunResponse(tools=[tool], requirements=[requirement])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].tool_execution is tool
+        assert rr.requirements[0].external_execution_result is None
+        assert rr.requirements[0].external_execution_result_provided is True
+        assert rr.requirements[0].is_resolved()
+
+    def test_applies_approved_status_to_requirements_without_top_level_tools(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": None}], 1)
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="dynamic_tool",
+                approval_type="required",
+                requires_confirmation=True,
+            )
+        )
+        rr = FakeRunResponse(tools=None, requirements=[requirement])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].confirmation is True
+        assert rr.requirements[0].tool_execution.confirmed is True
+        assert rr.requirements[0].is_resolved()
+        assert rr.tools == [rr.requirements[0].tool_execution]
+
+    def test_approved_user_input_without_values_stays_blocked(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": None}], 1)
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_reason",
+            approval_type="required",
+            requires_user_input=True,
+            user_input_schema=[FakeUserInputField(name="reason")],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+    def test_malformed_user_input_values_stays_blocked_without_crashing(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": {"values": ["reason"]}}], 1)
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_reason",
+            approval_type="required",
+            requires_user_input=True,
+            user_input_schema=[FakeUserInputField(name="reason")],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+    def test_null_user_input_value_stays_blocked(self):
+        db = MagicMock()
+        db.get_approvals.return_value = (
+            [{"status": "approved", "resolution_data": {"values": {"reason": None}}}],
+            1,
+        )
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_reason",
+            approval_type="required",
+            requires_user_input=True,
+            user_input_schema=[FakeUserInputField(name="reason")],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert tool.user_input_schema[0].value is None
+        assert tool.answered is None
+
+    def test_malformed_user_feedback_selections_stays_blocked_without_crashing(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": {"selections": ["Yes"]}}], 1)
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+    def test_string_user_feedback_selection_stays_blocked(self):
+        db = MagicMock()
+        db.get_approvals.return_value = (
+            [{"status": "approved", "resolution_data": {"selections": {"Deploy?": "Yes"}}}],
+            1,
+        )
+        yes = FakeFeedbackOption(label="Yes")
+        prefix = FakeFeedbackOption(label="Ye")
+        question = FakeFeedbackQuestion(question="Deploy?", options=[prefix, yes])
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[question],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert question.selected_options is None
+        assert prefix.selected is False
+        assert yes.selected is False
+
+    def test_null_user_feedback_selection_stays_blocked(self):
+        db = MagicMock()
+        db.get_approvals.return_value = (
+            [{"status": "approved", "resolution_data": {"selections": {"Deploy?": None}}}],
+            1,
+        )
+        question = FakeFeedbackQuestion(question="Deploy?", options=[FakeFeedbackOption(label="Yes")])
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[question],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert question.selected_options is None
+        assert question.options[0].selected is False
+
+    def test_approved_user_feedback_requirement_is_resolved(self):
+        db = MagicMock()
+        db.get_approvals.return_value = (
+            [{"status": "approved", "resolution_data": {"selections": {"Deploy?": ["Yes"]}}}],
+            1,
+        )
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+        )
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="ask_feedback",
+                approval_type="required",
+                requires_user_input=True,
+                user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+            )
+        )
+        rr = FakeRunResponse(tools=[tool], requirements=[requirement])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].is_resolved()
+        assert rr.requirements[0].tool_execution.answered is True
+        assert rr.requirements[0].user_feedback_schema[0].selected_options == ["Yes"]
+
+    def test_approved_legacy_approval_type_only_tool_is_resolved(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": None}], 1)
+        t = FakeToolExecution(approval_type="required")
+        rr = FakeRunResponse(tools=[t])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert t.requires_confirmation is True
+        assert t.confirmed is True
+
+    def test_approved_external_execution_without_result_stays_blocked(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": {}}], 1)
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="external_tool",
+            approval_type="required",
+            external_execution_required=True,
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+    def test_applies_resume_metadata_to_requirements(self):
+        db = MagicMock()
+        db.get_approvals.return_value = ([{"status": "approved", "resolution_data": {"metadata": {"m": 1}}}], 1)
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="dynamic_tool",
+            approval_type="required",
+            requires_confirmation=True,
+        )
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="dynamic_tool",
+                approval_type="required",
+                requires_confirmation=True,
+            )
+        )
+        rr = FakeRunResponse(tools=[tool], requirements=[requirement])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].approval_metadata == {"m": 1}
+        assert rr.requirements[0].tool_execution.resume_metadata == {"m": 1}
+
+    def test_approved_user_input_requirement_is_resolved_with_metadata(self):
+        db = MagicMock()
+        db.get_approvals.return_value = (
+            [{"status": "approved", "resolution_data": {"values": {"reason": "ok"}, "metadata": {"m": 1}}}],
+            1,
+        )
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_reason",
+            approval_type="required",
+            requires_user_input=True,
+            user_input_schema=[FakeUserInputField(name="reason")],
+        )
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="ask_reason",
+                approval_type="required",
+                requires_user_input=True,
+                user_input_schema=[FakeUserInputField(name="reason")],
+            )
+        )
+        rr = FakeRunResponse(tools=[tool], requirements=[requirement])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].is_resolved()
+        assert rr.requirements[0].approval_metadata == {"m": 1}
+        assert rr.requirements[0].tool_execution.answered is True
+
+    def test_resolution_prefers_active_tool_approval_id(self):
+        db = MagicMock()
+        db.get_approval.return_value = {
+            "id": "approval-active",
+            "run_id": "r1",
+            "approval_type": "required",
+            "status": "approved",
+            "resolution_data": None,
+        }
+        db.get_approvals.return_value = ([{"id": "approval-old", "status": "rejected", "resolution_data": None}], 1)
+        tool = FakeToolExecution(
+            approval_type="required",
+            approval_id="approval-active",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        db.get_approval.assert_called_once_with("approval-active")
+        assert tool.confirmed is True
+
+    def test_active_approval_id_from_another_run_is_ignored(self):
+        db = MagicMock()
+        db.get_approval.return_value = {
+            "id": "approval-active",
+            "run_id": "other-run",
+            "approval_type": "required",
+            "status": "approved",
+            "resolution_data": None,
+        }
+        db.get_approvals.return_value = ([{"id": "approval-current", "status": "pending"}], 1)
+        tool = FakeToolExecution(
+            approval_type="required",
+            approval_id="approval-active",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="still pending"):
+            check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert tool.confirmed is None
+
+    def test_new_approval_id_is_only_stamped_on_active_pause(self):
+        db = MagicMock()
+        old_tool = FakeToolExecution(
+            approval_type="required",
+            approval_id="approval-old",
+            requires_confirmation=False,
+        )
+        new_tool = FakeToolExecution(
+            approval_type="required",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(tools=[old_tool, new_tool])
+
+        approval_id = create_approval_from_pause(db=db, run_response=rr)
+
+        assert old_tool.approval_id == "approval-old"
+        assert new_tool.approval_id == approval_id
+
+    def test_resolution_sync_keeps_repeated_tool_call_requirements_separate(self):
+        db = MagicMock()
+        db.get_approval.return_value = {
+            "id": "approval-new",
+            "run_id": "r1",
+            "approval_type": "required",
+            "status": "approved",
+            "resolution_data": {"metadata": {"round": 2}},
+        }
+        old_tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="protected",
+            approval_type="required",
+            approval_id="approval-old",
+            requires_confirmation=True,
+            confirmed=True,
+            resume_metadata={"round": 1},
+        )
+        old_requirement = RunRequirement(old_tool)
+        old_requirement.confirmation = True
+        old_requirement.approval_metadata = {"round": 1}
+        new_tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="protected",
+            approval_type="required",
+            approval_id="approval-new",
+            requires_confirmation=True,
+        )
+        new_requirement = RunRequirement(new_tool)
+        rr = FakeRunResponse(tools=[old_tool, new_tool], requirements=[old_requirement, new_requirement])
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert old_requirement.tool_execution is old_tool
+        assert old_requirement.approval_metadata == {"round": 1}
+        assert new_requirement.tool_execution is new_tool
+        assert new_requirement.is_resolved()
+        assert new_requirement.approval_metadata == {"round": 2}
+
+    def test_specific_approval_id_does_not_resolve_unbound_active_requirement(self):
+        db = MagicMock()
+        db.get_approval.return_value = {
+            "id": "approval-a",
+            "run_id": "r1",
+            "approval_type": "required",
+            "status": "approved",
+            "resolution_data": {"metadata": {"approval": "a"}},
+        }
+        approved_tool = ToolExecution(
+            tool_call_id="call-a",
+            tool_name="approved_tool",
+            approval_type="required",
+            approval_id="approval-a",
+            requires_confirmation=True,
+        )
+        unbound_tool = ToolExecution(
+            tool_call_id="call-b",
+            tool_name="still_pending",
+            approval_type="required",
+            approval_id=None,
+            requires_confirmation=True,
+        )
+        approved_requirement = RunRequirement(approved_tool)
+        unbound_requirement = RunRequirement(unbound_tool)
+        rr = FakeRunResponse(
+            tools=[approved_tool, unbound_tool], requirements=[approved_requirement, unbound_requirement]
+        )
+
+        check_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert approved_requirement.is_resolved()
+        assert approved_requirement.approval_metadata == {"approval": "a"}
+        assert unbound_requirement.is_resolved() is False
+        assert unbound_tool.confirmed is None
 
     def test_applies_rejected_status(self):
         db = MagicMock()
@@ -579,6 +1186,170 @@ class TestAsyncCheckAndApplyApprovalResolution:
         rr = FakeRunResponse(tools=[t])
         await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
         assert t.confirmed is True
+
+    @pytest.mark.asyncio
+    async def test_applies_approved_status_to_requirements_async(self):
+        db = MagicMock()
+        db.get_approvals = AsyncMock(return_value=([{"status": "approved", "resolution_data": None}], 1))
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="dynamic_tool",
+            approval_type="required",
+            requires_confirmation=True,
+        )
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="dynamic_tool",
+                approval_type="required",
+                requires_confirmation=True,
+            )
+        )
+        rr = FakeRunResponse(tools=[tool], requirements=[requirement])
+
+        await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].tool_execution is tool
+        assert rr.requirements[0].confirmation is True
+        assert rr.requirements[0].is_resolved()
+        assert rr.tools == [tool]
+
+    @pytest.mark.asyncio
+    async def test_approved_external_execution_without_result_stays_blocked_async(self):
+        db = MagicMock()
+        db.get_approvals = AsyncMock(return_value=([{"status": "approved", "resolution_data": None}], 1))
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="external_tool",
+            approval_type="required",
+            external_execution_required=True,
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+    @pytest.mark.asyncio
+    async def test_active_approval_id_from_another_run_is_ignored_async(self):
+        db = MagicMock()
+        db.get_approval = AsyncMock(
+            return_value={
+                "id": "approval-active",
+                "run_id": "other-run",
+                "approval_type": "required",
+                "status": "approved",
+                "resolution_data": None,
+            }
+        )
+        db.get_approvals = AsyncMock(return_value=([{"id": "approval-current", "status": "pending"}], 1))
+        tool = FakeToolExecution(
+            approval_type="required",
+            approval_id="approval-active",
+            requires_confirmation=True,
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="still pending"):
+            await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert tool.confirmed is None
+
+    @pytest.mark.asyncio
+    async def test_rejected_user_feedback_sets_answered_async(self):
+        db = MagicMock()
+        db.get_approvals = AsyncMock(return_value=([{"status": "rejected", "resolution_data": {"reason": "no"}}], 1))
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert tool.confirmed is False
+        assert tool.answered is True
+        assert tool.confirmation_note == "no"
+
+    @pytest.mark.asyncio
+    async def test_approved_user_feedback_requirement_is_resolved_async(self):
+        db = MagicMock()
+        db.get_approvals = AsyncMock(
+            return_value=(
+                [{"status": "approved", "resolution_data": {"selections": {"Deploy?": ["Yes"]}}}],
+                1,
+            )
+        )
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+        )
+        requirement = RunRequirement(
+            tool_execution=ToolExecution(
+                tool_call_id="call-1",
+                tool_name="ask_feedback",
+                approval_type="required",
+                requires_user_input=True,
+                user_feedback_schema=[FakeFeedbackQuestion(question="Deploy?")],
+            )
+        )
+        rr = FakeRunResponse(tools=[tool], requirements=[requirement])
+
+        await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert rr.requirements[0].is_resolved()
+        assert rr.requirements[0].tool_execution.answered is True
+
+    @pytest.mark.asyncio
+    async def test_null_user_input_value_stays_blocked_async(self):
+        db = MagicMock()
+        db.get_approvals = AsyncMock(
+            return_value=([{"status": "approved", "resolution_data": {"values": {"reason": None}}}], 1)
+        )
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_reason",
+            approval_type="required",
+            requires_user_input=True,
+            user_input_schema=[FakeUserInputField(name="reason")],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert tool.user_input_schema[0].value is None
+        assert tool.answered is None
+
+    @pytest.mark.asyncio
+    async def test_string_user_feedback_selection_stays_blocked_async(self):
+        db = MagicMock()
+        db.get_approvals = AsyncMock(
+            return_value=([{"status": "approved", "resolution_data": {"selections": {"Deploy?": "Yes"}}}], 1)
+        )
+        yes = FakeFeedbackOption(label="Yes")
+        prefix = FakeFeedbackOption(label="Ye")
+        question = FakeFeedbackQuestion(question="Deploy?", options=[prefix, yes])
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="ask_feedback",
+            approval_type="required",
+            requires_user_input=True,
+            user_feedback_schema=[question],
+        )
+        rr = FakeRunResponse(tools=[tool])
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            await acheck_and_apply_approval_resolution(db=db, run_id="r1", run_response=rr)
+
+        assert question.selected_options is None
+        assert prefix.selected is False
+        assert yes.selected is False
 
     @pytest.mark.asyncio
     async def test_falls_back_to_sync_get_approvals(self):

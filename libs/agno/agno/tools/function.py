@@ -1,18 +1,62 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from importlib.metadata import version
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Type, TypeVar, get_type_hints
+from inspect import unwrap
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Type,
+    TypeVar,
+    get_type_hints,
+)
 
 from docstring_parser import parse
 from packaging.version import Version
 from pydantic import BaseModel, Field, validate_call
 
-from agno.exceptions import AgentRunException, RunCancelledException
+from agno.exceptions import AgentRunException, RunCancelledException, ToolApprovalRequired, ToolCallDeferred
 from agno.media import Audio, File, Image, Video
 from agno.run import RunContext
 from agno.utils.log import log_debug, log_exception, log_warning
 
 T = TypeVar("T")
+
+
+def _is_async_callable(callable_obj: Optional[Callable]) -> bool:
+    if callable_obj is None:
+        return False
+
+    from inspect import iscoroutinefunction
+
+    if iscoroutinefunction(callable_obj):
+        return True
+
+    try:
+        if iscoroutinefunction(unwrap(callable_obj)):
+            return True
+    except Exception:
+        pass
+
+    call = getattr(callable_obj, "__call__", None)
+    if call is None:
+        return False
+
+    if iscoroutinefunction(call):
+        return True
+
+    try:
+        return iscoroutinefunction(unwrap(call))
+    except Exception:
+        return False
+
+
+def _is_sync_async_hook_runtime_error(exc: RuntimeError) -> bool:
+    return "Async hooks cannot run inside FunctionCall.execute(); use aexecute() instead." in str(exc)
 
 
 def get_entrypoint_docstring(entrypoint: Callable) -> str:
@@ -144,6 +188,9 @@ class Function(BaseModel):
         description="JSON Schema object describing function parameters",
     )
     strict: Optional[bool] = None
+    # If True, provider-side tool search may load this function only when needed.
+    # Currently consumed by OpenAI Responses formatting.
+    defer_loading: Optional[bool] = None
 
     instructions: Optional[str] = None
     # If True, add instructions to the Agent's system message
@@ -180,7 +227,7 @@ class Function(BaseModel):
     # If True, the function will be executed outside the agent's control.
     external_execution: Optional[bool] = None
 
-    # If True (and external_execution=True), the function will not produce verbose paused messages (e.g., "I have tools to execute...")
+    # If True (and external_execution=True), the function will not produce verbose paused messages.
     external_execution_silent: Optional[bool] = None
 
     # Approval type: "required" (blocking) or "audit" (non-blocking audit trail).
@@ -229,6 +276,7 @@ class Function(BaseModel):
             description=data.get("description"),
             parameters=data.get("parameters"),
             strict=data.get("strict"),
+            defer_loading=data.get("defer_loading"),
             requires_confirmation=data.get("requires_confirmation", False),
             external_execution=data.get("external_execution", False),
             approval_type=data.get("approval_type"),
@@ -293,6 +341,8 @@ class Function(BaseModel):
                 del type_hints["team"]
             if "run_context" in sig.parameters and "run_context" in type_hints:
                 del type_hints["run_context"]
+            if "fc" in sig.parameters and "fc" in type_hints:
+                del type_hints["fc"]
 
             # Remove media parameters from type hints as they are injected automatically
             if "images" in sig.parameters and "images" in type_hints:
@@ -315,6 +365,7 @@ class Function(BaseModel):
                     "agent",
                     "team",
                     "run_context",
+                    "fc",
                     "self",
                     "images",
                     "videos",
@@ -354,6 +405,7 @@ class Function(BaseModel):
                         "agent",
                         "team",
                         "run_context",
+                        "fc",
                         "self",
                         "images",
                         "videos",
@@ -372,6 +424,7 @@ class Function(BaseModel):
                         "agent",
                         "team",
                         "run_context",
+                        "fc",
                         "self",
                         "images",
                         "videos",
@@ -428,6 +481,8 @@ class Function(BaseModel):
                 del type_hints["team"]
             if "run_context" in sig.parameters and "run_context" in type_hints:
                 del type_hints["run_context"]
+            if "fc" in sig.parameters and "fc" in type_hints:
+                del type_hints["fc"]
             if "images" in sig.parameters and "images" in type_hints:
                 del type_hints["images"]
             if "videos" in sig.parameters and "videos" in type_hints:
@@ -443,6 +498,7 @@ class Function(BaseModel):
                 "agent",
                 "team",
                 "run_context",
+                "fc",
                 "self",
                 "images",
                 "videos",
@@ -657,6 +713,7 @@ class Function(BaseModel):
                 "agent",
                 "team",
                 "run_context",
+                "fc",
                 "images",
                 "videos",
                 "audios",
@@ -678,6 +735,8 @@ class Function(BaseModel):
             del copy_entrypoint_args["team"]
         if "run_context" in copy_entrypoint_args:
             del copy_entrypoint_args["run_context"]
+        if "fc" in copy_entrypoint_args:
+            del copy_entrypoint_args["fc"]
         if "images" in copy_entrypoint_args:
             del copy_entrypoint_args["images"]
         if "videos" in copy_entrypoint_args:
@@ -772,6 +831,25 @@ class FunctionCall(BaseModel):
     # Error while parsing arguments or running the function.
     error: Optional[str] = None
 
+    def _build_isolated_hook_args(self, hook_args: Dict[str, Any]) -> Dict[str, Any]:
+        """Give hooks an isolated view of RunContext.messages without mutating shared Function state."""
+
+        run_context = self.function._run_context
+        if run_context is None or run_context.messages is None:
+            return hook_args
+
+        isolated_run_context = replace(run_context, messages=list(run_context.messages))
+        isolated_args = dict(hook_args)
+        if "run_context" in isolated_args:
+            isolated_args["run_context"] = isolated_run_context
+
+        if "fc" in isolated_args:
+            isolated_function = self.function.model_copy(deep=False)
+            isolated_function._run_context = isolated_run_context
+            isolated_args["fc"] = self.model_copy(update={"function": isolated_function}, deep=False)
+
+        return isolated_args
+
     def get_call_str(self) -> str:
         """Returns a string representation of the function call."""
         import shutil
@@ -801,35 +879,156 @@ class FunctionCall(BaseModel):
     def _safe_hook_call(self, hook: Callable, hook_args: Dict[str, Any]) -> Any:
         """Call a hook with list-structure-safe messages.
 
-        Temporarily replaces run_context.messages with a shallow copy so the
-        hook cannot corrupt the live message list (e.g. .clear(), .append()).
-        Individual Message objects are still shared references — this protects
-        list structure only, not message contents. The live reference is
-        restored after the hook returns (or raises).
+        Hooks see a shallow-copied RunContext with a copied messages list so
+        they cannot corrupt the live message list (e.g. .clear(), .append()).
+        Individual Message objects are still shared references; this protects
+        list structure only, not message contents.
         """
-        rc = self.function._run_context
-        if rc is not None and rc.messages is not None:
-            live_ref = rc.messages
-            rc.messages = list(live_ref)
-            try:
-                return hook(**hook_args)
-            finally:
-                rc.messages = live_ref
-        else:
-            return hook(**hook_args)
+        return hook(**self._build_isolated_hook_args(hook_args))
 
     async def _safe_hook_call_async(self, hook: Callable, hook_args: Dict[str, Any]) -> Any:
         """Async variant of _safe_hook_call."""
-        rc = self.function._run_context
-        if rc is not None and rc.messages is not None:
-            live_ref = rc.messages
-            rc.messages = list(live_ref)
+        from inspect import isawaitable
+
+        result = hook(**self._build_isolated_hook_args(hook_args))
+        if isawaitable(result):
+            return await result
+        return result
+
+    def _safe_hook_call_sync_or_async(self, hook: Callable, hook_args: Dict[str, Any]) -> Any:
+        """Call a hook from the sync execution path, awaiting async hooks when possible."""
+        import asyncio
+        from inspect import isawaitable
+
+        if _is_async_callable(hook):
             try:
-                return await hook(**hook_args)
-            finally:
-                rc.messages = live_ref
-        else:
-            return await hook(**hook_args)
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(self._safe_hook_call_async(hook, hook_args))
+            raise RuntimeError("Async hooks cannot run inside FunctionCall.execute(); use aexecute() instead.")
+
+        result = hook(**self._build_isolated_hook_args(hook_args))
+        if isawaitable(result):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(result)  # type: ignore[arg-type]
+            close = getattr(result, "close", None)
+            if close is not None:
+                close()
+            raise RuntimeError("Async hooks cannot run inside FunctionCall.execute(); use aexecute() instead.")
+        return result
+
+    def _requires_async_execution(self) -> bool:
+        return bool(
+            _is_async_callable(self.function.pre_hook)
+            or _is_async_callable(self.function.post_hook)
+            or (
+                self.function.tool_hooks is not None
+                and any(_is_async_callable(hook) for hook in self.function.tool_hooks)
+            )
+        )
+
+    def _wrap_generator_with_post_hook(self, generator):
+        run_post_hook = False
+        try:
+            yield from generator
+            run_post_hook = True
+        except (ToolApprovalRequired, ToolCallDeferred):
+            raise
+        except Exception:
+            run_post_hook = True
+            raise
+        finally:
+            if run_post_hook:
+                self._handle_post_hook()
+
+    async def _wrap_async_generator_with_post_hook(self, generator):
+        run_post_hook = False
+        try:
+            async for item in generator:
+                yield item
+            run_post_hook = True
+        except (ToolApprovalRequired, ToolCallDeferred):
+            raise
+        except Exception:
+            run_post_hook = True
+            raise
+        finally:
+            if run_post_hook:
+                await self._handle_post_hook_async()
+
+    async def _wrap_sync_generator_with_async_post_hook(self, generator):
+        import asyncio
+
+        completed = False
+        run_post_hook = False
+        loop = asyncio.get_running_loop()
+
+        def _next_item():
+            try:
+                return True, next(generator)
+            except StopIteration:
+                return False, None
+
+        try:
+            while True:
+                try:
+                    has_item, item = await loop.run_in_executor(None, _next_item)
+                except (ToolApprovalRequired, ToolCallDeferred):
+                    raise
+                except Exception:
+                    run_post_hook = True
+                    raise
+                if not has_item:
+                    completed = True
+                    run_post_hook = True
+                    break
+                yield item
+        finally:
+            if run_post_hook:
+                await self._handle_post_hook_async()
+            elif not completed:
+                close = getattr(generator, "close", None)
+                if close is not None:
+                    try:
+                        await loop.run_in_executor(None, close)
+                    except Exception:
+                        pass
+
+    async def _run_sync_entrypoint_in_thread(self, entrypoint_args: Dict[str, Any]) -> Any:
+        import asyncio
+        from inspect import isgeneratorfunction
+
+        arguments = entrypoint_args.copy()
+        if self.arguments is not None:
+            arguments.update(self.arguments)
+
+        if self.function.entrypoint is not None and isgeneratorfunction(unwrap(self.function.entrypoint)):
+            return self.function.entrypoint(**arguments)  # type: ignore
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self.function.entrypoint(**arguments))  # type: ignore
+
+    def _wrap_async_generator_for_sync_execution(self, async_generator):
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        completed = False
+        try:
+            while True:
+                try:
+                    yield loop.run_until_complete(async_generator.__anext__())
+                except StopAsyncIteration:
+                    completed = True
+                    break
+        finally:
+            if not completed:
+                try:
+                    loop.run_until_complete(async_generator.aclose())
+                except RuntimeError:
+                    pass
+            loop.close()
 
     def _handle_pre_hook(self):
         """Handles the pre-hook for the function call."""
@@ -850,13 +1049,20 @@ class FunctionCall(BaseModel):
                 # Check if the pre-hook has an fc argument
                 if "fc" in signature(self.function.pre_hook).parameters:
                     pre_hook_args["fc"] = self
-                self._safe_hook_call(self.function.pre_hook, pre_hook_args)
+                self._safe_hook_call_sync_or_async(self.function.pre_hook, pre_hook_args)
+            except (ToolApprovalRequired, ToolCallDeferred):
+                raise
             except AgentRunException as e:
                 log_debug(f"{e.__class__.__name__}: {e}")
                 self.error = str(e)
                 raise
             except RunCancelledException:
                 raise
+            except RuntimeError as e:
+                if _is_sync_async_hook_runtime_error(e):
+                    raise
+                log_warning(f"Error in pre-hook callback: {str(e)}")
+                log_exception(e)
             except Exception as e:
                 log_warning(f"Error in pre-hook callback: {str(e)}")
                 log_exception(e)
@@ -880,13 +1086,23 @@ class FunctionCall(BaseModel):
                 # Check if the post-hook has an fc argument
                 if "fc" in signature(self.function.post_hook).parameters:
                     post_hook_args["fc"] = self
-                self._safe_hook_call(self.function.post_hook, post_hook_args)
+                self._safe_hook_call_sync_or_async(self.function.post_hook, post_hook_args)
+            except (ToolApprovalRequired, ToolCallDeferred) as e:
+                log_warning(
+                    "Dynamic HITL signals are not supported in post-hook callbacks because the tool has already run: "
+                    f"{str(e)}"
+                )
             except AgentRunException as e:
                 log_debug(f"{e.__class__.__name__}: {e}")
                 self.error = str(e)
                 raise
             except RunCancelledException:
                 raise
+            except RuntimeError as e:
+                if _is_sync_async_hook_runtime_error(e):
+                    raise
+                log_warning(f"Error in post-hook callback: {str(e)}")
+                log_exception(e)
             except Exception as e:
                 log_warning(f"Error in post-hook callback: {str(e)}")
                 log_exception(e)
@@ -989,7 +1205,6 @@ class FunctionCall(BaseModel):
         at the innermost level. Returns bubble back up through each hook.
         """
         from functools import reduce
-        from inspect import iscoroutinefunction
 
         def execute_entrypoint(name, func, args):
             """Execute the entrypoint function."""
@@ -1013,15 +1228,15 @@ class FunctionCall(BaseModel):
 
                 hook_args = self._build_hook_args(hook, name, next_func, args)
 
-                return self._safe_hook_call(hook, hook_args)
+                return self._safe_hook_call_sync_or_async(hook, hook_args)
 
             return wrapper
 
         # Remove coroutine hooks
         final_hooks = []
         for hook in self.function.tool_hooks:
-            if iscoroutinefunction(hook):
-                log_warning(f"Cannot use async hooks with sync function calls. Skipping hook: {hook.__name__}")
+            if _is_async_callable(hook):
+                log_warning(f"Cannot use async hooks with sync function calls. Skipping hook: {hook}")
             else:
                 final_hooks.append(hook)
 
@@ -1037,16 +1252,35 @@ class FunctionCall(BaseModel):
         if self.function.entrypoint is None:
             return FunctionExecutionResult(status="failure", error="Entrypoint is not set")
 
+        if self._requires_async_execution():
+            import asyncio
+            import collections
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                async_execution_result = asyncio.run(self.aexecute())
+                if isinstance(self.result, collections.abc.AsyncIterator):
+                    self.result = self._wrap_async_generator_for_sync_execution(self.result)
+                    async_execution_result.result = self.result
+                return async_execution_result
+            raise RuntimeError(
+                "FunctionCall.execute() cannot run async hooks inside a running event loop; use aexecute()."
+            )
+
         log_debug(f"Running: {self.get_call_str()}")
 
         # Execute pre-hook if it exists
         self._handle_pre_hook()
 
         entrypoint_args = self._build_entrypoint_args()
+        run_context = self.function._run_context
+        cache_allowed = run_context is None
+        cache_entrypoint_args = entrypoint_args
 
         # Check cache if enabled and not a generator function
-        if self.function.cache_results and not isgeneratorfunction(self.function.entrypoint):
-            cache_key = self.function._get_cache_key(entrypoint_args, self.arguments)
+        if self.function.cache_results and cache_allowed and not isgeneratorfunction(self.function.entrypoint):
+            cache_key = self.function._get_cache_key(cache_entrypoint_args, self.arguments)
             cache_file = self.function._get_cache_file_path(cache_key)
             cached_result = self.function._get_cached_result(cache_file)
 
@@ -1058,6 +1292,7 @@ class FunctionCall(BaseModel):
         # Execute function
         execution_result: FunctionExecutionResult
         exception_to_raise = None
+        skip_post_hook = False
 
         try:
             # Build and execute the nested chain of hooks
@@ -1069,7 +1304,8 @@ class FunctionCall(BaseModel):
 
             # Handle generator case
             if isgenerator(result):
-                self.result = result  # Store generator directly, can't cache
+                self.result = self._wrap_generator_with_post_hook(result)  # Store generator directly, can't cache
+                skip_post_hook = True
                 # For generators, don't capture updated_session_state yet -
                 # session_state is passed by reference, so mutations made during
                 # generator iteration are already reflected in the original dict.
@@ -1080,8 +1316,8 @@ class FunctionCall(BaseModel):
             else:
                 self.result = result
                 # Only cache non-generator results
-                if self.function.cache_results:
-                    cache_key = self.function._get_cache_key(entrypoint_args, self.arguments)
+                if self.function.cache_results and cache_allowed:
+                    cache_key = self.function._get_cache_key(cache_entrypoint_args, self.arguments)
                     cache_file = self.function._get_cache_file_path(cache_key)
                     self.function._save_to_cache(cache_file, self.result)
 
@@ -1098,6 +1334,9 @@ class FunctionCall(BaseModel):
                     status="success", result=self.result, updated_session_state=updated_session_state
                 )
 
+        except (ToolApprovalRequired, ToolCallDeferred):
+            skip_post_hook = True
+            raise
         except AgentRunException as e:
             log_debug(f"{e.__class__.__name__}: {e}")
             self.error = str(e)
@@ -1105,14 +1344,26 @@ class FunctionCall(BaseModel):
             execution_result = FunctionExecutionResult(status="failure", error=str(e))
         except RunCancelledException:
             raise
+        except RuntimeError as e:
+            if _is_sync_async_hook_runtime_error(e):
+                skip_post_hook = True
+                raise
+            log_warning(f"Could not run function {self.get_call_str()}: {str(e)}")
+            log_exception(e)
+            self.error = str(e)
+            execution_result = FunctionExecutionResult(status="failure", error=str(e))
         except Exception as e:
             log_warning(f"Could not run function {self.get_call_str()}: {str(e)}")
             log_exception(e)
             self.error = str(e)
             execution_result = FunctionExecutionResult(status="failure", error=str(e))
+        except BaseException:
+            skip_post_hook = True
+            raise
 
         finally:
-            self._handle_post_hook()
+            if not skip_post_hook:
+                self._handle_post_hook()
 
         if exception_to_raise is not None:
             raise exception_to_raise
@@ -1140,6 +1391,8 @@ class FunctionCall(BaseModel):
                     pre_hook_args["fc"] = self
 
                 await self._safe_hook_call_async(self.function.pre_hook, pre_hook_args)
+            except (ToolApprovalRequired, ToolCallDeferred):
+                raise
             except AgentRunException as e:
                 log_debug(f"{e.__class__.__name__}: {e}")
                 self.error = str(e)
@@ -1171,6 +1424,11 @@ class FunctionCall(BaseModel):
                     post_hook_args["fc"] = self
 
                 await self._safe_hook_call_async(self.function.post_hook, post_hook_args)
+            except (ToolApprovalRequired, ToolCallDeferred) as e:
+                log_warning(
+                    "Dynamic HITL signals are not supported in post-hook callbacks because the tool has already run: "
+                    f"{str(e)}"
+                )
             except AgentRunException as e:
                 log_debug(f"{e.__class__.__name__}: {e}")
                 self.error = str(e)
@@ -1187,7 +1445,7 @@ class FunctionCall(BaseModel):
         Similar to _build_nested_execution_chain but for async execution.
         """
         from functools import reduce
-        from inspect import isasyncgenfunction, iscoroutinefunction
+        from inspect import isasyncgenfunction, isawaitable, iscoroutinefunction
 
         async def execute_entrypoint_async(name, func, args):
             """Execute the entrypoint function asynchronously."""
@@ -1196,20 +1454,20 @@ class FunctionCall(BaseModel):
                 arguments.update(self.arguments)
 
             result = self.function.entrypoint(**arguments)  # type: ignore
-            if iscoroutinefunction(self.function.entrypoint) and not isasyncgenfunction(self.function.entrypoint):
+            if isawaitable(result) and not isasyncgenfunction(self.function.entrypoint):
                 result = await result
             return result
 
-        def execute_entrypoint(name, func, args):
-            """Execute the entrypoint function synchronously."""
-            arguments = entrypoint_args.copy()
-            if self.arguments is not None:
-                arguments.update(self.arguments)
-            return self.function.entrypoint(**arguments)  # type: ignore
+        async def execute_entrypoint(name, func, args):
+            """Execute the sync entrypoint without blocking the event loop."""
+            return await self._run_sync_entrypoint_in_thread(entrypoint_args)
 
-        # If no hooks, just return the async entrypoint execution function
+        # If no hooks, use the direct async path for async entrypoints and the
+        # threaded path for sync entrypoints so aexecute() does not block the loop.
         if not self.function.tool_hooks:
-            return execute_entrypoint_async
+            if iscoroutinefunction(self.function.entrypoint):
+                return execute_entrypoint_async
+            return execute_entrypoint
 
         def create_hook_wrapper(inner_func, hook):
             """Create a nested wrapper for the hook."""
@@ -1220,17 +1478,14 @@ class FunctionCall(BaseModel):
                 # Pass the inner function as next_func to the hook
                 # The hook will call next_func to continue the chain
                 async def next_func(**kwargs):
-                    if iscoroutinefunction(inner_func):
-                        return await inner_func(name, func, kwargs)
-                    else:
-                        return inner_func(name, func, kwargs)
+                    result = inner_func(name, func, kwargs)
+                    if isawaitable(result):
+                        return await result
+                    return result
 
                 hook_args = self._build_hook_args(hook, name, next_func, args)
 
-                if iscoroutinefunction(hook):
-                    return await self._safe_hook_call_async(hook, hook_args)
-                else:
-                    return self._safe_hook_call(hook, hook_args)
+                return await self._safe_hook_call_async(hook, hook_args)
 
             return wrapper
 
@@ -1254,18 +1509,21 @@ class FunctionCall(BaseModel):
         log_debug(f"Running: {self.get_call_str()}")
 
         # Execute pre-hook if it exists
-        if iscoroutinefunction(self.function.pre_hook):
+        if self.function.pre_hook is not None:
             await self._handle_pre_hook_async()
-        else:
-            self._handle_pre_hook()
 
         entrypoint_args = self._build_entrypoint_args()
+        run_context = self.function._run_context
+        cache_allowed = run_context is None
+        cache_entrypoint_args = entrypoint_args
 
         # Check cache if enabled and not a generator function
-        if self.function.cache_results and not (
-            isasyncgenfunction(self.function.entrypoint) or isgeneratorfunction(self.function.entrypoint)
+        if (
+            self.function.cache_results
+            and not (isasyncgenfunction(self.function.entrypoint) or isgeneratorfunction(self.function.entrypoint))
+            and cache_allowed
         ):
-            cache_key = self.function._get_cache_key(entrypoint_args, self.arguments)
+            cache_key = self.function._get_cache_key(cache_entrypoint_args, self.arguments)
             cache_file = self.function._get_cache_file_path(cache_key)
             cached_result = self.function._get_cached_result(cache_file)
             if cached_result is not None:
@@ -1276,6 +1534,7 @@ class FunctionCall(BaseModel):
         # Execute function
         execution_result: FunctionExecutionResult
         exception_to_raise = None
+        skip_post_hook = False
 
         try:
             # Build and execute the nested chain of hooks
@@ -1283,24 +1542,46 @@ class FunctionCall(BaseModel):
                 execution_chain = await self._build_nested_execution_chain_async(entrypoint_args)
                 self.result = await execution_chain(self.function.name, self.function.entrypoint, self.arguments or {})
             else:
-                if self.arguments is None or self.arguments == {}:
-                    result = self.function.entrypoint(**entrypoint_args)
+                if (
+                    isasyncgenfunction(self.function.entrypoint)
+                    or iscoroutinefunction(self.function.entrypoint)
+                    or isgeneratorfunction(self.function.entrypoint)
+                ):
+                    if self.arguments is None or self.arguments == {}:
+                        result = self.function.entrypoint(**entrypoint_args)
+                    else:
+                        result = self.function.entrypoint(**entrypoint_args, **self.arguments)
                 else:
-                    result = self.function.entrypoint(**entrypoint_args, **self.arguments)
+                    result = None
 
                 # Handle both sync and async entrypoints
                 if isasyncgenfunction(self.function.entrypoint):
-                    self.result = result  # Store async generator directly
+                    self.result = self._wrap_async_generator_with_post_hook(result)  # Store async generator directly
+                    skip_post_hook = True
                 elif iscoroutinefunction(self.function.entrypoint):
                     self.result = await result  # Await coroutine result
                 elif isgeneratorfunction(self.function.entrypoint):
-                    self.result = result  # Store sync generator directly
+                    self.result = self._wrap_sync_generator_with_async_post_hook(
+                        result
+                    )  # Store sync generator directly
+                    skip_post_hook = True
                 else:
-                    self.result = result  # Sync function, result is already computed
+                    self.result = await self._run_sync_entrypoint_in_thread(entrypoint_args)
+
+            if not skip_post_hook and isasyncgen(self.result):
+                self.result = self._wrap_async_generator_with_post_hook(self.result)
+                skip_post_hook = True
+            elif not skip_post_hook and isgenerator(self.result):
+                self.result = self._wrap_sync_generator_with_async_post_hook(self.result)
+                skip_post_hook = True
 
             # Only cache if not a generator
-            if self.function.cache_results and not (isgenerator(self.result) or isasyncgen(self.result)):
-                cache_key = self.function._get_cache_key(entrypoint_args, self.arguments)
+            if (
+                self.function.cache_results
+                and cache_allowed
+                and not (isgenerator(self.result) or isasyncgen(self.result))
+            ):
+                cache_key = self.function._get_cache_key(cache_entrypoint_args, self.arguments)
                 cache_file = self.function._get_cache_file_path(cache_key)
                 self.function._save_to_cache(cache_file, self.result)
 
@@ -1324,6 +1605,9 @@ class FunctionCall(BaseModel):
                 status="success", result=self.result, updated_session_state=updated_session_state
             )
 
+        except (ToolApprovalRequired, ToolCallDeferred):
+            skip_post_hook = True
+            raise
         except AgentRunException as e:
             log_debug(f"{e.__class__.__name__}: {e}")
             self.error = str(e)
@@ -1336,12 +1620,13 @@ class FunctionCall(BaseModel):
             log_exception(e)
             self.error = str(e)
             execution_result = FunctionExecutionResult(status="failure", error=str(e))
+        except BaseException:
+            skip_post_hook = True
+            raise
 
         finally:
-            if iscoroutinefunction(self.function.post_hook):
+            if not skip_post_hook:
                 await self._handle_post_hook_async()
-            else:
-                self._handle_post_hook()
 
         if exception_to_raise is not None:
             raise exception_to_raise

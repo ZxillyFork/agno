@@ -28,12 +28,18 @@ class RunRequirement:
     user_feedback_schema: Optional[List[UserFeedbackQuestion]] = None
 
     # External execution
-    external_execution_result: Optional[str] = None
+    external_execution_result: Optional[Any] = None
+    external_execution_result_provided: bool = False
+    approval_metadata: Optional[Dict[str, Any]] = None
 
     # Member context (set when requirement originates from a team member)
     member_agent_id: Optional[str] = None
     member_agent_name: Optional[str] = None
     member_run_id: Optional[str] = None
+    routed_member_agent_id: Optional[str] = None
+    routed_member_agent_name: Optional[str] = None
+    routed_member_run_id: Optional[str] = None
+    routed_member_is_team_level: bool = False
 
     def __init__(
         self,
@@ -49,12 +55,19 @@ class RunRequirement:
         self.confirmation = None
         self.confirmation_note = None
         self.external_execution_result = None
+        self.external_execution_result_provided = False
+        self.approval_metadata = None
         self.member_agent_id = None
         self.member_agent_name = None
         self.member_run_id = None
+        self.routed_member_agent_id = None
+        self.routed_member_agent_name = None
+        self.routed_member_run_id = None
+        self.routed_member_is_team_level = False
         # Internal: holds a reference to the member's paused RunOutput so
         # continue_run can pass it directly without a session lookup.
         self._member_run_response: Any = None
+        self._routing_failed = False
 
     @property
     def needs_confirmation(self) -> bool:
@@ -94,17 +107,23 @@ class RunRequirement:
     def needs_external_execution(self) -> bool:
         if not self.tool_execution:
             return False
-        if self.external_execution_result is not None:
+        if (
+            self.external_execution_result_provided
+            or self.external_execution_result is not None
+            or self.tool_execution.external_execution_result_provided
+        ):
             return False
 
         return self.tool_execution.external_execution_required or False
 
-    def confirm(self):
+    def confirm(self, metadata: Optional[Dict[str, Any]] = None):
         if not self.needs_confirmation:
             raise ValueError("This requirement does not require confirmation")
         self.confirmation = True
+        self.approval_metadata = metadata
         if self.tool_execution:
             self.tool_execution.confirmed = True
+            self.tool_execution.resume_metadata = metadata
 
     def reject(self, note: Optional[str] = None):
         if not self.needs_confirmation:
@@ -144,6 +163,15 @@ class RunRequirement:
         """
         if not self.needs_user_feedback:
             raise ValueError("This requirement does not require user feedback")
+        if not isinstance(selections, dict):
+            raise ValueError("Feedback selections must be a dictionary")
+        for question_text, selected_options in selections.items():
+            if (
+                not isinstance(question_text, str)
+                or not isinstance(selected_options, list)
+                or not all(isinstance(option, str) for option in selected_options)
+            ):
+                raise ValueError("Feedback selections must map question text to lists of option labels")
         if self.user_feedback_schema:
             for question in self.user_feedback_schema:
                 if question.question in selections:
@@ -163,12 +191,14 @@ class RunRequirement:
             if all(q.selected_options is not None for q in self.user_feedback_schema) and self.tool_execution:
                 self.tool_execution.answered = True
 
-    def set_external_execution_result(self, result: str):
+    def set_external_execution_result(self, result: Any):
         if not self.needs_external_execution:
             raise ValueError("This requirement does not require external execution")
         self.external_execution_result = result
+        self.external_execution_result_provided = True
         if self.tool_execution:
             self.tool_execution.result = result
+            self.tool_execution.external_execution_result_provided = True
 
     def is_resolved(self) -> bool:
         """Return True if the requirement has been resolved"""
@@ -200,10 +230,16 @@ class RunRequirement:
             "created_at": self.created_at.isoformat() if isinstance(self.created_at, datetime) else self.created_at,
             "confirmation": self.confirmation,
             "confirmation_note": self.confirmation_note,
+            "approval_metadata": self.approval_metadata,
             "external_execution_result": self.external_execution_result,
+            "external_execution_result_provided": True if self.external_execution_result_provided else None,
             "member_agent_id": self.member_agent_id,
             "member_agent_name": self.member_agent_name,
             "member_run_id": self.member_run_id,
+            "routed_member_agent_id": self.routed_member_agent_id,
+            "routed_member_agent_name": self.routed_member_agent_name,
+            "routed_member_run_id": self.routed_member_run_id,
+            "routed_member_is_team_level": True if self.routed_member_is_team_level else None,
         }
 
         if self.tool_execution is not None:
@@ -219,7 +255,11 @@ class RunRequirement:
                 q.to_dict() if hasattr(q, "to_dict") else q for q in self.user_feedback_schema
             ]
 
-        return {k: v for k, v in _dict.items() if v is not None}
+        result = {k: v for k, v in _dict.items() if v is not None}
+        if self.external_execution_result_provided:
+            result["external_execution_result"] = self.external_execution_result
+            result["external_execution_result_provided"] = True
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunRequirement":
@@ -260,10 +300,38 @@ class RunRequirement:
         # Set optional fields
         requirement.confirmation = data.get("confirmation")
         requirement.confirmation_note = data.get("confirmation_note")
-        requirement.external_execution_result = data.get("external_execution_result")
+        requirement.approval_metadata = data.get("approval_metadata")
+        if requirement.approval_metadata is None and tool_execution.resume_metadata is not None:
+            requirement.approval_metadata = tool_execution.resume_metadata
+
+        requirement.external_execution_result_provided = bool(data.get("external_execution_result_provided", False))
+        if requirement.external_execution_result_provided:
+            requirement.external_execution_result = data.get("external_execution_result")
+        elif data.get("external_execution_result") is not None:
+            requirement.external_execution_result = data.get("external_execution_result")
+            requirement.external_execution_result_provided = True
+        elif tool_execution.external_execution_result_provided or (
+            tool_execution.external_execution_required and tool_execution.result is not None
+        ):
+            requirement.external_execution_result = tool_execution.result
+            requirement.external_execution_result_provided = True
         requirement.member_agent_id = data.get("member_agent_id")
         requirement.member_agent_name = data.get("member_agent_name")
         requirement.member_run_id = data.get("member_run_id")
+        requirement.routed_member_agent_id = data.get("routed_member_agent_id")
+        requirement.routed_member_agent_name = data.get("routed_member_agent_name")
+        requirement.routed_member_run_id = data.get("routed_member_run_id")
+        requirement.routed_member_is_team_level = bool(data.get("routed_member_is_team_level", False))
+
+        if requirement.tool_execution is not None:
+            if requirement.confirmation is not None:
+                requirement.tool_execution.confirmed = requirement.confirmation
+                requirement.tool_execution.confirmation_note = requirement.confirmation_note
+                if requirement.approval_metadata is not None:
+                    requirement.tool_execution.resume_metadata = requirement.approval_metadata
+            if requirement.external_execution_result_provided:
+                requirement.tool_execution.result = requirement.external_execution_result
+                requirement.tool_execution.external_execution_result_provided = True
 
         # Handle user_input_schema
         schema_raw = data.get("user_input_schema")
@@ -274,7 +342,11 @@ class RunRequirement:
                     rebuilt_schema.append(item)
                 elif isinstance(item, dict):
                     rebuilt_schema.append(UserInputField.from_dict(item))
-            requirement.user_input_schema = rebuilt_schema if rebuilt_schema else None
+            requirement.user_input_schema = rebuilt_schema
+            if requirement.tool_execution is not None:
+                requirement.tool_execution.user_input_schema = requirement.user_input_schema
+                if requirement.user_input_schema and all(f.value is not None for f in requirement.user_input_schema):
+                    requirement.tool_execution.answered = True
 
         # Handle user_feedback_schema
         feedback_raw = data.get("user_feedback_schema")
@@ -285,6 +357,12 @@ class RunRequirement:
                     rebuilt_feedback.append(item)
                 elif isinstance(item, dict):
                     rebuilt_feedback.append(UserFeedbackQuestion.from_dict(item))
-            requirement.user_feedback_schema = rebuilt_feedback if rebuilt_feedback else None
+            requirement.user_feedback_schema = rebuilt_feedback
+            if requirement.tool_execution is not None:
+                requirement.tool_execution.user_feedback_schema = requirement.user_feedback_schema
+                if requirement.user_feedback_schema and all(
+                    q.selected_options is not None for q in requirement.user_feedback_schema
+                ):
+                    requirement.tool_execution.answered = True
 
         return requirement

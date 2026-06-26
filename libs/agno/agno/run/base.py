@@ -33,6 +33,11 @@ class RunContext:
     # Individual Message objects are shared references — do not mutate them.
     messages: Optional[List[Message]] = None
 
+    # Tool-level HITL resume context. Dynamic approval tools can check
+    # tool_call_approved to avoid requesting approval again after continue_run.
+    tool_call_approved: bool = False
+    tool_call_metadata: Optional[Dict[str, Any]] = None
+
     # Runtime-resolved callable factory results
     tools: Optional[List[Any]] = None
     knowledge: Optional[Any] = None
@@ -202,17 +207,18 @@ class BaseRunOutputEvent:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]):
+        data = dict(data)
         tool = data.pop("tool", None)
         if tool:
             from agno.models.response import ToolExecution
 
-            data["tool"] = ToolExecution.from_dict(tool)
+            data["tool"] = tool if isinstance(tool, ToolExecution) else ToolExecution.from_dict(tool)
 
         tools = data.pop("tools", None)
-        if tools:
+        if tools is not None:
             from agno.models.response import ToolExecution
 
-            data["tools"] = [ToolExecution.from_dict(t) for t in tools]
+            data["tools"] = [t if isinstance(t, ToolExecution) else ToolExecution.from_dict(t) for t in tools]
 
         images = data.pop("images", None)
         if images:
@@ -290,7 +296,7 @@ class BaseRunOutputEvent:
                     requirements_list.append(item)
                 elif isinstance(item, dict):
                     requirements_list.append(RunRequirement.from_dict(item))
-            data["requirements"] = requirements_list if requirements_list else None
+            data["requirements"] = requirements_list
 
         # Handle tasks (TaskData objects in TaskStateUpdatedEvent)
         tasks_data = data.pop("tasks", None)
