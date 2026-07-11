@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 
 from agno.models.response import ToolExecution
-from agno.run.agent import RunOutput
+from agno.run.agent import RunOutput, RunStartedEvent
 from agno.run.requirement import RunRequirement
 from agno.run.team import TeamRunOutput
 from agno.session import AgentSession
@@ -100,11 +100,31 @@ def test_agent_session_from_dict_returns_canonical_run_identities():
                 "regenerated_from": 13,
                 "agent_id": "agent-1",
                 "session_id": "session-1",
+                "tools": [
+                    {
+                        "tool_name": "delegate",
+                        "tool_args": {},
+                        "child_run_id": _LegacyInteger(16),
+                    }
+                ],
                 "requirements": [
                     {
-                        "tool_execution": {"tool_name": "lookup", "tool_args": {}},
+                        "tool_execution": {
+                            "tool_name": "lookup",
+                            "tool_args": {},
+                            "child_run_id": _LegacyInteger(17),
+                        },
                         "member_run_id": 14,
                         "routed_member_run_id": 15,
+                    }
+                ],
+                "events": [
+                    {
+                        "event": "RunStarted",
+                        "agent_id": "agent-1",
+                        "run_id": _LegacyInteger(18),
+                        "parent_run_id": _LegacyInteger(19),
+                        "workflow_run_id": _LegacyInteger(20),
                     }
                 ],
             },
@@ -126,9 +146,16 @@ def test_agent_session_from_dict_returns_canonical_run_identities():
     assert session.runs[0].parent_run_id == "11"
     assert session.runs[0].forked_from_run_id == "12"
     assert session.runs[0].regenerated_from == "13"
+    assert session.runs[0].tools is not None
+    assert session.runs[0].tools[0].child_run_id == "16"
     assert session.runs[0].requirements is not None
+    assert session.runs[0].requirements[0].tool_execution.child_run_id == "17"
     assert session.runs[0].requirements[0].member_run_id == "14"
     assert session.runs[0].requirements[0].routed_member_run_id == "15"
+    assert session.runs[0].events is not None
+    assert session.runs[0].events[0].run_id == "18"
+    assert session.runs[0].events[0].parent_run_id == "19"
+    assert session.runs[0].events[0].workflow_run_id == "20"
 
 
 @pytest.mark.parametrize(
@@ -181,3 +208,48 @@ def test_run_requirement_to_dict_rejects_invalid_identity(field_name: str):
 
     with pytest.raises(TypeError, match=field_name):
         requirement.to_dict()
+
+
+@pytest.mark.parametrize("invalid_value", (True, 1.5))
+def test_tool_execution_from_dict_rejects_invalid_child_run_id(
+    invalid_value: object,
+):
+    with pytest.raises(TypeError, match="child_run_id"):
+        ToolExecution.from_dict({"child_run_id": invalid_value})
+
+
+def test_tool_execution_to_dict_rejects_invalid_child_run_id():
+    tool = ToolExecution(child_run_id=50358656)
+
+    with pytest.raises(TypeError, match="child_run_id"):
+        tool.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("event_class", "field_name"),
+    (
+        (RunStartedEvent, "run_id"),
+        (RunStartedEvent, "parent_run_id"),
+        (RunStartedEvent, "workflow_run_id"),
+    ),
+)
+@pytest.mark.parametrize("invalid_value", (True, 1.5))
+def test_run_event_from_dict_rejects_invalid_identity(event_class, field_name: str, invalid_value: object):
+    with pytest.raises(TypeError, match=field_name):
+        event_class.from_dict({field_name: invalid_value})
+
+
+@pytest.mark.parametrize(
+    ("event_class", "field_name"),
+    (
+        (RunStartedEvent, "run_id"),
+        (RunStartedEvent, "parent_run_id"),
+        (RunStartedEvent, "workflow_run_id"),
+    ),
+)
+def test_run_event_to_dict_rejects_invalid_identity(event_class, field_name: str):
+    event = event_class()
+    setattr(event, field_name, 50358656)
+
+    with pytest.raises(TypeError, match=field_name):
+        event.to_dict()

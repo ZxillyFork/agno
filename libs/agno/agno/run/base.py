@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -47,6 +47,13 @@ class RunContext:
 @dataclass
 class BaseRunOutputEvent:
     def to_dict(self) -> Dict[str, Any]:
+        for field_name in ("run_id", "parent_run_id", "workflow_run_id"):
+            if not hasattr(self, field_name):
+                continue
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string or None, got {type(value).__name__}")
+
         _dict = {
             k: v
             for k, v in asdict(self).items()
@@ -208,6 +215,16 @@ class BaseRunOutputEvent:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]):
         data = dict(data)
+        supported_fields = {field.name for field in fields(cls)}
+        for field_name in ("run_id", "parent_run_id", "workflow_run_id"):
+            if field_name not in supported_fields:
+                continue
+            value = data.get(field_name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                data[field_name] = str(value)
+            elif value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string, legacy integer, or None, got {type(value).__name__}")
+
         tool = data.pop("tool", None)
         if tool:
             from agno.models.response import ToolExecution
@@ -310,9 +327,6 @@ class BaseRunOutputEvent:
         if cls.__name__ == "CustomEvent":
             return cls(**data)
 
-        from dataclasses import fields
-
-        supported_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in supported_fields}
 
         return cls(**filtered_data)

@@ -76,6 +76,9 @@ class ToolExecution:
         return bool(self.requires_confirmation or self.requires_user_input or self.external_execution_required)
 
     def to_dict(self) -> Dict[str, Any]:
+        if self.child_run_id is not None and not isinstance(self.child_run_id, str):
+            raise TypeError(f"child_run_id must be a string or None, got {type(self.child_run_id).__name__}")
+
         _dict = asdict(self)
         if self.metrics is not None:
             _dict["metrics"] = self.metrics.to_dict()
@@ -90,6 +93,14 @@ class ToolExecution:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ToolExecution":
+        child_run_id = data.get("child_run_id")
+        if isinstance(child_run_id, int) and not isinstance(child_run_id, bool):
+            child_run_id = str(child_run_id)
+        elif child_run_id is not None and not isinstance(child_run_id, str):
+            raise TypeError(
+                f"child_run_id must be a string, legacy integer, or None, got {type(child_run_id).__name__}"
+            )
+
         user_input_schema = data.get("user_input_schema")
         if user_input_schema is not None:
             user_input_schema = [
@@ -110,7 +121,7 @@ class ToolExecution:
             tool_args=data.get("tool_args"),
             tool_call_error=data.get("tool_call_error"),
             result=data.get("result"),
-            child_run_id=data.get("child_run_id"),
+            child_run_id=child_run_id,
             stop_after_tool_call=data.get("stop_after_tool_call", False),
             requires_confirmation=data.get("requires_confirmation"),
             confirmed=data.get("confirmed"),
