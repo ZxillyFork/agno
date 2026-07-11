@@ -845,6 +845,11 @@ class TeamRunOutput:
         return self.status == RunStatus.cancelled
 
     def to_dict(self) -> Dict[str, Any]:
+        for field_name in ("run_id", "parent_run_id", "forked_from_run_id", "regenerated_from"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string or None, got {type(value).__name__}")
+
         _dict = {
             k: v
             for k, v in asdict(self).items()
@@ -963,6 +968,13 @@ class TeamRunOutput:
     def from_dict(cls, data: Dict[str, Any]) -> "TeamRunOutput":
         inner = data.get("run")
         data = dict(inner) if isinstance(inner, dict) else dict(data)
+
+        for field_name in ("run_id", "parent_run_id", "forked_from_run_id", "regenerated_from"):
+            value = data.get(field_name)
+            if type(value) is int:
+                data[field_name] = str(value)
+            elif value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string, legacy integer, or None, got {type(value).__name__}")
 
         events = data.pop("events", None)
         final_events: List[Union[RunOutputEvent, TeamRunOutputEvent]] = []
