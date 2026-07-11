@@ -225,6 +225,11 @@ class RunRequirement:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary for storage."""
+        for field_name in ("member_run_id", "routed_member_run_id"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string or None, got {type(value).__name__}")
+
         _dict: Dict[str, Any] = {
             "id": self.id,
             "created_at": self.created_at.isoformat() if isinstance(self.created_at, datetime) else self.created_at,
@@ -266,6 +271,15 @@ class RunRequirement:
         """Reconstruct from stored dictionary."""
         if data is None:
             raise ValueError("RunRequirement.from_dict() requires a non-None dict")
+
+        run_ids: Dict[str, Optional[str]] = {}
+        for field_name in ("member_run_id", "routed_member_run_id"):
+            value = data.get(field_name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                value = str(value)
+            elif value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string, legacy integer, or None, got {type(value).__name__}")
+            run_ids[field_name] = value
 
         # Handle tool_execution
         tool_data = data.get("tool_execution")
@@ -317,10 +331,10 @@ class RunRequirement:
             requirement.external_execution_result_provided = True
         requirement.member_agent_id = data.get("member_agent_id")
         requirement.member_agent_name = data.get("member_agent_name")
-        requirement.member_run_id = data.get("member_run_id")
+        requirement.member_run_id = run_ids["member_run_id"]
         requirement.routed_member_agent_id = data.get("routed_member_agent_id")
         requirement.routed_member_agent_name = data.get("routed_member_agent_name")
-        requirement.routed_member_run_id = data.get("routed_member_run_id")
+        requirement.routed_member_run_id = run_ids["routed_member_run_id"]
         requirement.routed_member_is_team_level = bool(data.get("routed_member_is_team_level", False))
 
         if requirement.tool_execution is not None:

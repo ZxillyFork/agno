@@ -971,7 +971,7 @@ class TeamRunOutput:
 
         for field_name in ("run_id", "parent_run_id", "forked_from_run_id", "regenerated_from"):
             value = data.get(field_name)
-            if type(value) is int:
+            if isinstance(value, int) and not isinstance(value, bool):
                 data[field_name] = str(value)
             elif value is not None and not isinstance(value, str):
                 raise TypeError(f"{field_name} must be a string, legacy integer, or None, got {type(value).__name__}")
