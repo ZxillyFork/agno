@@ -1933,6 +1933,127 @@ def test_sync_static_pause_stops_later_sibling():
     assert function_call_results == []
 
 
+def test_sync_multiple_static_pauses_are_batched():
+    model = DummyModel(id="dummy-model")
+    side_effects = []
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    function_call_results = []
+    responses = list(
+        model.run_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+        )
+    )
+
+    started = [response for response in responses if response.event == ModelResponseEvent.tool_call_started.value]
+    paused = [response for response in responses if response.event == ModelResponseEvent.tool_call_paused.value]
+
+    assert [response.event for response in responses] == [
+        ModelResponseEvent.tool_call_started.value,
+        ModelResponseEvent.tool_call_started.value,
+        ModelResponseEvent.tool_call_paused.value,
+    ]
+    assert [response.tool_executions[0].tool_call_id for response in started] == ["call_first", "call_second"]
+    assert len(paused) == 1
+    assert [tool_execution.tool_call_id for tool_execution in paused[0].tool_executions] == [
+        "call_first",
+        "call_second",
+    ]
+    assert [tool_execution.tool_args for tool_execution in paused[0].tool_executions] == [
+        {"value": "first"},
+        {"value": "second"},
+    ]
+    assert all(tool_execution.external_execution_required for tool_execution in paused[0].tool_executions)
+    assert side_effects == []
+    assert function_call_results == []
+
+
+def test_sync_multiple_user_input_pauses_keep_independent_schemas():
+    model = DummyModel(id="dummy-model")
+
+    @tool(requires_user_input=True, user_input_fields=["name"])
+    def greet(name: str) -> str:
+        return f"Hello {name}"
+
+    responses = list(
+        model.run_function_calls(
+            [
+                FunctionCall(function=greet, arguments={"name": "Alice"}, call_id="call_alice"),
+                FunctionCall(function=greet, arguments={"name": "Bob"}, call_id="call_bob"),
+            ],
+            [],
+        )
+    )
+
+    paused = responses[-1]
+    alice_schema = paused.tool_executions[0].user_input_schema
+    bob_schema = paused.tool_executions[1].user_input_schema
+
+    assert alice_schema is not bob_schema
+    assert alice_schema[0].value == "Alice"
+    assert bob_schema[0].value == "Bob"
+    assert greet.user_input_schema[0].value is None
+
+
+def test_sync_static_pause_batch_respects_function_call_limit():
+    model = DummyModel(id="dummy-model")
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        return value
+
+    function_call_results = []
+    responses = list(
+        model.run_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+            function_call_limit=1,
+        )
+    )
+
+    paused = [response for response in responses if response.event == ModelResponseEvent.tool_call_paused.value]
+
+    assert len(paused) == 1
+    assert [tool_execution.tool_call_id for tool_execution in paused[0].tool_executions] == ["call_first"]
+    assert [message.tool_call_id for message in function_call_results] == ["call_second"]
+    assert function_call_results[0].tool_call_error is True
+
+
+def test_sync_static_pause_batch_appends_additional_input_once():
+    model = DummyModel(id="dummy-model")
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        return value
+
+    additional_input = [Message(role="user", content="context")]
+    function_call_results = []
+    responses = list(
+        model.run_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+            additional_input=additional_input,
+        )
+    )
+
+    assert responses[-1].event == ModelResponseEvent.tool_call_paused.value
+    assert function_call_results == additional_input
+
+
 def test_static_pause_flags_are_collapsed_into_one_requirement():
     model = DummyModel(id="dummy-model")
 
@@ -2190,6 +2311,246 @@ async def test_async_static_pause_stops_later_sync_sibling():
     assert paused[0].tool_executions[0].tool_call_id == "call_external"
     assert completed == []
     assert function_call_results == []
+
+
+@pytest.mark.asyncio
+async def test_async_multiple_sync_static_pauses_are_batched():
+    model = DummyModel(id="dummy-model")
+    side_effects = []
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    function_call_results = []
+    responses = [
+        response
+        async for response in model.arun_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+        )
+    ]
+
+    started = [response for response in responses if response.event == ModelResponseEvent.tool_call_started.value]
+    paused = [response for response in responses if response.event == ModelResponseEvent.tool_call_paused.value]
+
+    assert [response.event for response in responses] == [
+        ModelResponseEvent.tool_call_started.value,
+        ModelResponseEvent.tool_call_started.value,
+        ModelResponseEvent.tool_call_paused.value,
+    ]
+    assert [response.tool_executions[0].tool_call_id for response in started] == ["call_first", "call_second"]
+    assert len(paused) == 1
+    assert [tool_execution.tool_call_id for tool_execution in paused[0].tool_executions] == [
+        "call_first",
+        "call_second",
+    ]
+    assert [tool_execution.tool_args for tool_execution in paused[0].tool_executions] == [
+        {"value": "first"},
+        {"value": "second"},
+    ]
+    assert all(tool_execution.external_execution_required for tool_execution in paused[0].tool_executions)
+    assert side_effects == []
+    assert function_call_results == []
+
+
+@pytest.mark.asyncio
+async def test_async_multiple_async_static_pauses_are_batched():
+    model = DummyModel(id="dummy-model")
+    side_effects = []
+
+    @tool(external_execution=True)
+    async def external_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    function_call_results = []
+    responses = [
+        response
+        async for response in model.arun_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+        )
+    ]
+
+    assert [response.event for response in responses] == [
+        ModelResponseEvent.tool_call_started.value,
+        ModelResponseEvent.tool_call_started.value,
+        ModelResponseEvent.tool_call_paused.value,
+    ]
+    paused = responses[-1]
+    assert [tool_execution.tool_call_id for tool_execution in paused.tool_executions] == [
+        "call_first",
+        "call_second",
+    ]
+    assert [tool_execution.tool_args for tool_execution in paused.tool_executions] == [
+        {"value": "first"},
+        {"value": "second"},
+    ]
+    assert all(tool_execution.external_execution_required for tool_execution in paused.tool_executions)
+    assert side_effects == []
+    assert function_call_results == []
+
+
+@pytest.mark.asyncio
+async def test_async_skip_pause_check_executes_all_static_calls():
+    model = DummyModel(id="dummy-model")
+    side_effects = []
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    function_call_results = []
+    responses = [
+        response
+        async for response in model.arun_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+            skip_pause_check=True,
+        )
+    ]
+
+    assert side_effects == ["first", "second"]
+    assert [message.tool_call_id for message in function_call_results] == ["call_first", "call_second"]
+    assert [
+        response.tool_executions[0].tool_call_id
+        for response in responses
+        if response.event == ModelResponseEvent.tool_call_completed.value
+    ] == ["call_first", "call_second"]
+    assert all(response.event != ModelResponseEvent.tool_call_paused.value for response in responses)
+
+
+@pytest.mark.asyncio
+async def test_async_static_pause_batch_respects_function_call_limit():
+    model = DummyModel(id="dummy-model")
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        return value
+
+    function_call_results = []
+    responses = [
+        response
+        async for response in model.arun_function_calls(
+            [
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+            function_call_limit=1,
+        )
+    ]
+
+    paused = [response for response in responses if response.event == ModelResponseEvent.tool_call_paused.value]
+
+    assert len(paused) == 1
+    assert [tool_execution.tool_call_id for tool_execution in paused[0].tool_executions] == ["call_first"]
+    assert [message.tool_call_id for message in function_call_results] == ["call_second"]
+    assert function_call_results[0].tool_call_error is True
+
+
+@pytest.mark.asyncio
+async def test_async_static_pause_batches_later_static_calls_but_blocks_regular_calls():
+    model = DummyModel(id="dummy-model")
+    side_effects = []
+
+    @tool
+    def regular_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    function_call_results = []
+    responses = [
+        response
+        async for response in model.arun_function_calls(
+            [
+                FunctionCall(function=regular_tool, arguments={"value": "before"}, call_id="call_before"),
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=regular_tool, arguments={"value": "after"}, call_id="call_after"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            function_call_results,
+        )
+    ]
+
+    started_ids = [
+        response.tool_executions[0].tool_call_id
+        for response in responses
+        if response.event == ModelResponseEvent.tool_call_started.value
+    ]
+    paused = [response for response in responses if response.event == ModelResponseEvent.tool_call_paused.value]
+
+    assert started_ids == ["call_before", "call_first", "call_second"]
+    assert side_effects == ["before"]
+    assert [message.tool_call_id for message in function_call_results] == ["call_before"]
+    assert len(paused) == 1
+    assert [tool_execution.tool_call_id for tool_execution in paused[0].tool_executions] == [
+        "call_first",
+        "call_second",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_dynamic_pause_before_static_boundary_takes_priority():
+    model = DummyModel(id="dummy-model")
+    side_effects = []
+
+    @tool
+    async def dynamic_pause() -> str:
+        raise ApprovalRequired({"reason": "dynamic"})
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        side_effects.append(value)
+        return value
+
+    @tool
+    async def regular_tool() -> str:
+        side_effects.append("regular")
+        return "regular"
+
+    responses = [
+        response
+        async for response in model.arun_function_calls(
+            [
+                FunctionCall(function=dynamic_pause, arguments={}, call_id="call_dynamic"),
+                FunctionCall(function=external_tool, arguments={"value": "first"}, call_id="call_first"),
+                FunctionCall(function=regular_tool, arguments={}, call_id="call_regular"),
+                FunctionCall(function=external_tool, arguments={"value": "second"}, call_id="call_second"),
+            ],
+            [],
+        )
+    ]
+
+    started_ids = [
+        response.tool_executions[0].tool_call_id
+        for response in responses
+        if response.event == ModelResponseEvent.tool_call_started.value
+    ]
+    paused = [response for response in responses if response.event == ModelResponseEvent.tool_call_paused.value]
+
+    assert started_ids == ["call_dynamic"]
+    assert len(paused) == 1
+    assert [tool_execution.tool_call_id for tool_execution in paused[0].tool_executions] == ["call_dynamic"]
+    assert paused[0].tool_executions[0].metadata == {"reason": "dynamic"}
+    assert side_effects == []
 
 
 @pytest.mark.asyncio
@@ -2979,30 +3340,32 @@ def test_response_adds_requirement_for_each_paused_tool_execution():
     model = DummyModel(id="dummy-model")
     run_response = RunOutput(run_id="run-1", session_id="session-1")
     messages = [Message(role="user", content="pause both")]
+
+    @tool(external_execution=True)
+    def external_tool(value: str) -> str:
+        return value
+
     provider_response = ModelResponse(
         role="assistant",
         tool_calls=[
-            {"id": "call_a", "type": "function", "function": {"name": "pause_a", "arguments": "{}"}},
-            {"id": "call_b", "type": "function", "function": {"name": "pause_b", "arguments": "{}"}},
+            {
+                "id": "call_a",
+                "type": "function",
+                "function": {"name": "external_tool", "arguments": '{"value":"a"}'},
+            },
+            {
+                "id": "call_b",
+                "type": "function",
+                "function": {"name": "external_tool", "arguments": '{"value":"b"}'},
+            },
         ],
     )
-    responses = [
-        ModelResponse(
-            tool_executions=[
-                ToolExecution(tool_call_id="call_a", tool_name="pause_a", requires_confirmation=True),
-                ToolExecution(tool_call_id="call_b", tool_name="pause_b", requires_confirmation=True),
-            ],
-            event=ModelResponseEvent.tool_call_paused.value,
-        )
-    ]
-    model.run_function_calls = lambda **kwargs: iter(responses)  # type: ignore[method-assign]
-    model._prepare_function_calls = lambda **kwargs: []  # type: ignore[method-assign]
     model._invoke_with_retry = lambda **kwargs: provider_response  # type: ignore[method-assign]
 
     model_response = model.response(
         messages=messages,
         run_response=run_response,
-        tools=[],
+        tools=[external_tool],
     )
     assert model_response.tool_executions is not None
     assert [tool.tool_call_id for tool in model_response.tool_executions] == ["call_a", "call_b"]

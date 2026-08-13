@@ -3,6 +3,7 @@ import collections.abc
 import json
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import md5
 from pathlib import Path
@@ -266,7 +267,7 @@ def _create_static_paused_tool_executions(function_call: FunctionCall) -> List[T
     if function_call.function.requires_user_input and not (
         _is_get_user_input_call(function_call) or _is_ask_user_call(function_call)
     ):
-        user_input_schema = function_call.function.user_input_schema
+        user_input_schema = deepcopy(function_call.function.user_input_schema)
         if function_call.arguments and user_input_schema:
             for name, value in function_call.arguments.items():
                 for user_input_field in user_input_schema:
@@ -335,6 +336,50 @@ def _create_static_paused_tool_executions(function_call: FunctionCall) -> List[T
         get_paused_tool_execution().external_execution_required = True
 
     return [paused_tool_execution] if paused_tool_execution is not None else []
+
+
+def _partition_function_calls_at_static_pause(
+    function_calls: Sequence[FunctionCall],
+) -> Tuple[List[FunctionCall], List[FunctionCall]]:
+    """Keep the executable prefix and collect every static pause at or beyond the first pause boundary."""
+
+    runnable_function_calls: List[FunctionCall] = []
+    static_pause_calls: List[FunctionCall] = []
+    pause_boundary_reached = False
+
+    for function_call in function_calls:
+        if _is_static_pause_call(function_call):
+            pause_boundary_reached = True
+            static_pause_calls.append(function_call)
+        elif not pause_boundary_reached:
+            runnable_function_calls.append(function_call)
+
+    return runnable_function_calls, static_pause_calls
+
+
+def _create_tool_call_started_response(function_call: FunctionCall) -> ModelResponse:
+    return ModelResponse(
+        content=function_call.get_call_str(),
+        tool_executions=[
+            ToolExecution(
+                tool_call_id=function_call.call_id,
+                tool_name=function_call.function.name,
+                tool_args=function_call.arguments,
+            )
+        ],
+        event=ModelResponseEvent.tool_call_started.value,
+    )
+
+
+def _create_static_tool_calls_paused_response(function_calls: Sequence[FunctionCall]) -> ModelResponse:
+    return ModelResponse(
+        tool_executions=[
+            tool_execution
+            for function_call in function_calls
+            for tool_execution in _create_static_paused_tool_executions(function_call)
+        ],
+        event=ModelResponseEvent.tool_call_paused.value,
+    )
 
 
 def _function_call_uses_thread(function_call: FunctionCall) -> bool:
@@ -2688,6 +2733,7 @@ class Model(ABC):
         if additional_input is None:
             additional_input = []
 
+        function_calls_to_run = []
         for fc in function_calls:
             if function_call_limit is not None:
                 current_function_call_count += 1
@@ -2695,31 +2741,11 @@ class Model(ABC):
                 if current_function_call_count > function_call_limit:
                     function_call_results.append(self.create_tool_call_limit_error_result(fc))
                     continue
+            function_calls_to_run.append(fc)
 
-            paused_tool_executions = _create_static_paused_tool_executions(fc)
-            if paused_tool_executions:
-                # Mirror the dynamic-pause sequence: emit tool_call_started before
-                # tool_call_paused so downstream SSE consumers see a uniform
-                # "started → paused" pair regardless of pause origin.
-                yield ModelResponse(
-                    content=fc.get_call_str(),
-                    tool_executions=[
-                        ToolExecution(
-                            tool_call_id=fc.call_id,
-                            tool_name=fc.function.name,
-                            tool_args=fc.arguments,
-                        )
-                    ],
-                    event=ModelResponseEvent.tool_call_started.value,
-                )
-                yield ModelResponse(
-                    tool_executions=paused_tool_executions,
-                    event=ModelResponseEvent.tool_call_paused.value,
-                )
-                if additional_input:
-                    function_call_results.extend(additional_input)
-                return
+        runnable_function_calls, static_pause_calls = _partition_function_calls_at_static_pause(function_calls_to_run)
 
+        for fc in runnable_function_calls:
             for response in self.run_function_call(
                 function_call=fc, function_call_results=function_call_results, additional_input=additional_input
             ):
@@ -2728,6 +2754,15 @@ class Model(ABC):
                     if additional_input:
                         function_call_results.extend(additional_input)
                     return
+
+        if static_pause_calls:
+            if additional_input:
+                function_call_results.extend(additional_input)
+            paused_response = _create_static_tool_calls_paused_response(static_pause_calls)
+            for function_call in static_pause_calls:
+                yield _create_tool_call_started_response(function_call)
+            yield paused_response
+            return
 
         # Add any additional messages at the end
         if additional_input:
@@ -2806,37 +2841,13 @@ class Model(ABC):
                     continue
             function_calls_to_run.append(fc)
 
-        if any(_function_call_uses_thread(fc) for fc in function_calls_to_run):
-            thread_function_calls = []
-            # For each statically-paused call, remember the started + paused responses
-            # so we can emit "started → paused" together, matching the dynamic flow.
-            static_pause_responses: Dict[str, Tuple[ModelResponse, ModelResponse]] = {}
+        static_pause_calls: List[FunctionCall] = []
+        if not skip_pause_check:
+            function_calls_to_run, static_pause_calls = _partition_function_calls_at_static_pause(function_calls_to_run)
 
-            for fc in function_calls_to_run:
-                if not skip_pause_check:
-                    paused_tool_executions = _create_static_paused_tool_executions(fc)
-                    if paused_tool_executions:
-                        response_key = fc.call_id or fc.function.name or str(id(fc))
-                        started_response = ModelResponse(
-                            content=fc.get_call_str(),
-                            tool_executions=[
-                                ToolExecution(
-                                    tool_call_id=fc.call_id,
-                                    tool_name=fc.function.name,
-                                    tool_args=fc.arguments,
-                                )
-                            ],
-                            event=ModelResponseEvent.tool_call_started.value,
-                        )
-                        paused_response = ModelResponse(
-                            tool_executions=paused_tool_executions,
-                            event=ModelResponseEvent.tool_call_paused.value,
-                        )
-                        static_pause_responses[response_key] = (started_response, paused_response)
-                        continue
-
-                if _function_call_uses_thread(fc):
-                    thread_function_calls.append(fc)
+        has_thread_function_calls = any(_function_call_uses_thread(fc) for fc in function_calls_to_run)
+        if has_thread_function_calls:
+            thread_function_calls = [fc for fc in function_calls_to_run if _function_call_uses_thread(fc)]
 
             async def _yield_sync_function_call(
                 fc: FunctionCall,
@@ -2912,25 +2923,6 @@ class Model(ABC):
                 return
 
             for fc in function_calls_to_run:
-                response_key = fc.call_id or fc.function.name or str(id(fc))
-                static_pause_pair = static_pause_responses.get(response_key)
-                if static_pause_pair is not None:
-                    async for response in _flush_pending_non_thread_function_calls():
-                        yield response
-                        if (
-                            isinstance(response, ModelResponse)
-                            and response.event == ModelResponseEvent.tool_call_paused.value
-                        ):
-                            if additional_input:
-                                function_call_results.extend(additional_input)
-                            return
-                    started_response, paused_response = static_pause_pair
-                    yield started_response
-                    yield paused_response
-                    if additional_input:
-                        function_call_results.extend(additional_input)
-                    return
-
                 if id(fc) not in thread_call_object_ids:
                     pending_non_thread_function_calls.append(fc)
                     continue
@@ -2962,51 +2954,22 @@ class Model(ABC):
                         function_call_results.extend(additional_input)
                     return
 
+            if static_pause_calls:
+                if additional_input:
+                    function_call_results.extend(additional_input)
+                paused_response = _create_static_tool_calls_paused_response(static_pause_calls)
+                for function_call in static_pause_calls:
+                    yield _create_tool_call_started_response(function_call)
+                yield paused_response
+                return
+
             if additional_input:
                 function_call_results.extend(additional_input)
             return
 
-        first_static_pause_response: Optional[ModelResponse] = None
-        first_static_pause_started: Optional[ModelResponse] = None
-        if not skip_pause_check:
-            runnable_function_calls = []
-            for fc in function_calls_to_run:
-                paused_tool_executions = _create_static_paused_tool_executions(fc)
-                if paused_tool_executions:
-                    # Build the paired started event so we emit the same
-                    # "started → paused" sequence dynamic pauses produce.
-                    first_static_pause_started = ModelResponse(
-                        content=fc.get_call_str(),
-                        tool_executions=[
-                            ToolExecution(
-                                tool_call_id=fc.call_id,
-                                tool_name=fc.function.name,
-                                tool_args=fc.arguments,
-                            )
-                        ],
-                        event=ModelResponseEvent.tool_call_started.value,
-                    )
-                    first_static_pause_response = ModelResponse(
-                        tool_executions=paused_tool_executions,
-                        event=ModelResponseEvent.tool_call_paused.value,
-                    )
-                    break
-                runnable_function_calls.append(fc)
-            function_calls_to_run = runnable_function_calls
-
         # Yield tool_call_started events for all calls that can run before the first static pause.
         for fc in function_calls_to_run:
-            yield ModelResponse(
-                content=fc.get_call_str(),
-                tool_executions=[
-                    ToolExecution(
-                        tool_call_id=fc.call_id,
-                        tool_name=fc.function.name,
-                        tool_args=fc.arguments,
-                    )
-                ],
-                event=ModelResponseEvent.tool_call_started.value,
-            )
+            yield _create_tool_call_started_response(fc)
 
         # Create and run all function calls in parallel.
         results: List[Any] = [None] * len(function_calls_to_run)
@@ -3602,12 +3565,13 @@ class Model(ABC):
             yield _create_tool_calls_paused_response(paused_calls)
             return
 
-        if first_static_pause_response is not None:
+        if static_pause_calls:
             if additional_input:
                 function_call_results.extend(additional_input)
-            if first_static_pause_started is not None:
-                yield first_static_pause_started
-            yield first_static_pause_response
+            paused_response = _create_static_tool_calls_paused_response(static_pause_calls)
+            for function_call in static_pause_calls:
+                yield _create_tool_call_started_response(function_call)
+            yield paused_response
             return
 
         # Add any additional messages at the end
