@@ -1681,12 +1681,12 @@ class Function(BaseModel):
             if cache is None:
                 return cls._build_from_callable(c, name=name, strict=strict)[0]
             try:
-                template = cache.from_callable_template(cls, name, strict)
+                template = cache.from_callable_template(cls, name, strict)  # type: ignore[arg-type]
             except _DerivationFailed as failed:
                 return failed.payload
             return template._per_run_copy()
         try:
-            template = _cached_from_callable_template(cls, _CallableIdentity(c), name, strict)
+            template = _cached_from_callable_template(cls, _CallableIdentity(c), name, strict)  # type: ignore[arg-type]
         except _DerivationFailed as failed:
             return failed.payload
         return template._per_run_copy()
@@ -3281,8 +3281,10 @@ class FunctionCall(BaseModel):
 
         # Check cache if enabled and not a generator function
         cached_result = None
-        cacheable = self.function.cache_results and self.function._run_context is None and not (
-            isasyncgenfunction(self.function.entrypoint) or isgeneratorfunction(self.function.entrypoint)
+        cacheable = (
+            self.function.cache_results
+            and self.function._run_context is None
+            and not (isasyncgenfunction(self.function.entrypoint) or isgeneratorfunction(self.function.entrypoint))
         )
         if cacheable and _has_injected_media(entrypoint_args):
             log_debug(f"Skipping cache for {self.function.name}: the call carries attached media")

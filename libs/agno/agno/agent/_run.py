@@ -5708,9 +5708,7 @@ async def _acontinue_run(
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
                 # Add error event to list of events
                 error_msg = _describe_exception(e)
-                run_error = create_run_error_event(
-                    run_response, error=error_msg, error_type=error_type_of(e)
-                )  # type: ignore
+                run_error = create_run_error_event(run_response, error=error_msg, error_type=error_type_of(e))  # type: ignore
                 run_response.events = add_error_event(error=run_error, events=run_response.events)  # type: ignore
 
                 # If the content is None, set it to the error message

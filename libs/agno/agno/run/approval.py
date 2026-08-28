@@ -135,8 +135,10 @@ def _stamp_approval_id_on_tools(
         for req in requirements:
             te = getattr(req, "tool_execution", None)
             current_id = getattr(te, "approval_id", None)
-            if te is not None and _is_active_approval_tool(te) and (
-                current_id is None or current_id == replace_approval_id
+            if (
+                te is not None
+                and _is_active_approval_tool(te)
+                and (current_id is None or current_id == replace_approval_id)
             ):
                 te.approval_id = approval_id
 
@@ -900,8 +902,6 @@ def _group_tools_by_approval(db: Any, run_id: str, run_response: Any, tools: Lis
 
 async def _agroup_tools_by_approval(db: Any, run_id: str, run_response: Any, tools: List[Any]) -> List[tuple]:
     """Async variant of _group_tools_by_approval."""
-    from inspect import iscoroutinefunction
-
     cache: Dict[str, Optional[Dict[str, Any]]] = {}
     fallback_used = False
     fallback: Optional[Dict[str, Any]] = None

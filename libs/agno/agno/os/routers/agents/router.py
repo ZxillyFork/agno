@@ -1511,16 +1511,13 @@ def get_agent_router(
         # core supports. Teams are equally ungated; workflows still refuse
         # non-paused continues because their core requires PAUSED.
 
-        # Convert tools dict to RunRequirement and ToolExecution objects if provided
-        requirements = None
+        # Convert the legacy tools payload to ToolExecution objects if provided.
         updated_tools = None
         if tools_data:
             try:
                 from agno.models.response import ToolExecution
-                from agno.run.requirement import RunRequirement
 
                 tool_executions = [ToolExecution.from_dict(tool) for tool in tools_data]
-                requirements = [RunRequirement(tool_execution=te) for te in tool_executions]
                 updated_tools = tool_executions
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid structure or content for tools: {str(e)}")

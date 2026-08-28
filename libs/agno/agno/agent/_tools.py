@@ -642,9 +642,7 @@ def determine_tools_for_model(
 
         # Check if any functions need media before collecting
         needs_media = any(
-            entrypoint_accepts_media(func.entrypoint)
-            for func in function_map.values()
-            if func.entrypoint is not None
+            entrypoint_accepts_media(func.entrypoint) for func in function_map.values() if func.entrypoint is not None
         )
 
         # Only collect media if functions actually need them
@@ -706,6 +704,7 @@ def handle_external_execution_update(
     run_response: Optional[RunOutput] = None,
 ):
     import json
+
     agent.model = cast(Model, agent.model)
 
     result_provided = tool.result is not None or bool(tool.external_execution_result_provided)
@@ -1205,17 +1204,13 @@ def handle_tool_call_updates(
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
             if _t.result is not None or _t.external_execution_result_provided:
-                handle_external_execution_update(
-                    agent, run_messages=run_messages, tool=_t, run_response=run_response
-                )
+                handle_external_execution_update(agent, run_messages=run_messages, tool=_t, run_response=run_response)
                 _maybe_create_audit_approval(agent, _t, run_response, "approved")
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
             if _tool_user_input_ready(_t):
-                handle_get_user_input_tool_update(
-                    agent, run_messages=run_messages, tool=_t, run_response=run_response
-                )
+                handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t, run_response=run_response)
                 _t.requires_user_input = False
                 _t.answered = True
 
@@ -1274,17 +1269,13 @@ def handle_tool_call_updates_stream(
         # Case 2: Handle external execution required tools
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
             if _t.result is not None or _t.external_execution_result_provided:
-                handle_external_execution_update(
-                    agent, run_messages=run_messages, tool=_t, run_response=run_response
-                )
+                handle_external_execution_update(agent, run_messages=run_messages, tool=_t, run_response=run_response)
                 _maybe_create_audit_approval(agent, _t, run_response, "approved")
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
             if _tool_user_input_ready(_t):
-                handle_get_user_input_tool_update(
-                    agent, run_messages=run_messages, tool=_t, run_response=run_response
-                )
+                handle_get_user_input_tool_update(agent, run_messages=run_messages, tool=_t, run_response=run_response)
                 _t.requires_user_input = False
                 _t.answered = True
 

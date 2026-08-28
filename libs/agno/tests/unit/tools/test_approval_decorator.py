@@ -250,8 +250,8 @@ def test_requires_approval_conflicts_with_requires_confirmation():
 def test_dynamic_approval_is_not_logged_as_tool_error(monkeypatch):
     """Dynamic HITL exceptions are control flow, not tool failures."""
 
-    from agno.exceptions import ToolApprovalRequired
     import agno.tools.decorator as tool_decorator
+    from agno.exceptions import ToolApprovalRequired
 
     logged_errors = []
     monkeypatch.setattr(tool_decorator, "log_error", lambda *args, **kwargs: logged_errors.append((args, kwargs)))

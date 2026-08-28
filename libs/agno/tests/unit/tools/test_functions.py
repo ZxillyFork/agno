@@ -2791,9 +2791,8 @@ async def test_cached_results_do_not_leak_across_users_async(tmp_path):
     assert executions == ["alice", "bob"]
 
 
-def test_cache_hits_across_runs_for_same_user_and_session(tmp_path):
-    """run_id must stay out of the cache key: the same user and session hit
-    the cache across runs."""
+def test_run_context_tools_do_not_cache_across_runs_for_same_user_and_session(tmp_path):
+    """A context-bound tool must re-run so dynamic policy and approval state cannot be bypassed."""
     executions = []
 
     def whoami(run_context: RunContext) -> str:
@@ -2809,12 +2808,12 @@ def test_cache_hits_across_runs_for_same_user_and_session(tmp_path):
     result = FunctionCall(function=func).execute()
 
     assert result.result == "secret for alice"
-    assert executions == ["alice"]
+    assert executions == ["alice", "alice"]
 
 
 @pytest.mark.asyncio
-async def test_cache_hits_across_runs_for_same_user_and_session_async(tmp_path):
-    """Async variant: run_id stays out of the cache key."""
+async def test_run_context_tools_do_not_cache_across_runs_for_same_user_and_session_async(tmp_path):
+    """Async context-bound tools also re-run on every call."""
     executions = []
 
     async def whoami(run_context: RunContext) -> str:
@@ -2830,7 +2829,7 @@ async def test_cache_hits_across_runs_for_same_user_and_session_async(tmp_path):
     result = await FunctionCall(function=func).aexecute()
 
     assert result.result == "secret for alice"
-    assert executions == ["alice"]
+    assert executions == ["alice", "alice"]
 
 
 # =============================================================================
@@ -3221,9 +3220,8 @@ def test_a_hook_can_still_refuse_a_call_served_from_cache(tmp_path):
     assert "rate limit exceeded" in refused.error
 
 
-def test_post_hook_and_session_state_still_run_on_a_hit_without_tool_hooks(tmp_path):
-    """Most cached tools declare no tool_hooks. The hit must not short-circuit
-    past post_hook or past the session state the run context collected."""
+def test_post_hook_and_session_state_run_when_context_disables_cache(tmp_path):
+    """Disabling cache for a context-bound tool still preserves hooks and session state."""
     events = []
 
     def post_hook():
@@ -3243,10 +3241,11 @@ def test_post_hook_and_session_state_still_run_on_a_hit_without_tool_hooks(tmp_p
     events.clear()
 
     func._run_context = RunContext(run_id="r2", session_id="s1", user_id="alice", session_state={})
-    hit = FunctionCall(function=func).execute()
+    second = FunctionCall(function=func).execute()
 
-    assert events == ["post_hook"]
-    assert hit.result == "noted"
+    assert events == ["entrypoint", "post_hook"]
+    assert second.result == "noted"
+    assert second.updated_session_state == {"seen": 1}
 
 
 @pytest.mark.asyncio

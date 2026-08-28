@@ -19,7 +19,13 @@ from agno.os.interfaces.agui.input import extract_context, extract_media, extrac
 from agno.os.interfaces.agui.router import run_entity
 from agno.os.interfaces.agui.state import StreamState
 from agno.os.interfaces.agui.stream import async_stream_agno_response_as_agui_events
-from agno.run.agent import RunContentEvent, RunEvent, ToolCallArgsDeltaEvent, ToolCallCompletedEvent, ToolCallStartedEvent
+from agno.run.agent import (
+    RunContentEvent,
+    RunEvent,
+    ToolCallArgsDeltaEvent,
+    ToolCallCompletedEvent,
+    ToolCallStartedEvent,
+)
 
 
 def test_event_buffer_initial_state():
@@ -344,15 +350,11 @@ async def test_tool_call_started_after_args_delta_does_not_duplicate_agui_start_
         yield ToolCallArgsDeltaEvent(tool_call_id="tool_1", tool_name="search", delta='{"query":"test"}')
 
         tool_start_response = ToolCallStartedEvent()
-        tool_start_response.tool = ToolExecution(
-            tool_call_id="tool_1", tool_name="search", tool_args={"query": "test"}
-        )
+        tool_start_response.tool = ToolExecution(tool_call_id="tool_1", tool_name="search", tool_args={"query": "test"})
         yield tool_start_response
 
         tool_end_response = ToolCallCompletedEvent()
-        tool_end_response.tool = ToolExecution(
-            tool_call_id="tool_1", tool_name="search", tool_args={"query": "test"}
-        )
+        tool_end_response.tool = ToolExecution(tool_call_id="tool_1", tool_name="search", tool_args={"query": "test"})
         yield tool_end_response
 
     events = []

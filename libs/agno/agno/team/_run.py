@@ -5606,25 +5606,19 @@ def _handle_team_tool_call_updates(
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
             if _t.result is not None or _t.external_execution_result_provided:
                 pause_type = "external_execution"
-                handle_external_execution_update(
-                    team, run_messages=run_messages, tool=_t, run_response=run_response
-                )  # type: ignore
+                handle_external_execution_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
                 _maybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
             if _tool_user_input_ready(_t):
-                handle_get_user_input_tool_update(
-                    team, run_messages=run_messages, tool=_t, run_response=run_response
-                )  # type: ignore
+                handle_get_user_input_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
                 _t.requires_user_input = False
                 _t.answered = True
 
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
             if _tool_user_feedback_ready(_t):
-                handle_ask_user_tool_update(
-                    team, run_messages=run_messages, tool=_t, run_response=run_response
-                )  # type: ignore
+                handle_ask_user_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
                 _t.requires_user_input = False
                 _t.answered = True
 
@@ -5702,25 +5696,19 @@ def _handle_team_tool_call_updates_stream(
         elif _t.external_execution_required is not None and _t.external_execution_required is True:
             if _t.result is not None or _t.external_execution_result_provided:
                 pause_type = "external_execution"
-                handle_external_execution_update(
-                    team, run_messages=run_messages, tool=_t, run_response=run_response
-                )  # type: ignore
+                handle_external_execution_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
                 _maybe_create_team_audit_approval(team, _t, run_response, "approved", pause_type=pause_type)
 
         # Case 3a: Agentic user input required
         elif _t.tool_name == "get_user_input" and _t.requires_user_input is not None and _t.requires_user_input is True:
             if _tool_user_input_ready(_t):
-                handle_get_user_input_tool_update(
-                    team, run_messages=run_messages, tool=_t, run_response=run_response
-                )  # type: ignore
+                handle_get_user_input_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
                 _t.requires_user_input = False
                 _t.answered = True
 
         elif _t.tool_name == "ask_user" and _t.requires_user_input is not None and _t.requires_user_input is True:
             if _tool_user_feedback_ready(_t):
-                handle_ask_user_tool_update(
-                    team, run_messages=run_messages, tool=_t, run_response=run_response
-                )  # type: ignore
+                handle_ask_user_tool_update(team, run_messages=run_messages, tool=_t, run_response=run_response)  # type: ignore
                 _t.requires_user_input = False
                 _t.answered = True
 
