@@ -11,10 +11,12 @@ from types import AsyncGeneratorType, GeneratorType
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
     Dict,
+    Generator,
     Iterator,
     List,
     Literal,
@@ -1621,7 +1623,7 @@ class Model(ABC):
         result_store: Optional["ResultStore"] = None,
         after_tool_results: Optional[Callable[["ModelResponse"], None]] = None,
         run_context: Optional[Any] = None,
-    ) -> Iterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
+    ) -> Generator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent], None, None]:
         """
         Generate a streaming response from the model.
 
@@ -1683,54 +1685,63 @@ class Model(ABC):
 
                 yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
 
-                if stream_model_response:
-                    stream_data.response_metrics = MessageMetrics()
-                    stream_data.response_metrics.start_timer()
-                    self._ensure_message_metrics_initialized(assistant_message)
-                    try:
-                        for response in self.process_response_stream(
+                try:
+                    if stream_model_response:
+                        stream_data.response_metrics = MessageMetrics()
+                        stream_data.response_metrics.start_timer()
+                        self._ensure_message_metrics_initialized(assistant_message)
+                        try:
+                            for response in self.process_response_stream(
+                                messages=messages,
+                                assistant_message=assistant_message,
+                                stream_data=stream_data,
+                                response_format=response_format,
+                                tools=_tool_dicts,
+                                tool_choice=tool_choice or self._tool_choice,
+                                run_response=run_response,
+                                compress_tool_results=_compress_tool_results,
+                            ):
+                                if cache_streaming_response and isinstance(response, ModelResponse):
+                                    streaming_responses.append(response)
+                                yield response
+                        finally:
+                            if run_response is not None and assistant_message.metrics is not None:
+                                from agno.metrics import accumulate_model_metrics
+
+                                _stream_model_response = ModelResponse()
+                                _stream_model_response.response_usage = assistant_message.metrics
+                                accumulate_model_metrics(
+                                    _stream_model_response, self, self.model_type, run_response.metrics
+                                )
+
+                    else:
+                        self._ensure_message_metrics_initialized(assistant_message)
+                        self._process_model_response(
                             messages=messages,
                             assistant_message=assistant_message,
-                            stream_data=stream_data,
+                            model_response=model_response,
                             response_format=response_format,
                             tools=_tool_dicts,
                             tool_choice=tool_choice or self._tool_choice,
                             run_response=run_response,
                             compress_tool_results=_compress_tool_results,
-                        ):
-                            if cache_streaming_response and isinstance(response, ModelResponse):
-                                streaming_responses.append(response)
-                            yield response
-                    finally:
-                        if run_response is not None and assistant_message.metrics is not None:
+                        )
+                        if run_response is not None and model_response.response_usage is not None:
                             from agno.metrics import accumulate_model_metrics
 
-                            _stream_model_response = ModelResponse()
-                            _stream_model_response.response_usage = assistant_message.metrics
-                            accumulate_model_metrics(
-                                _stream_model_response, self, self.model_type, run_response.metrics
-                            )
+                            accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
+                        if cache_streaming_response:
+                            streaming_responses.append(model_response)
+                        yield model_response
 
-                else:
-                    self._ensure_message_metrics_initialized(assistant_message)
-                    self._process_model_response(
-                        messages=messages,
-                        assistant_message=assistant_message,
-                        model_response=model_response,
-                        response_format=response_format,
-                        tools=_tool_dicts,
-                        tool_choice=tool_choice or self._tool_choice,
-                        run_response=run_response,
-                        compress_tool_results=_compress_tool_results,
-                    )
-                    if run_response is not None and model_response.response_usage is not None:
-                        from agno.metrics import accumulate_model_metrics
-
-                        accumulate_model_metrics(model_response, self, self.model_type, run_response.metrics)
-                    if cache_streaming_response:
-                        streaming_responses.append(model_response)
-                    yield model_response
-
+                except BaseException:
+                    if stream_model_response:
+                        self._populate_assistant_message_from_stream_data(
+                            assistant_message=assistant_message, stream_data=stream_data
+                        )
+                    if assistant_message.content or assistant_message.reasoning_content or assistant_message.tool_calls:
+                        messages.append(assistant_message)
+                    raise
                 messages.append(assistant_message)
                 assistant_message.log(metrics=True)
 
@@ -1902,7 +1913,7 @@ class Model(ABC):
         result_store: Optional["ResultStore"] = None,
         after_tool_results: Optional[Callable[["ModelResponse"], Awaitable[None]]] = None,
         run_context: Optional[Any] = None,
-    ) -> AsyncIterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
+    ) -> AsyncGenerator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent], None]:
         """
         Generate an asynchronous streaming response from the model.
 
@@ -2026,7 +2037,11 @@ class Model(ABC):
                         self._populate_assistant_message_from_stream_data(
                             assistant_message=assistant_message, stream_data=stream_data
                         )
-                        if assistant_message.content:
+                        if (
+                            assistant_message.content
+                            or assistant_message.reasoning_content
+                            or assistant_message.tool_calls
+                        ):
                             messages.append(assistant_message)
                     raise
                 assistant_message.log(metrics=True)

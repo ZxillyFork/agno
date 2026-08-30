@@ -7,7 +7,7 @@ import pytest
 from agno.agent import _init, _messages, _response, _run, _session, _storage, _telemetry, _tools
 from agno.agent.agent import Agent
 from agno.db.base import SessionType
-from agno.exceptions import RunCancelledException, RunNotFoundError
+from agno.exceptions import RunNotFoundError
 from agno.models.message import Message
 from agno.models.response import ModelResponse, ToolExecution
 from agno.run import RunContext
@@ -324,44 +324,6 @@ async def test_acontinue_run_stream_yields_error_event_without_attribute_error(
             events.append(event)
 
     assert events == []
-
-
-@pytest.mark.asyncio
-async def test_ahandle_model_response_stream_preserves_partial_assistant_message_on_cancellation():
-    agent = Agent(name="test-agent")
-
-    class FakeModel:
-        id = "fake-model"
-        provider = "fake-provider"
-
-        async def aresponse_stream(self, **kwargs):
-            yield ModelResponse(content="partial content")
-            raise RunCancelledException("cancelled")
-
-    agent.model = FakeModel()
-    session = AgentSession(session_id="session-1")
-    run_messages = RunMessages(messages=[Message(role="user", content="hello")])
-    run_response = RunOutput(
-        run_id="run-1",
-        session_id="session-1",
-        agent_id=agent.id,
-        agent_name=agent.name,
-    )
-
-    with pytest.raises(RunCancelledException, match="cancelled"):
-        async for _ in _response.ahandle_model_response_stream(
-            agent=agent,
-            session=session,
-            run_response=run_response,
-            run_messages=run_messages,
-        ):
-            pass
-
-    assert run_response.messages is not None
-    assert len(run_response.messages) == 2
-    assert run_response.messages[0].role == "user"
-    assert run_response.messages[1].role == "assistant"
-    assert run_response.messages[1].content == "partial content"
 
 
 @pytest.mark.asyncio

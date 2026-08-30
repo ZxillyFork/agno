@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections import deque
 from dataclasses import fields as dataclass_fields
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncGenerator,
     AsyncIterator,
     Dict,
+    Generator,
     Iterator,
     List,
     Optional,
@@ -571,18 +574,19 @@ async def aparse_response_with_parser_model_stream(
                 stream_model_response=False,
                 run_response=run_response,
             )
-            async for model_response_event in model_response_stream:  # type: ignore
-                for event in handle_model_response_chunk(
-                    agent,
-                    session=session,
-                    run_response=run_response,
-                    model_response=parser_model_response,
-                    model_response_event=model_response_event,
-                    parse_structured_output=True,
-                    stream_events=stream_events,
-                    run_context=run_context,
-                ):
-                    yield event
+            async with contextlib.aclosing(model_response_stream) as response_stream:
+                async for model_response_event in response_stream:
+                    for event in handle_model_response_chunk(
+                        agent,
+                        session=session,
+                        run_response=run_response,
+                        model_response=parser_model_response,
+                        model_response_event=model_response_event,
+                        parse_structured_output=True,
+                        stream_events=stream_events,
+                        run_context=run_context,
+                    ):
+                        yield event
 
             parser_model_response_message: Optional[Message] = None
             for message in reversed(messages_for_parser_model):
@@ -746,16 +750,17 @@ async def agenerate_response_with_output_model_stream(
         messages=messages_for_output_model, run_response=run_response
     )
 
-    async for model_response_event in model_response_stream:
-        for event in handle_model_response_chunk(
-            agent,
-            session=session,
-            run_response=run_response,
-            model_response=model_response,
-            model_response_event=model_response_event,
-            stream_events=stream_events,
-        ):
-            yield event
+    async with contextlib.aclosing(model_response_stream) as response_stream:
+        async for model_response_event in response_stream:
+            for event in handle_model_response_chunk(
+                agent,
+                session=session,
+                run_response=run_response,
+                model_response=model_response,
+                model_response_event=model_response_event,
+                stream_events=stream_events,
+            ):
+                yield event
 
     if stream_events:
         yield handle_event(
@@ -1058,7 +1063,7 @@ def handle_model_response_stream(
     stream_events: bool = False,
     session_state: Optional[Dict[str, Any]] = None,
     run_context: Optional[RunContext] = None,
-) -> Iterator[RunOutputEvent]:
+) -> Generator[RunOutputEvent, None, None]:
     agent.model = cast(Model, agent.model)
 
     reasoning_state = {
@@ -1079,128 +1084,107 @@ def handle_model_response_stream(
     from agno.agent._run import build_after_tool_results_callback
 
     try:
-        for model_response_event in call_model_stream_with_fallback(
-            agent.model,
-            agent.fallback_config,
-            messages=run_messages.messages,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=agent.tool_choice,
-            tool_call_limit=agent.tool_call_limit,
-            stream_model_response=stream_model_response,
-            run_response=run_response,
-            run_context=run_context,
-            send_media_to_model=agent.send_media_to_model,
-            compression_manager=agent.compression_manager if agent.compress_tool_results else None,
-            **result_store_kwargs(agent),
-            after_tool_results=build_after_tool_results_callback(
-                agent,
+        with contextlib.closing(
+            call_model_stream_with_fallback(
+                agent.model,
+                agent.fallback_config,
+                messages=run_messages.messages,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=agent.tool_choice,
+                tool_call_limit=agent.tool_call_limit,
+                stream_model_response=stream_model_response,
                 run_response=run_response,
-                session=session,
-                run_messages=run_messages,
                 run_context=run_context,
-            ),
-        ):
-            if isinstance(model_response_event, ModelResponse):
-                if model_response_event.event == ModelResponseEvent.model_request_started.value:
-                    if stream_events:
-                        yield handle_event(  # type: ignore
-                            create_model_request_started_event(
-                                from_run_response=run_response,
-                                model=agent.model.id,
-                                model_provider=agent.model.provider,
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
-
-                if model_response_event.event == ModelResponseEvent.model_request_completed.value:
-                    if stream_events:
-                        yield handle_event(  # type: ignore
-                            create_model_request_completed_event(
-                                from_run_response=run_response,
-                                model=agent.model.id,
-                                model_provider=agent.model.provider,
-                                input_tokens=model_response_event.input_tokens,
-                                output_tokens=model_response_event.output_tokens,
-                                total_tokens=model_response_event.total_tokens,
-                                time_to_first_token=model_response_event.time_to_first_token,
-                                reasoning_tokens=model_response_event.reasoning_tokens,
-                                cache_read_tokens=model_response_event.cache_read_tokens,
-                                cache_write_tokens=model_response_event.cache_write_tokens,
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
-
-                if model_response_event.event == ModelResponseEvent.compression_started.value:
-                    if stream_events:
-                        yield handle_event(  # type: ignore
-                            create_compression_started_event(from_run_response=run_response),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
-
-                if model_response_event.event == ModelResponseEvent.compression_completed.value:
-                    if stream_events:
-                        stats = model_response_event.compression_stats or {}
-                        yield handle_event(  # type: ignore
-                            create_compression_completed_event(
-                                from_run_response=run_response,
-                                tool_results_compressed=stats.get("tool_results_compressed"),
-                                original_size=stats.get("original_size"),
-                                compressed_size=stats.get("compressed_size"),
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
-
-            yield from handle_model_response_chunk(
-                agent,
-                session=session,
-                run_response=run_response,
-                model_response=model_response,
-                model_response_event=model_response_event,
-                reasoning_state=reasoning_state,
-                parse_structured_output=should_parse_structured_output,
-                stream_events=stream_events,
-                session_state=session_state,
-                run_context=run_context,
+                send_media_to_model=agent.send_media_to_model,
+                compression_manager=agent.compression_manager if agent.compress_tool_results else None,
+                **result_store_kwargs(agent),
+                after_tool_results=build_after_tool_results_callback(
+                    agent,
+                    run_response=run_response,
+                    session=session,
+                    run_messages=run_messages,
+                    run_context=run_context,
+                ),
             )
-    except RunCancelledException:
-        if (
-            model_response.content is not None
-            or model_response.reasoning_content is not None
-            or model_response.tool_calls
-            or model_response.provider_data is not None
-        ):
-            last_message = run_messages.messages[-1] if run_messages.messages else None
-            if not (
-                last_message is not None
-                and last_message.role == "assistant"
-                and last_message.content == model_response.content
-            ):
-                run_messages.messages.append(
-                    Message(
-                        role="assistant",
-                        content=model_response.content or "",
-                        tool_calls=model_response.tool_calls or None,
-                        provider_data=model_response.provider_data,
-                        reasoning_content=model_response.reasoning_content,
-                    )
-                )
-        run_response.messages = [m for m in run_messages.messages if m.add_to_agent_memory]
-        raise
+        ) as response_stream:
+            for model_response_event in response_stream:
+                if isinstance(model_response_event, ModelResponse):
+                    if model_response_event.event == ModelResponseEvent.model_request_started.value:
+                        if stream_events:
+                            yield handle_event(  # type: ignore
+                                create_model_request_started_event(
+                                    from_run_response=run_response,
+                                    model=agent.model.id,
+                                    model_provider=agent.model.provider,
+                                ),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
 
-    run_response.messages = [m for m in run_messages.messages if m.add_to_agent_memory]
+                    if model_response_event.event == ModelResponseEvent.model_request_completed.value:
+                        if stream_events:
+                            yield handle_event(  # type: ignore
+                                create_model_request_completed_event(
+                                    from_run_response=run_response,
+                                    model=agent.model.id,
+                                    model_provider=agent.model.provider,
+                                    input_tokens=model_response_event.input_tokens,
+                                    output_tokens=model_response_event.output_tokens,
+                                    total_tokens=model_response_event.total_tokens,
+                                    time_to_first_token=model_response_event.time_to_first_token,
+                                    reasoning_tokens=model_response_event.reasoning_tokens,
+                                    cache_read_tokens=model_response_event.cache_read_tokens,
+                                    cache_write_tokens=model_response_event.cache_write_tokens,
+                                ),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
+
+                    if model_response_event.event == ModelResponseEvent.compression_started.value:
+                        if stream_events:
+                            yield handle_event(  # type: ignore
+                                create_compression_started_event(from_run_response=run_response),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
+
+                    if model_response_event.event == ModelResponseEvent.compression_completed.value:
+                        if stream_events:
+                            stats = model_response_event.compression_stats or {}
+                            yield handle_event(  # type: ignore
+                                create_compression_completed_event(
+                                    from_run_response=run_response,
+                                    tool_results_compressed=stats.get("tool_results_compressed"),
+                                    original_size=stats.get("original_size"),
+                                    compressed_size=stats.get("compressed_size"),
+                                ),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
+
+                yield from handle_model_response_chunk(
+                    agent,
+                    session=session,
+                    run_response=run_response,
+                    model_response=model_response,
+                    model_response_event=model_response_event,
+                    reasoning_state=reasoning_state,
+                    parse_structured_output=should_parse_structured_output,
+                    stream_events=stream_events,
+                    session_state=session_state,
+                    run_context=run_context,
+                )
+    finally:
+        run_response.messages = [m for m in run_messages.messages if m.add_to_agent_memory]
 
     # Determine reasoning completed
     if stream_events and reasoning_state["reasoning_started"]:
@@ -1239,7 +1223,7 @@ async def ahandle_model_response_stream(
     stream_events: bool = False,
     session_state: Optional[Dict[str, Any]] = None,
     run_context: Optional[RunContext] = None,
-) -> AsyncIterator[RunOutputEvent]:
+) -> AsyncGenerator[RunOutputEvent, None]:
     agent.model = cast(Model, agent.model)
 
     reasoning_state = {
@@ -1283,108 +1267,85 @@ async def ahandle_model_response_stream(
     )  # type: ignore
 
     try:
-        async for model_response_event in model_response_stream:  # type: ignore
-            if isinstance(model_response_event, ModelResponse):
-                if model_response_event.event == ModelResponseEvent.model_request_started.value:
-                    if stream_events:
-                        yield handle_event(  # type: ignore
-                            create_model_request_started_event(
-                                from_run_response=run_response,
-                                model=agent.model.id,
-                                model_provider=agent.model.provider,
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
+        async with contextlib.aclosing(model_response_stream) as response_stream:
+            async for model_response_event in response_stream:
+                if isinstance(model_response_event, ModelResponse):
+                    if model_response_event.event == ModelResponseEvent.model_request_started.value:
+                        if stream_events:
+                            yield handle_event(  # type: ignore
+                                create_model_request_started_event(
+                                    from_run_response=run_response,
+                                    model=agent.model.id,
+                                    model_provider=agent.model.provider,
+                                ),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
 
-                if model_response_event.event == ModelResponseEvent.model_request_completed.value:
-                    if stream_events:
-                        yield handle_event(  # type: ignore
-                            create_model_request_completed_event(
-                                from_run_response=run_response,
-                                model=agent.model.id,
-                                model_provider=agent.model.provider,
-                                input_tokens=model_response_event.input_tokens,
-                                output_tokens=model_response_event.output_tokens,
-                                total_tokens=model_response_event.total_tokens,
-                                time_to_first_token=model_response_event.time_to_first_token,
-                                reasoning_tokens=model_response_event.reasoning_tokens,
-                                cache_read_tokens=model_response_event.cache_read_tokens,
-                                cache_write_tokens=model_response_event.cache_write_tokens,
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
+                    if model_response_event.event == ModelResponseEvent.model_request_completed.value:
+                        if stream_events:
+                            yield handle_event(  # type: ignore
+                                create_model_request_completed_event(
+                                    from_run_response=run_response,
+                                    model=agent.model.id,
+                                    model_provider=agent.model.provider,
+                                    input_tokens=model_response_event.input_tokens,
+                                    output_tokens=model_response_event.output_tokens,
+                                    total_tokens=model_response_event.total_tokens,
+                                    time_to_first_token=model_response_event.time_to_first_token,
+                                    reasoning_tokens=model_response_event.reasoning_tokens,
+                                    cache_read_tokens=model_response_event.cache_read_tokens,
+                                    cache_write_tokens=model_response_event.cache_write_tokens,
+                                ),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
 
-                if model_response_event.event == ModelResponseEvent.compression_started.value:
-                    if stream_events:
-                        yield handle_event(  # type: ignore
-                            create_compression_started_event(from_run_response=run_response),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
+                    if model_response_event.event == ModelResponseEvent.compression_started.value:
+                        if stream_events:
+                            yield handle_event(  # type: ignore
+                                create_compression_started_event(from_run_response=run_response),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
 
-                if model_response_event.event == ModelResponseEvent.compression_completed.value:
-                    if stream_events:
-                        stats = model_response_event.compression_stats or {}
-                        yield handle_event(  # type: ignore
-                            create_compression_completed_event(
-                                from_run_response=run_response,
-                                tool_results_compressed=stats.get("tool_results_compressed"),
-                                original_size=stats.get("original_size"),
-                                compressed_size=stats.get("compressed_size"),
-                            ),
-                            run_response,
-                            events_to_skip=agent.events_to_skip,  # type: ignore
-                            store_events=agent.store_events,
-                        )
-                    continue
+                    if model_response_event.event == ModelResponseEvent.compression_completed.value:
+                        if stream_events:
+                            stats = model_response_event.compression_stats or {}
+                            yield handle_event(  # type: ignore
+                                create_compression_completed_event(
+                                    from_run_response=run_response,
+                                    tool_results_compressed=stats.get("tool_results_compressed"),
+                                    original_size=stats.get("original_size"),
+                                    compressed_size=stats.get("compressed_size"),
+                                ),
+                                run_response,
+                                events_to_skip=agent.events_to_skip,  # type: ignore
+                                store_events=agent.store_events,
+                            )
+                        continue
 
-            for event in handle_model_response_chunk(
-                agent,
-                session=session,
-                run_response=run_response,
-                model_response=model_response,
-                model_response_event=model_response_event,
-                reasoning_state=reasoning_state,
-                parse_structured_output=should_parse_structured_output,
-                stream_events=stream_events,
-                session_state=session_state,
-                run_context=run_context,
-            ):
-                yield event
-    except RunCancelledException:
-        if (
-            model_response.content is not None
-            or model_response.reasoning_content is not None
-            or model_response.tool_calls
-            or model_response.provider_data is not None
-        ):
-            last_message = run_messages.messages[-1] if run_messages.messages else None
-            if not (
-                last_message is not None
-                and last_message.role == "assistant"
-                and last_message.content == model_response.content
-            ):
-                run_messages.messages.append(
-                    Message(
-                        role="assistant",
-                        content=model_response.content or "",
-                        tool_calls=model_response.tool_calls or None,
-                        provider_data=model_response.provider_data,
-                        reasoning_content=model_response.reasoning_content,
-                    )
-                )
+                for event in handle_model_response_chunk(
+                    agent,
+                    session=session,
+                    run_response=run_response,
+                    model_response=model_response,
+                    model_response_event=model_response_event,
+                    reasoning_state=reasoning_state,
+                    parse_structured_output=should_parse_structured_output,
+                    stream_events=stream_events,
+                    session_state=session_state,
+                    run_context=run_context,
+                ):
+                    yield event
+    finally:
         run_response.messages = [m for m in run_messages.messages if m.add_to_agent_memory]
-        raise
-
-    run_response.messages = [m for m in run_messages.messages if m.add_to_agent_memory]
 
     if stream_events and reasoning_state["reasoning_started"]:
         all_reasoning_steps: List[ReasoningStep] = []

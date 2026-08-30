@@ -1369,47 +1369,53 @@ def _run_stream(
 
                 # 9. Process model response
                 if agent.output_model is None:
-                    for event in handle_model_response_stream(
-                        agent,
-                        session=agent_session,
-                        run_response=run_response,
-                        run_messages=run_messages,
-                        tools=_tools,
-                        response_format=response_format,
-                        stream_events=stream_events,
-                        session_state=run_context.session_state,
-                        run_context=run_context,
-                    ):
-                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                            raise_if_cancelled(run_response.run_id)  # type: ignore
-                        yield event
+                    with contextlib.closing(
+                        handle_model_response_stream(
+                            agent,
+                            session=agent_session,
+                            run_response=run_response,
+                            run_messages=run_messages,
+                            tools=_tools,
+                            response_format=response_format,
+                            stream_events=stream_events,
+                            session_state=run_context.session_state,
+                            run_context=run_context,
+                        )
+                    ) as response_stream:
+                        for event in response_stream:
+                            if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                                raise_if_cancelled(run_response.run_id)  # type: ignore
+                            yield event
                 else:
                     from agno.run.agent import (
                         IntermediateRunContentEvent,
                         RunContentEvent,
                     )  # type: ignore
 
-                    for event in handle_model_response_stream(
-                        agent,
-                        session=agent_session,
-                        run_response=run_response,
-                        run_messages=run_messages,
-                        tools=_tools,
-                        response_format=response_format,
-                        stream_events=stream_events,
-                        session_state=run_context.session_state,
-                        run_context=run_context,
-                    ):
-                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                            raise_if_cancelled(run_response.run_id)  # type: ignore
-                        if isinstance(event, RunContentEvent):
-                            if stream_events:
-                                yield IntermediateRunContentEvent(
-                                    content=event.content,
-                                    content_type=event.content_type,
-                                )
-                        else:
-                            yield event
+                    with contextlib.closing(
+                        handle_model_response_stream(
+                            agent,
+                            session=agent_session,
+                            run_response=run_response,
+                            run_messages=run_messages,
+                            tools=_tools,
+                            response_format=response_format,
+                            stream_events=stream_events,
+                            session_state=run_context.session_state,
+                            run_context=run_context,
+                        )
+                    ) as response_stream:
+                        for event in response_stream:
+                            if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                                raise_if_cancelled(run_response.run_id)  # type: ignore
+                            if isinstance(event, RunContentEvent):
+                                if stream_events:
+                                    yield IntermediateRunContentEvent(
+                                        content=event.content,
+                                        content_type=event.content_type,
+                                    )
+                            else:
+                                yield event
 
                     # If an output model is provided, generate output using the output model
                     for event in generate_response_with_output_model_stream(
@@ -2852,47 +2858,53 @@ async def _arun_stream(
 
                 # 9. Generate a response from the Model
                 if agent.output_model is None:
-                    async for event in ahandle_model_response_stream(
-                        agent,
-                        session=agent_session,
-                        run_response=run_response,
-                        run_messages=run_messages,
-                        tools=_tools,
-                        response_format=response_format,
-                        stream_events=stream_events,
-                        session_state=run_context.session_state,
-                        run_context=run_context,
-                    ):
-                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                            await araise_if_cancelled(run_response.run_id)  # type: ignore
-                        yield event
+                    async with contextlib.aclosing(
+                        ahandle_model_response_stream(
+                            agent,
+                            session=agent_session,
+                            run_response=run_response,
+                            run_messages=run_messages,
+                            tools=_tools,
+                            response_format=response_format,
+                            stream_events=stream_events,
+                            session_state=run_context.session_state,
+                            run_context=run_context,
+                        )
+                    ) as response_stream:
+                        async for event in response_stream:
+                            if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                                await araise_if_cancelled(run_response.run_id)  # type: ignore
+                            yield event
                 else:
                     from agno.run.agent import (
                         IntermediateRunContentEvent,
                         RunContentEvent,
                     )  # type: ignore
 
-                    async for event in ahandle_model_response_stream(
-                        agent,
-                        session=agent_session,
-                        run_response=run_response,
-                        run_messages=run_messages,
-                        tools=_tools,
-                        response_format=response_format,
-                        stream_events=stream_events,
-                        session_state=run_context.session_state,
-                        run_context=run_context,
-                    ):
-                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                            await araise_if_cancelled(run_response.run_id)  # type: ignore
-                        if isinstance(event, RunContentEvent):
-                            if stream_events:
-                                yield IntermediateRunContentEvent(
-                                    content=event.content,
-                                    content_type=event.content_type,
-                                )
-                        else:
-                            yield event
+                    async with contextlib.aclosing(
+                        ahandle_model_response_stream(
+                            agent,
+                            session=agent_session,
+                            run_response=run_response,
+                            run_messages=run_messages,
+                            tools=_tools,
+                            response_format=response_format,
+                            stream_events=stream_events,
+                            session_state=run_context.session_state,
+                            run_context=run_context,
+                        )
+                    ) as response_stream:
+                        async for event in response_stream:
+                            if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                                await araise_if_cancelled(run_response.run_id)  # type: ignore
+                            if isinstance(event, RunContentEvent):
+                                if stream_events:
+                                    yield IntermediateRunContentEvent(
+                                        content=event.content,
+                                        content_type=event.content_type,
+                                    )
+                            else:
+                                yield event
 
                     # If an output model is provided, generate output using the output model
                     async for event in agenerate_response_with_output_model_stream(
@@ -4480,20 +4492,23 @@ def _continue_run_stream(
                     return
 
                 # 3. Process model response
-                for event in handle_model_response_stream(
-                    agent,
-                    session=session,
-                    run_response=run_response,
-                    run_messages=run_messages,
-                    tools=tools,
-                    response_format=response_format,
-                    stream_events=stream_events,
-                    session_state=run_context.session_state,
-                    run_context=run_context,
-                ):
-                    if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                        raise_if_cancelled(run_response.run_id)  # type: ignore
-                    yield event
+                with contextlib.closing(
+                    handle_model_response_stream(
+                        agent,
+                        session=session,
+                        run_response=run_response,
+                        run_messages=run_messages,
+                        tools=tools,
+                        response_format=response_format,
+                        stream_events=stream_events,
+                        session_state=run_context.session_state,
+                        run_context=run_context,
+                    )
+                ) as response_stream:
+                    for event in response_stream:
+                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                            raise_if_cancelled(run_response.run_id)  # type: ignore
+                        yield event
 
                 # Parse response with parser model if provided
                 for event in parse_response_with_parser_model_stream(
@@ -6050,45 +6065,51 @@ async def _acontinue_run_stream(
 
                 # 8. Process model response
                 if agent.output_model is None:
-                    async for event in ahandle_model_response_stream(
-                        agent,
-                        session=agent_session,
-                        run_response=run_response,
-                        run_messages=run_messages,
-                        tools=_tools,
-                        response_format=response_format,
-                        stream_events=stream_events,
-                        run_context=run_context,
-                    ):
-                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                            await araise_if_cancelled(run_response.run_id)  # type: ignore
-                        yield event
+                    async with contextlib.aclosing(
+                        ahandle_model_response_stream(
+                            agent,
+                            session=agent_session,
+                            run_response=run_response,
+                            run_messages=run_messages,
+                            tools=_tools,
+                            response_format=response_format,
+                            stream_events=stream_events,
+                            run_context=run_context,
+                        )
+                    ) as response_stream:
+                        async for event in response_stream:
+                            if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                                await araise_if_cancelled(run_response.run_id)  # type: ignore
+                            yield event
                 else:
                     from agno.run.agent import (
                         IntermediateRunContentEvent,
                         RunContentEvent,
                     )  # type: ignore
 
-                    async for event in ahandle_model_response_stream(
-                        agent,
-                        session=agent_session,
-                        run_response=run_response,
-                        run_messages=run_messages,
-                        tools=_tools,
-                        response_format=response_format,
-                        stream_events=stream_events,
-                        run_context=run_context,
-                    ):
-                        if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
-                            await araise_if_cancelled(run_response.run_id)  # type: ignore
-                        if isinstance(event, RunContentEvent):
-                            if stream_events:
-                                yield IntermediateRunContentEvent(
-                                    content=event.content,
-                                    content_type=event.content_type,
-                                )
-                        else:
-                            yield event
+                    async with contextlib.aclosing(
+                        ahandle_model_response_stream(
+                            agent,
+                            session=agent_session,
+                            run_response=run_response,
+                            run_messages=run_messages,
+                            tools=_tools,
+                            response_format=response_format,
+                            stream_events=stream_events,
+                            run_context=run_context,
+                        )
+                    ) as response_stream:
+                        async for event in response_stream:
+                            if not isinstance(event, _CANCEL_BYPASS_EVENT_TYPES):
+                                await araise_if_cancelled(run_response.run_id)  # type: ignore
+                            if isinstance(event, RunContentEvent):
+                                if stream_events:
+                                    yield IntermediateRunContentEvent(
+                                        content=event.content,
+                                        content_type=event.content_type,
+                                    )
+                            else:
+                                yield event
 
                     # If an output model is provided, generate output using the output model
                     async for event in agenerate_response_with_output_model_stream(
@@ -6542,22 +6563,8 @@ def _handle_run_cancellation(
     """Prepare a run response for cancellation: set status, preserve content and messages."""
     log_debug(f"Run {run_response.run_id} was cancelled")
     run_response.status = RunStatus.cancelled
-    has_partial_content = bool(run_response.content)
     if run_response.messages is None and run_messages is not None:
-        messages_for_run_response = [msg for msg in run_messages.messages if msg.add_to_agent_memory]
-        # Preserve partial streamed content as the assistant message, filling an empty trailing one if present
-        if has_partial_content:
-            partial_content = str(run_response.content)
-            trailing_assistant = next(
-                (msg for msg in reversed(messages_for_run_response) if msg.role == "assistant"),
-                None,
-            )
-            if trailing_assistant is None:
-                messages_for_run_response.append(Message(role="assistant", content=partial_content))
-            elif not trailing_assistant.content:
-                trailing_assistant.content = partial_content
-        if messages_for_run_response:
-            run_response.messages = messages_for_run_response
+        run_response.messages = [msg for msg in run_messages.messages if msg.add_to_agent_memory]
     # Stop the timer for the Run duration
     if run_response.metrics:
         run_response.metrics.stop_timer()

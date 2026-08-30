@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Iterator, List, Optional, Union
+from typing import Any, AsyncGenerator, Callable, Generator, Iterator, List, Optional, Union
 
-from agno.exceptions import ContextWindowExceededError, ModelProviderError, ModelRateLimitError
+from agno.exceptions import ContextWindowExceededError, ModelProviderError, ModelRateLimitError, RunCancelledException
 from agno.models.base import Model
 from agno.models.message import Message
 from agno.models.response import ModelResponse, ModelResponseEvent
@@ -215,7 +217,7 @@ def call_model_stream_with_fallback(
     model: Model,
     fallback_config: Optional[FallbackConfig],
     **kwargs: Any,
-) -> Iterator[StreamEvent]:
+) -> Generator[StreamEvent, None, None]:
     """Call the primary model stream, falling back on failure."""
     try:
         yield from model.response_stream(**kwargs)
@@ -239,26 +241,30 @@ async def acall_model_stream_with_fallback(
     model: Model,
     fallback_config: Optional[FallbackConfig],
     **kwargs: Any,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     """Async variant of call_model_stream_with_fallback."""
     try:
-        async for event in model.aresponse_stream(**kwargs):
-            yield event
+        async with contextlib.aclosing(model.aresponse_stream(**kwargs)) as response_stream:
+            async for event in response_stream:
+                yield event
     except ModelProviderError as primary_error:
         fallbacks = get_fallback_models(fallback_config, primary_error)
         if not fallbacks:
             raise
         log_warning(f"Primary model '{model.id}' failed. Trying fallback models...: {primary_error}")
         yield ModelResponse(event=ModelResponseEvent.fallback_model_activated.value)
-        async for event in _atry_fallback_models_stream(
-            fallbacks,
-            primary_error,
-            _clean_kwargs_for_fallback(kwargs),
-            model.id,
-            fallback_config,
-            original_messages=kwargs.get("messages"),
-        ):
-            yield event
+        async with contextlib.aclosing(
+            _atry_fallback_models_stream(
+                fallbacks,
+                primary_error,
+                _clean_kwargs_for_fallback(kwargs),
+                model.id,
+                fallback_config,
+                original_messages=kwargs.get("messages"),
+            )
+        ) as response_stream:
+            async for event in response_stream:
+                yield event
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +366,9 @@ def _try_fallback_models_stream(
             _sync_appended_messages(original_messages, attempt_kwargs.get("messages"), seed_len)
             _notify_fallback(fallback_config, primary_model_id, fallback.id, primary_error)
             return
+        except (RunCancelledException, asyncio.CancelledError, KeyboardInterrupt, GeneratorExit):
+            _sync_appended_messages(original_messages, attempt_kwargs.get("messages"), seed_len)
+            raise
         except ModelProviderError as e:
             log_warning(f"Fallback model '{fallback.id}' also failed: {str(e)}")
             continue
@@ -373,7 +382,7 @@ async def _atry_fallback_models_stream(
     primary_model_id: str = "",
     fallback_config: Optional[FallbackConfig] = None,
     original_messages: Optional[List[Message]] = None,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     """Async: try each fallback model stream in order. Raises the primary error if all fail.
 
     Messages the successful fallback appends are synced back into original_messages
@@ -384,11 +393,15 @@ async def _atry_fallback_models_stream(
         try:
             log_warning(f"Trying fallback model {i + 1}/{len(fallback_models)}: {fallback.id}")
             attempt_kwargs = _copy_kwargs_with_fresh_messages(kwargs)
-            async for event in fallback.aresponse_stream(**attempt_kwargs):
-                yield event
+            async with contextlib.aclosing(fallback.aresponse_stream(**attempt_kwargs)) as response_stream:
+                async for event in response_stream:
+                    yield event
             _sync_appended_messages(original_messages, attempt_kwargs.get("messages"), seed_len)
             _notify_fallback(fallback_config, primary_model_id, fallback.id, primary_error)
             return
+        except (RunCancelledException, asyncio.CancelledError, KeyboardInterrupt, GeneratorExit):
+            _sync_appended_messages(original_messages, attempt_kwargs.get("messages"), seed_len)
+            raise
         except ModelProviderError as e:
             log_warning(f"Fallback model '{fallback.id}' also failed: {str(e)}")
             continue

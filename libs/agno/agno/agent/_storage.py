@@ -413,16 +413,9 @@ def upsert_session(
         session: The session to upsert.
     """
 
-    try:
-        if not agent.db:
-            raise ValueError("Db not initialized")
-        return agent.db.upsert_session(session=session)  # type: ignore
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc(limit=3)
-        log_warning(f"Error upserting session into db: {str(e)}")
-        return None
+    if not agent.db:
+        raise ValueError("Db not initialized")
+    return agent.db.upsert_session(session=session)  # type: ignore
 
 
 async def aupsert_session(
@@ -439,19 +432,12 @@ async def aupsert_session(
     """
     from agno.agent import _init
 
-    try:
-        if not agent.db:
-            raise ValueError("Db not initialized")
-        if _init.has_async_db(agent):
-            return await agent.db.upsert_session(session=session)  # type: ignore
-        else:
-            return agent.db.upsert_session(session=session)  # type: ignore
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc(limit=3)
-        log_warning(f"Error upserting session into db: {str(e)}")
-        return None
+    if not agent.db:
+        raise ValueError("Db not initialized")
+    if _init.has_async_db(agent):
+        return await agent.db.upsert_session(session=session)  # type: ignore
+    else:
+        return agent.db.upsert_session(session=session)  # type: ignore
 
 
 def upsert_run(
@@ -476,25 +462,20 @@ def upsert_run(
         user_id: Optional user ID to associate with the run.
         run_index: Optional run index for new runs.
     """
-    try:
-        if not agent.db:
-            return
-        from agno.run.status_persist import persist_worker_owned_run
+    if not agent.db:
+        return
+    from agno.run.status_persist import persist_worker_owned_run
 
-        # Queue-worker-owned runs save through the attempt-fenced primitive;
-        # a zombie attempt's write is refused instead of clobbering the row
-        if persist_worker_owned_run(agent.db, run, session_id=session_id, user_id=user_id):
-            return
+    # Queue-worker-owned runs save through the attempt-fenced primitive;
+    # a zombie attempt's write is refused instead of clobbering the row
+    if persist_worker_owned_run(agent.db, run, session_id=session_id, user_id=user_id):
+        return
+    try:
         agent.db.upsert_run(run=run, session_id=session_id, user_id=user_id, run_index=run_index)  # type: ignore[union-attr]
     except NotImplementedError:
         # Adapter has not been ported to v3 storage; runs are persisted inline
         # via upsert_session instead. Silent no-op.
         log_debug(f"{type(agent.db).__name__} does not implement upsert_run; skipping per-run write")
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc(limit=3)
-        log_warning(f"Error upserting run into db: {str(e)}")
 
 
 async def aupsert_run(
@@ -522,26 +503,21 @@ async def aupsert_run(
     """
     from agno.agent import _init
 
-    try:
-        if not agent.db:
-            return
-        from agno.run.status_persist import apersist_worker_owned_run
+    if not agent.db:
+        return
+    from agno.run.status_persist import apersist_worker_owned_run
 
-        # Queue-worker-owned runs save through the attempt-fenced primitive;
-        # a zombie attempt's write is refused instead of clobbering the row
-        if await apersist_worker_owned_run(agent.db, run, session_id=session_id, user_id=user_id):
-            return
+    # Queue-worker-owned runs save through the attempt-fenced primitive;
+    # a zombie attempt's write is refused instead of clobbering the row
+    if await apersist_worker_owned_run(agent.db, run, session_id=session_id, user_id=user_id):
+        return
+    try:
         if _init.has_async_db(agent):
             await agent.db.upsert_run(run=run, session_id=session_id, user_id=user_id, run_index=run_index)  # type: ignore[union-attr,misc]
         else:
             agent.db.upsert_run(run=run, session_id=session_id, user_id=user_id, run_index=run_index)  # type: ignore[union-attr]
     except NotImplementedError:
         log_debug(f"{type(agent.db).__name__} does not implement upsert_run; skipping per-run write")
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc(limit=3)
-        log_warning(f"Error upserting run into db: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
