@@ -480,6 +480,20 @@ class Model(ABC):
 
         return True
 
+    def _retry_stream_response(self, error: Exception, messages: List[Message], assistant_message: Message) -> bool:
+        """Opt into another model attempt after the partial assistant message is preserved.
+
+        Providers own the retry budget and must exclude unfinished tool calls from replay.
+        A retry starts a new assistant message and does not execute this attempt's tools.
+        Cancellation and generator closure never enter this hook.
+        """
+        return False
+
+    async def _aretry_stream_response(
+        self, error: Exception, messages: List[Message], assistant_message: Message
+    ) -> bool:
+        return self._retry_stream_response(error, messages, assistant_message)
+
     def _invoke_with_retry(self, **kwargs) -> ModelResponse:
         """
         Invoke the model with retry logic for ModelProviderError.
@@ -1682,6 +1696,7 @@ class Model(ABC):
                 assistant_message = Message(role=self.assistant_message_role)
                 stream_data = MessageData()
                 model_response = ModelResponse()
+                retry_stream_response = False
 
                 yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
 
@@ -1734,15 +1749,23 @@ class Model(ABC):
                             streaming_responses.append(model_response)
                         yield model_response
 
-                except BaseException:
+                except BaseException as error:
                     if stream_model_response:
                         self._populate_assistant_message_from_stream_data(
                             assistant_message=assistant_message, stream_data=stream_data
                         )
                     if assistant_message.content or assistant_message.reasoning_content or assistant_message.tool_calls:
                         messages.append(assistant_message)
-                    raise
-                messages.append(assistant_message)
+                    if (
+                        stream_model_response
+                        and isinstance(error, Exception)
+                        and not isinstance(error, RunCancelledException)
+                    ):
+                        retry_stream_response = self._retry_stream_response(error, messages, assistant_message)
+                    if not retry_stream_response:
+                        raise
+                if not retry_stream_response:
+                    messages.append(assistant_message)
                 assistant_message.log(metrics=True)
 
                 llm_metrics = assistant_message.metrics
@@ -1756,6 +1779,9 @@ class Model(ABC):
                     cache_read_tokens=llm_metrics.cache_read_tokens if llm_metrics else None,
                     cache_write_tokens=llm_metrics.cache_write_tokens if llm_metrics else None,
                 )
+
+                if retry_stream_response:
+                    continue
 
                 if assistant_message.tool_calls is not None:
                     function_calls_to_run: List[FunctionCall] = self.get_function_calls_to_run(
@@ -1978,6 +2004,7 @@ class Model(ABC):
                 stream_data = MessageData()
                 model_response = ModelResponse()
                 _assistant_message_appended = False
+                retry_stream_response = False
 
                 # Emit LLM request started event
                 yield ModelResponse(event=ModelResponseEvent.model_request_started.value)
@@ -2032,7 +2059,7 @@ class Model(ABC):
 
                     messages.append(assistant_message)
                     _assistant_message_appended = True
-                except BaseException:
+                except BaseException as error:
                     if not _assistant_message_appended:
                         self._populate_assistant_message_from_stream_data(
                             assistant_message=assistant_message, stream_data=stream_data
@@ -2043,7 +2070,14 @@ class Model(ABC):
                             or assistant_message.tool_calls
                         ):
                             messages.append(assistant_message)
-                    raise
+                    if (
+                        stream_model_response
+                        and isinstance(error, Exception)
+                        and not isinstance(error, RunCancelledException)
+                    ):
+                        retry_stream_response = await self._aretry_stream_response(error, messages, assistant_message)
+                    if not retry_stream_response:
+                        raise
                 assistant_message.log(metrics=True)
 
                 # Emit LLM request completed event with metrics
@@ -2058,6 +2092,9 @@ class Model(ABC):
                     cache_read_tokens=llm_metrics.cache_read_tokens if llm_metrics else None,
                     cache_write_tokens=llm_metrics.cache_write_tokens if llm_metrics else None,
                 )
+
+                if retry_stream_response:
+                    continue
 
                 # Handle tool calls if present
                 if assistant_message.tool_calls is not None:
