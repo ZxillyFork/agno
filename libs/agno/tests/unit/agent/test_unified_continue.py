@@ -24,6 +24,7 @@ from agno.agent._run import _apply_continue_modifiers, _fork_run, _truncate_run_
 from agno.agent.agent import Agent
 from agno.exceptions import RunNotContinuableError, RunNotFoundError
 from agno.models.message import Message
+from agno.models.openai.responses import OpenAIResponses
 from agno.models.response import ToolExecution
 from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
@@ -250,12 +251,10 @@ class TestHitlContractPreserved:
         agent = _make_agent(monkeypatch, runs=[paused_run])
 
         # Patch the admin-approval check to simulate "no resolved approval"
-        from agno.run import approval as approval_mod
-
         def raising_approval(db, run_id, run_response):
             raise RuntimeError("no resolved approval")
 
-        monkeypatch.setattr(approval_mod, "check_and_apply_approval_resolution", raising_approval)
+        monkeypatch.setattr(_run, "check_and_apply_approval_resolution", raising_approval)
 
         with pytest.raises(ValueError, match="unresolved HITL requirements"):
             _run.continue_run_dispatch(
@@ -287,15 +286,13 @@ class TestHitlContractPreserved:
         agent = _make_agent(monkeypatch, runs=[paused_run])
 
         # Patch the approval check to "succeed" (no-op) — admin approval was resolved.
-        from agno.run import approval as approval_mod
-
         approval_calls = {"called": False}
 
         def successful_approval(db, run_id, run_response):
             approval_calls["called"] = True
             # Real implementation would mutate run_response.tools to apply the resolution.
 
-        monkeypatch.setattr(approval_mod, "check_and_apply_approval_resolution", successful_approval)
+        monkeypatch.setattr(_run, "check_and_apply_approval_resolution", successful_approval)
 
         called = {"continue_run": False}
 
@@ -339,14 +336,12 @@ class TestHitlContractPreserved:
         agent = _make_agent(monkeypatch, runs=[run])
 
         # Approval check should NOT be invoked — no unresolved requirements
-        from agno.run import approval as approval_mod
-
         approval_calls = {"called": False}
 
         def tracking_approval(db, run_id, run_response):
             approval_calls["called"] = True
 
-        monkeypatch.setattr(approval_mod, "check_and_apply_approval_resolution", tracking_approval)
+        monkeypatch.setattr(_run, "check_and_apply_approval_resolution", tracking_approval)
 
         called = {"continue_run": False}
 
@@ -415,7 +410,7 @@ class TestHitlContractPreserved:
         )
 
         # The resolved requirement was applied
-        assert captured["requirements"][0] is resolved_requirement
+        assert captured["requirements"][0].tool_execution is captured["tools"][0]
         assert captured["tools"][0].result == "user supplied value"
 
 
@@ -511,12 +506,10 @@ class TestAsyncEmptyBodyResume:
         _patch_async_dispatch_dependencies(agent, monkeypatch, runs=[paused_run])
         monkeypatch.setattr(agent, "initialize_agent", lambda debug_mode=None: None)
 
-        from agno.run import approval as approval_mod
-
         async def raising_approval(db, run_id, run_response):
             raise RuntimeError("no resolved approval")
 
-        monkeypatch.setattr(approval_mod, "acheck_and_apply_approval_resolution", raising_approval)
+        monkeypatch.setattr(_run, "acheck_and_apply_approval_resolution", raising_approval)
 
         with pytest.raises(ValueError, match="unresolved HITL requirements"):
             await _run.acontinue_run_dispatch(
@@ -2177,7 +2170,7 @@ class TestStreamingRealBody:
 
         monkeypatch.setattr(response_mod, "ahandle_model_response_stream", fake_ahandle_stream)
 
-        agent = Agent(name="real-stream")
+        agent = Agent(name="real-stream", model=OpenAIResponses(id="test-model"))
         monkeypatch.setattr(agent, "initialize_agent", lambda debug_mode=None: None)
 
         # Patch agent.aget_tools so it doesn't traverse the live tool registry

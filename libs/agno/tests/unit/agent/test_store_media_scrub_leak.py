@@ -8,6 +8,7 @@ when the member/executor has store_media=False.
 """
 
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 from unittest.mock import AsyncMock, Mock, patch
@@ -243,9 +244,10 @@ async def test_acleanup_and_store_restores_media_after_scrub():
 def test_sync_media_storage_offloads_persisted_media():
     """Baseline for the two tests below: on run(), a sync backend replaces the persisted
     bytes with a reference and writes the payload out, while the caller keeps its bytes."""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
         media_dir = f"{tmpdir}/media"
         agent = _media_agent(tmpdir, media_storage=LocalMediaStorage(base_path=media_dir))
+        cleanup.callback(agent.db.close)
 
         result = agent.run("Generate an image")
 
@@ -261,9 +263,10 @@ def test_async_media_storage_on_sync_run_raises():
     async database is: loudly. Skipping it wrote the whole run inline while reporting success,
     so the one configuration difference between run() and arun() silently turned the feature
     off."""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
         media_dir = f"{tmpdir}/media"
         agent = _media_agent(tmpdir, media_storage=AsyncLocalMediaStorage(base_path=media_dir))
+        cleanup.callback(agent.db.close)
 
         with pytest.raises(ValueError, match="Cannot use sync run\\(\\) with an AsyncMediaStorage"):
             agent.run("Generate an image")
@@ -275,9 +278,10 @@ def test_async_media_storage_on_sync_run_raises():
 async def test_async_media_storage_on_arun_offloads():
     """The other half of the raise above: the same backend on arun() is the supported
     combination and offloads, so the run row carries a reference rather than the bytes."""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
         media_dir = f"{tmpdir}/media"
         agent = _media_agent(tmpdir, media_storage=AsyncLocalMediaStorage(base_path=media_dir))
+        cleanup.callback(agent.db.close)
 
         result = await agent.arun("Generate an image")
 
@@ -292,8 +296,9 @@ async def test_async_media_storage_on_arun_offloads():
 def test_no_media_storage_on_sync_run_does_not_warn():
     """The other half of the same distinction: with no backend the media is inline for the
     same reason it always was, and nothing was skipped, so no offload warning is emitted."""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as cleanup:
         agent = _media_agent(tmpdir)
+        cleanup.callback(agent.db.close)
 
         with patch("agno.agent._run.log_warning") as mock_warn:
             agent.run("Generate an image")
