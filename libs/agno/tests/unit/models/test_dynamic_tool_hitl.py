@@ -1,7 +1,9 @@
 import asyncio
 import json
 import pickle
+import threading
 import time
+from contextvars import ContextVar
 
 import pytest
 
@@ -22,6 +24,7 @@ from agno.models.base import Model
 from agno.models.message import Message
 from agno.models.response import ModelResponse, ModelResponseEvent, ToolExecution
 from agno.run.agent import RunOutput
+from agno.run.authorization import RunAuthorization, authorization_scope, current_authorization
 from agno.run.base import RunContext
 from agno.run.cancel import acancel_run, acleanup_run, aregister_run
 from agno.run.messages import RunMessages
@@ -3082,3 +3085,124 @@ def test_model_response_cache_is_disabled_when_tools_are_available(tmp_path):
     assert with_tools.content == "fresh"
     assert without_tools.content == "cached"
     assert saved_keys == []
+
+
+_REQUEST_MARKER = ContextVar("function_thread_request_marker", default=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_hook", [False, True])
+async def test_async_sync_tool_preserves_authority_and_request_context(with_hook):
+    authority = RunAuthorization(provider=object(), context=object())
+    marker = object()
+    event_loop_thread = threading.get_ident()
+    observed = []
+
+    def entrypoint():
+        observed.append(("entrypoint", current_authorization(), _REQUEST_MARKER.get()))
+        assert threading.get_ident() != event_loop_thread
+        return "completed"
+
+    def hook(function_call, arguments):
+        observed.append(("hook", current_authorization(), _REQUEST_MARKER.get()))
+        return function_call(**arguments)
+
+    def post_hook():
+        observed.append(("post_hook", current_authorization(), _REQUEST_MARKER.get()))
+
+    function = Function(
+        name="context_probe",
+        entrypoint=entrypoint,
+        tool_hooks=[hook] if with_hook else None,
+        post_hook=post_hook,
+    )
+    token = _REQUEST_MARKER.set(marker)
+    try:
+        with authorization_scope(lambda: authority):
+            result = await FunctionCall(function=function).aexecute()
+        assert current_authorization() is None
+    finally:
+        _REQUEST_MARKER.reset(token)
+
+    assert result.status == "success"
+    assert result.result == "completed"
+    stages = ["hook", "entrypoint", "post_hook"] if with_hook else ["entrypoint", "post_hook"]
+    assert observed == [(stage, authority, marker) for stage in stages]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_early", [False, True])
+async def test_async_sync_generator_preserves_authority_on_next_and_close(close_early):
+    authority = RunAuthorization(provider=object(), context=object())
+    marker = object()
+    event_loop_thread = threading.get_ident()
+    observed = []
+
+    def entrypoint():
+        try:
+            assert threading.get_ident() != event_loop_thread
+            observed.append(("next", current_authorization(), _REQUEST_MARKER.get()))
+            yield "first"
+            observed.append(("next", current_authorization(), _REQUEST_MARKER.get()))
+            yield "second"
+        finally:
+            assert threading.get_ident() != event_loop_thread
+            observed.append(("close", current_authorization(), _REQUEST_MARKER.get()))
+
+    def post_hook():
+        observed.append(("post_hook", current_authorization(), _REQUEST_MARKER.get()))
+
+    function = Function(name="generator_probe", entrypoint=entrypoint, post_hook=post_hook)
+    token = _REQUEST_MARKER.set(marker)
+    try:
+        with authorization_scope(lambda: authority):
+            result = await FunctionCall(function=function).aexecute()
+        assert current_authorization() is None
+        stream = result.result
+        assert await stream.__anext__() == "first"
+        assert current_authorization() is None
+        if close_early:
+            await stream.aclose()
+        else:
+            assert [item async for item in stream] == ["second"]
+        assert current_authorization() is None
+    finally:
+        _REQUEST_MARKER.reset(token)
+
+    stages = ["next", "close"] if close_early else ["next", "next", "close", "post_hook"]
+    assert observed == [(stage, authority, marker) for stage in stages]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", [False, True])
+async def test_model_sync_tools_preserve_authority_and_request_context(batch):
+    authority = RunAuthorization(provider=object(), context=object())
+    marker = object()
+    event_loop_thread = threading.get_ident()
+    observed = []
+
+    def entrypoint():
+        assert threading.get_ident() != event_loop_thread
+        observed.append((current_authorization(), _REQUEST_MARKER.get()))
+        return "completed"
+
+    function = Function(name="model_context_probe", entrypoint=entrypoint)
+    function_call = FunctionCall(function=function, call_id="context_probe")
+    model = DummyModel(id="context_probe")
+    token = _REQUEST_MARKER.set(marker)
+    try:
+        with authorization_scope(lambda: authority):
+            if batch:
+                messages = []
+                events = [event async for event in model.arun_function_calls([function_call], messages)]
+                assert any(event.event == ModelResponseEvent.tool_call_completed.value for event in events)
+                assert messages[-1].content == "completed"
+            else:
+                success, _, _, result = await model.arun_function_call(function_call)
+                assert success is True
+                assert result.result == "completed"
+        assert current_authorization() is None
+    finally:
+        _REQUEST_MARKER.reset(token)
+
+    assert observed == [(authority, marker)]

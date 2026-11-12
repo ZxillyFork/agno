@@ -62,6 +62,8 @@ def tool(
     *,
     name: Optional[str] = None,
     description: Optional[str] = None,
+    title: Optional[str] = None,
+    annotations: Optional[Dict[str, Any]] = None,
     strict: Optional[bool] = None,
     defer_loading: Optional[bool] = None,
     instructions: Optional[str] = None,
@@ -93,6 +95,9 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
     Args:
         name: Optional[str] - Override for the function name
         description: Optional[str] - Override for the function description
+        title: Optional[str] - Human-facing display name for clients that render tools to people
+        annotations: Optional[Dict[str, Any]] - MCP behaviour hints (readOnlyHint,
+            destructiveHint, idempotentHint, openWorldHint) published alongside the tool
         strict: Optional[bool] - Flag for strict parameter checking
         defer_loading: Optional[bool] - If True, provider-side tool search may load the tool lazily
         instructions: Optional[str] - Instructions for using the tool
@@ -133,6 +138,8 @@ def tool(*args, **kwargs) -> Union[Function, Callable[[F], Function]]:
         {
             "name",
             "description",
+            "title",
+            "annotations",
             "strict",
             "defer_loading",
             "instructions",

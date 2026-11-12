@@ -1,7 +1,9 @@
 from typing import Any, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from openai import APIStatusError
 
 from agno.models.message import Message
 from agno.models.openai.responses import OpenAIResponses
@@ -949,3 +951,73 @@ def test_streaming_namespaced_function_call_preserves_namespace():
     )
     assert assistant.tool_calls is not None
     assert assistant.tool_calls[0]["namespace"] == "crm"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_streaming_client_tool_search_recovers_stale_chain(async_mode):
+    loaded_function = Function(name="loaded_tool", parameters={"type": "object", "properties": {}})
+    search_response = _FakeResponse(
+        output=[
+            _FakeOutput(
+                type="tool_search_call",
+                id="ts_1",
+                call_id="call_search",
+                execution="client",
+                arguments={},
+                status="completed",
+            )
+        ]
+    )
+    final_response = _FakeResponse(
+        output=[_FakeOutput(type="function_call", id="fc_1", call_id="call_loaded", name="loaded_tool", arguments="{}")]
+    )
+    rejection = APIStatusError(
+        "Previous response not found",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://api.openai.com/v1/responses")),
+        body={"error": {"param": "previous_response_id", "code": "previous_response_not_found"}},
+    )
+    rounds = [
+        [_FakeChunk(type="response.completed", response=response)] for response in [search_response, final_response]
+    ]
+
+    async def chunks(items):
+        for item in items:
+            yield item
+
+    client = _make_fake_client()
+    model = OpenAIResponses(id="gpt-5.4")
+    if async_mode:
+        client.responses.create = AsyncMock(side_effect=[rejection, *(chunks(items) for items in rounds)])
+        model.async_client = client
+    else:
+        client.responses.create.side_effect = [rejection, *(iter(items) for items in rounds)]
+        model.client = client
+    messages = [
+        Message(role="user", content="Original question"),
+        Message(role="assistant", content="Prior answer", provider_data={"response_id": "resp_stale"}),
+        Message(role="user", content="Find a tool"),
+    ]
+    assistant = Message(role="assistant")
+    kwargs = {
+        "messages": messages,
+        "assistant_message": assistant,
+        "tools": [
+            ToolSearch.client(
+                description="Find tools",
+                parameters={"type": "object", "properties": {}},
+                searcher=lambda _call, _context: [loaded_function],
+            )
+        ],
+    }
+    if async_mode:
+        responses = [chunk async for chunk in model.ainvoke_stream(**kwargs)]
+    else:
+        responses = list(model.invoke_stream(**kwargs))
+
+    requests = [call.kwargs for call in client.responses.create.call_args_list]
+    assert ["previous_response_id" in request for request in requests] == [True, False, False]
+    assert requests[1]["input"][0]["content"] == "Original question"
+    assert requests[2]["input"][-1]["type"] == "tool_search_output"
+    assert assistant.tool_calls[0]["function"]["name"] == "loaded_tool"
+    assert any(response.provider_data and response.provider_data.get("tool_search_items") for response in responses)

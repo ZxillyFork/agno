@@ -213,7 +213,7 @@ async def test_ahandle_team_run_paused_forwards_run_context_to_cleanup(monkeypat
 
 def test_handle_team_run_paused_persists_session_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
     monkeypatch.setattr("agno.run.approval.create_approval_from_pause", lambda **kwargs: None)
 
     team = Team(name="test-team", members=[Agent(name="m1")])
@@ -237,7 +237,7 @@ def test_handle_team_run_paused_persists_session_state(monkeypatch: pytest.Monke
 
 def test_handle_team_run_paused_without_run_context_does_not_set_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
     monkeypatch.setattr("agno.run.approval.create_approval_from_pause", lambda **kwargs: None)
 
     team = Team(name="test-team", members=[Agent(name="m1")])
@@ -257,7 +257,7 @@ def test_handle_team_run_paused_without_run_context_does_not_set_state(monkeypat
 
 def test_handle_team_run_paused_persists_state_when_session_data_is_none(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
     monkeypatch.setattr("agno.run.approval.create_approval_from_pause", lambda **kwargs: None)
 
     team = Team(name="test-team", members=[Agent(name="m1")])
@@ -282,7 +282,7 @@ def test_handle_team_run_paused_persists_state_when_session_data_is_none(monkeyp
 @pytest.mark.asyncio
 async def test_ahandle_team_run_paused_persists_state_when_session_data_is_none(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
 
     async def noop_acreate_approval(**kwargs):
         return None
@@ -315,7 +315,7 @@ async def test_ahandle_team_run_paused_persists_state_when_session_data_is_none(
 @pytest.mark.asyncio
 async def test_ahandle_team_run_paused_persists_session_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
 
     async def noop_acreate_approval(**kwargs):
         return None
@@ -401,7 +401,7 @@ async def test_ahandle_team_run_paused_stream_forwards_run_context_to_cleanup(mo
 
 def test_handle_team_run_paused_stream_persists_session_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
     monkeypatch.setattr("agno.run.approval.create_approval_from_pause", lambda **kwargs: None)
 
     team = Team(name="test-team", members=[Agent(name="m1")])
@@ -428,7 +428,7 @@ def test_handle_team_run_paused_stream_persists_session_state(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_ahandle_team_run_paused_stream_persists_session_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(team_run, "scrub_run_output_for_storage", lambda team, run_response: None)
-    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session, run_response: None)
+    monkeypatch.setattr("agno.team._session.update_session_metrics", lambda team, session: None)
 
     async def noop_acreate_approval(**kwargs):
         return None

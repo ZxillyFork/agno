@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import pytest
 
 from agno.agent import Agent, _response, _run
+from agno.agent._messages import _history_for_compaction, _history_for_run
+from agno.compaction import Compaction
 from agno.db.in_memory import InMemoryDb
 from agno.exceptions import ModelProviderError, RunCancelledException
 from agno.models.base import Model
@@ -11,6 +13,7 @@ from agno.models.fallback import FallbackConfig
 from agno.models.message import Message
 from agno.models.response import ModelResponse
 from agno.run.agent import RunOutput
+from agno.run.base import RunStatus
 from agno.run.cancel import cancel_run
 from agno.run.messages import RunMessages
 from agno.session import AgentSession
@@ -19,6 +22,35 @@ from agno.tools.function import Function
 
 def checkpoint() -> str:
     return "ok"
+
+
+@pytest.mark.parametrize("include_cancelled", [False, True])
+@pytest.mark.parametrize("compact", [False, True])
+def test_compaction_history_preserves_cancelled_history_policy(include_cancelled, compact):
+    agent = Agent(
+        model=ScriptedModel(id="scripted"),
+        include_cancelled_history=include_cancelled,
+        compaction=Compaction(compact_at_tokens=1000) if compact else None,
+        num_history_runs=10,
+        telemetry=False,
+    )
+    session = AgentSession(
+        session_id="history",
+        runs=[
+            RunOutput(
+                run_id=status.value,
+                status=status,
+                messages=[Message(role="assistant", content=status.value)],
+            )
+            for status in (RunStatus.completed, RunStatus.cancelled, RunStatus.paused, RunStatus.error)
+        ],
+    )
+    expected = [RunStatus.completed.value]
+    if include_cancelled:
+        expected.append(RunStatus.cancelled.value)
+    history, _, _ = _history_for_run(agent, session, None, None)
+    assert [message.content for message in history] == expected
+    assert [message.content for message in _history_for_compaction(agent, session)] == expected
 
 
 @dataclass

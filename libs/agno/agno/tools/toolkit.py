@@ -409,6 +409,8 @@ class Toolkit:
         f = Function(
             name=tool_name,
             description=function.description,
+            title=function.title,
+            annotations=function.annotations,
             parameters=function.parameters,
             strict=function.strict,
             instructions=function.instructions,
@@ -460,6 +462,11 @@ class Toolkit:
         merged = OrderedDict(self.functions)
         merged.update(self.async_functions)
         return merged
+
+    @property
+    def recorded_name(self) -> str:
+        """The toolkit name each tool call records, sent in run events and kept in metrics."""
+        return self.name
 
     @property
     def requires_connect(self) -> bool:

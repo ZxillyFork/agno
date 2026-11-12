@@ -1390,7 +1390,7 @@ class TestNestedRequirementMerge:
         assert run_response.requirements == [paused_req]
         assert run_response.requirements[0]._member_run_response is member_run_response
         assert run_response.requirements[0].is_resolved()
-        assert run_response.tools == [paused_req.tool_execution]
+        assert run_response.tools is None
 
 
 # ===========================================================================

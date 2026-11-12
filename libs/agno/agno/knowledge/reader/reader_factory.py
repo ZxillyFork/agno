@@ -2,13 +2,11 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 from agno.knowledge.reader.base import Reader
+from agno.knowledge.reader.utils.urls import is_sitemap_url
 
 
 class ReaderFactory:
     """Factory for creating and managing document readers with lazy loading."""
-
-    # Cache for instantiated readers
-    _reader_cache: Dict[str, Reader] = {}
 
     # Static metadata for readers - avoids instantiation just to get metadata
     READER_METADATA: Dict[str, Dict[str, str]] = {
@@ -79,6 +77,10 @@ class ReaderFactory:
         "llms_txt": {
             "name": "LLMsTxtReader",
             "description": "Reads llms.txt files, discovers linked documentation URLs, and fetches their content",
+        },
+        "sitemap": {
+            "name": "SitemapReader",
+            "description": "Discovers a website's sitemap and loads one document per page with its source URL",
         },
         "docling": {
             "name": "DoclingReader",
@@ -296,6 +298,18 @@ class ReaderFactory:
         return LLMsTxtReader(**config)
 
     @classmethod
+    def _get_sitemap_reader(cls, **kwargs) -> Reader:
+        """Get Sitemap reader instance."""
+        from agno.knowledge.reader.sitemap_reader import SitemapReader
+
+        config: Dict[str, Any] = {
+            "name": "Sitemap Reader",
+            "description": "Discovers a website's sitemap and loads one document per page with its source URL",
+        }
+        config.update(kwargs)
+        return SitemapReader(**config)
+
+    @classmethod
     def _get_docling_reader(cls, **kwargs) -> Reader:
         """Get Docling reader instance."""
         from agno.knowledge.reader.docling_reader import DoclingReader
@@ -351,6 +365,7 @@ class ReaderFactory:
             "wikipedia": ("agno.knowledge.reader.wikipedia_reader", "WikipediaReader"),
             "web_search": ("agno.knowledge.reader.web_search_reader", "WebSearchReader"),
             "llms_txt": ("agno.knowledge.reader.llms_txt_reader", "LLMsTxtReader"),
+            "sitemap": ("agno.knowledge.reader.sitemap_reader", "SitemapReader"),
             "docling": ("agno.knowledge.reader.docling_reader", "DoclingReader"),
         }
 
@@ -380,18 +395,21 @@ class ReaderFactory:
 
     @classmethod
     def create_reader(cls, reader_key: str, **kwargs) -> Reader:
-        """Create a reader instance with the given key and optional overrides."""
-        if reader_key in cls._reader_cache:
-            return cls._reader_cache[reader_key]
+        """Create a reader instance with the given key and optional overrides.
 
-        # Get the reader method and create the instance
+        When kwargs are provided, constructs and returns a new reader instance
+        configured with those overrides. When no kwargs are provided, returns a
+        newly constructed default instance to avoid sharing mutable state across callers.
+
+        Args:
+            reader_key: The identifier for the reader type (e.g., 'text', 'pdf', 'csv').
+            **kwargs: Optional configuration overrides passed to the reader constructor.
+
+        Returns:
+            Reader: A configured reader instance.
+        """
         reader_method = cls._get_reader_method(reader_key)
-        reader = reader_method(**kwargs)
-
-        # Cache the reader
-        cls._reader_cache[reader_key] = reader
-
-        return reader
+        return reader_method(**kwargs)
 
     @classmethod
     def get_reader_for_extension(cls, extension: str) -> Reader:
@@ -432,6 +450,10 @@ class ReaderFactory:
         # Check for YouTube URLs
         if any(domain in url_lower for domain in ["youtube.com", "youtu.be"]):
             return cls.create_reader("youtube")
+
+        # A sitemap URL gets the per-page sitemap reader
+        if is_sitemap_url(url):
+            return cls.create_reader("sitemap")
 
         # Default to website reader
         return cls.create_reader("website")
@@ -478,8 +500,7 @@ class ReaderFactory:
 
     @classmethod
     def clear_cache(cls):
-        """Clear the reader cache."""
-        cls._reader_cache.clear()
+        """No-op kept for backward compatibility; readers are no longer cached."""
 
     @classmethod
     def register_reader(

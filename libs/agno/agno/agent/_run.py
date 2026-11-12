@@ -49,7 +49,7 @@ from agno.models.base import Model
 from agno.models.fallback import acall_model_with_fallback, call_model_with_fallback
 from agno.models.message import Message
 from agno.models.response import ModelResponse, ToolExecution
-from agno.run import RunContext, RunStatus
+from agno.run import CancellationStage, RunContext, RunStatus
 from agno.run.agent import (
     RunCancelledEvent,
     RunCompletedEvent,
@@ -63,6 +63,10 @@ from agno.run.approval import (
     check_and_apply_approval_resolution,
     create_approval_from_pause,
 )
+
+# Strong references to background tasks so they aren't garbage-collected mid-execution.
+# See: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+from agno.run.background import _background_tasks
 from agno.run.cancel import (
     acancel_run as acancel_run_global,
 )
@@ -116,6 +120,7 @@ from agno.utils.events import (
     handle_event,
 )
 from agno.utils.hooks import (
+    continue_post_hooks,
     normalize_post_hooks,
     normalize_pre_hooks,
 )
@@ -125,10 +130,6 @@ from agno.utils.log import (
     log_info,
     log_warning,
 )
-
-# Strong references to background tasks so they aren't garbage-collected mid-execution.
-# See: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
-_background_tasks: set[asyncio.Task[None]] = set()
 
 # Cancel raises immediately on every event. Only terminal events bypass so the
 # run's own cancel handler can yield them to the stream.
@@ -355,19 +356,27 @@ def _sync_run_response_tools_from_requirements(run_response: RunOutput, requirem
     requirement_tools = sorted(requirement_tools, key=lambda tool: id(tool) not in current_tool_object_ids)
     matched_tool_indexes: set[int] = set()
     for requirement_tool in requirement_tools:
+        identity_index = next(
+            (index for index, existing_tool in enumerate(synced_tools) if existing_tool is requirement_tool), None
+        )
+        if identity_index is not None:
+            matched_tool_indexes.add(identity_index)
+            continue
+        if requirement_tool.result is not None and any(
+            tool.tool_call_id == requirement_tool.tool_call_id and tool.result is not None for tool in synced_tools
+        ):
+            continue
         matched = False
         for index, existing_tool in enumerate(synced_tools):
             if index in matched_tool_indexes:
                 continue
-            if existing_tool is requirement_tool:
-                matched_tool_indexes.add(index)
-                matched = True
-                break
             if (
                 existing_tool.tool_call_id is not None
                 and requirement_tool.tool_call_id is not None
                 and existing_tool.tool_call_id == requirement_tool.tool_call_id
+                and existing_tool.result is None
             ):
+                requirement_tool.toolkit = existing_tool.toolkit
                 synced_tools[index] = requirement_tool
                 matched_tool_indexes.add(index)
                 matched = True
@@ -386,28 +395,48 @@ def _sync_run_response_tools_from_requirements(run_response: RunOutput, requirem
     run_response.tools = synced_tools
 
 
-def _find_matching_tool(tool_execution: ToolExecution, tools: Optional[List[ToolExecution]]) -> Optional[ToolExecution]:
+def _find_matching_tool(
+    tool_execution: ToolExecution, tools: Optional[List[ToolExecution]], *, completed: bool = False
+) -> Optional[ToolExecution]:
     if not tools or tool_execution.tool_call_id is None:
         return None
 
+    for tool in tools:
+        if tool is tool_execution:
+            return tool
+    matching_tools = [tool for tool in tools if tool.tool_call_id == tool_execution.tool_call_id]
+    if completed:
+        return next((tool for tool in reversed(matching_tools) if tool.result is not None), tool_execution)
     return next(
-        (tool for tool in tools if tool.tool_call_id is not None and tool.tool_call_id == tool_execution.tool_call_id),
-        None,
+        (tool for tool in reversed(matching_tools) if tool.result is None),
+        matching_tools[-1] if matching_tools else None,
     )
 
 
 def _hydrate_requirement_tool_context_from_run_tools(
-    requirements: List[RunRequirement], tools: Optional[List[ToolExecution]]
+    requirements: List[RunRequirement],
+    tools: Optional[List[ToolExecution]],
+    existing_requirements: Optional[List[RunRequirement]] = None,
 ) -> None:
+    matched_requirement_ids: set[int] = set()
     for requirement in requirements:
         if requirement.tool_execution is None:
             continue
 
-        matching_tool = _find_matching_tool(requirement.tool_execution, tools)
-        if matching_tool is None or matching_tool is requirement.tool_execution:
+        target = _find_requirement_resolution_target(existing_requirements or [], requirement, matched_requirement_ids)
+        target_tool = requirement.tool_execution
+        if target is not None and target.tool_execution is not None:
+            matched_requirement_ids.add(id(target))
+            target_tool = target.tool_execution
+        matching_tool = _find_matching_tool(
+            target_tool, tools, completed=target is not None and target_tool.result is not None
+        )
+        if matching_tool is None:
             continue
-
-        _apply_tool_resolution_to_tool(matching_tool, requirement.tool_execution)
+        if matching_tool is not requirement.tool_execution and matching_tool.result is None:
+            _apply_tool_resolution_to_tool(matching_tool, requirement.tool_execution)
+        if target is not None:
+            target.tool_execution = matching_tool
         requirement.tool_execution = matching_tool
 
 
@@ -478,8 +507,8 @@ def _apply_tool_resolution_payload(
         return
 
     normalized_requirements = _normalize_requirements_payload(requirements)
-    _hydrate_requirement_tool_context_from_run_tools(normalized_requirements, run_response.tools)
     existing_requirements = list(run_response.requirements or [])
+    _hydrate_requirement_tool_context_from_run_tools(normalized_requirements, run_response.tools, existing_requirements)
     if not existing_requirements:
         run_response.requirements = normalized_requirements
         _sync_run_response_tools_from_requirements(run_response, normalized_requirements)
@@ -505,7 +534,13 @@ def _apply_tool_resolution_payload(
 # ---------------------------------------------------------------------------
 
 
-def resolve_run_dependencies(agent: Agent, run_context: RunContext) -> None:
+def resolve_run_dependencies(
+    agent: Agent,
+    run_context: RunContext,
+    *,
+    run_input: Optional[RunInput] = None,
+    session: Optional[AgentSession] = None,
+) -> None:
     from inspect import iscoroutine, iscoroutinefunction, signature
 
     # Dependencies should already be resolved in run() method
@@ -528,6 +563,10 @@ def resolve_run_dependencies(agent: Agent, run_context: RunContext) -> None:
                     kwargs["agent"] = agent
                 if "run_context" in sig.parameters:
                     kwargs["run_context"] = run_context
+                if "run_input" in sig.parameters:
+                    kwargs["run_input"] = run_input
+                if "session" in sig.parameters:
+                    kwargs["session"] = session
 
                 # Run the function
                 result = value(**kwargs)
@@ -542,7 +581,13 @@ def resolve_run_dependencies(agent: Agent, run_context: RunContext) -> None:
             run_context.dependencies[key] = value
 
 
-async def aresolve_run_dependencies(agent: Agent, run_context: RunContext) -> None:
+async def aresolve_run_dependencies(
+    agent: Agent,
+    run_context: RunContext,
+    *,
+    run_input: Optional[RunInput] = None,
+    session: Optional[AgentSession] = None,
+) -> None:
     from inspect import iscoroutine, signature
 
     log_debug("Resolving context (async)")
@@ -563,6 +608,10 @@ async def aresolve_run_dependencies(agent: Agent, run_context: RunContext) -> No
                 kwargs["agent"] = agent
             if "run_context" in sig.parameters:
                 kwargs["run_context"] = run_context
+            if "run_input" in sig.parameters:
+                kwargs["run_input"] = run_input
+            if "session" in sig.parameters:
+                kwargs["session"] = session
 
             # Run the function
             result = value(**kwargs)
@@ -803,7 +852,7 @@ def _run(
     """
     from agno.agent._hooks import execute_post_hooks, execute_pre_hooks
     from agno.agent._init import disconnect_connectable_tools
-    from agno.agent._messages import get_run_messages
+    from agno.agent._messages import _recompact_after_overflow, get_run_messages
     from agno.agent._response import (
         convert_response_to_structured_format,
         generate_followups,
@@ -859,7 +908,9 @@ def _run(
 
                 # 3. Resolve dependencies
                 if run_context.dependencies is not None:
-                    resolve_run_dependencies(agent, run_context=run_context)
+                    resolve_run_dependencies(
+                        agent, run_context=run_context, run_input=run_response.input, session=agent_session
+                    )
 
                 raise_if_cancelled(run_response.run_id)  # type: ignore
 
@@ -954,6 +1005,9 @@ def _run(
                 model_response: ModelResponse = call_model_with_fallback(
                     agent.model,
                     agent.fallback_config,
+                    recover_from_overflow=lambda: _recompact_after_overflow(
+                        agent, agent_session, run_messages, run_response, _tools
+                    ),
                     messages=run_messages.messages,
                     tools=_tools,
                     tool_choice=agent.tool_choice,
@@ -1264,7 +1318,9 @@ def _run_stream(
 
                 # 3. Resolve dependencies
                 if run_context.dependencies is not None:
-                    resolve_run_dependencies(agent, run_context=run_context)
+                    resolve_run_dependencies(
+                        agent, run_context=run_context, run_input=run_response.input, session=agent_session
+                    )
 
                 raise_if_cancelled(run_response.run_id)  # type: ignore
 
@@ -1325,6 +1381,17 @@ def _run_stream(
                 )
                 if len(run_messages.messages) == 0:
                     log_error("No messages to be sent to the model.")
+
+                # Events raised while assembling messages (compaction). Assembly
+                # is not a generator, so they are collected there and emitted here.
+                if stream_events:
+                    for assembly_event in run_messages.events:
+                        yield handle_event(  # type: ignore
+                            assembly_event,
+                            run_response,
+                            events_to_skip=agent.events_to_skip,  # type: ignore
+                            store_events=agent.store_events,
+                        )
 
                 # 7. Start memory creation in background thread
                 from agno.agent import _managers
@@ -1940,7 +2007,7 @@ async def _arun(
     """
     from agno.agent._hooks import aexecute_post_hooks, aexecute_pre_hooks
     from agno.agent._init import disconnect_connectable_tools, disconnect_mcp_tools
-    from agno.agent._messages import aget_run_messages
+    from agno.agent._messages import _arecompact_after_overflow, aget_run_messages
     from agno.agent._response import (
         agenerate_followups,
         agenerate_response_with_output_model,
@@ -1997,7 +2064,9 @@ async def _arun(
 
                 # 3. Resolve dependencies
                 if run_context.dependencies is not None:
-                    await aresolve_run_dependencies(agent, run_context=run_context)
+                    await aresolve_run_dependencies(
+                        agent, run_context=run_context, run_input=run_response.input, session=agent_session
+                    )
 
                 await araise_if_cancelled(run_response.run_id)  # type: ignore
 
@@ -2061,7 +2130,6 @@ async def _arun(
                 )
                 if len(run_messages.messages) == 0:
                     log_error("No messages to be sent to the model.")
-
                 # 7. Start memory creation as a background task (runs concurrently with the main execution)
                 from agno.agent import _managers
 
@@ -2097,6 +2165,9 @@ async def _arun(
                 model_response: ModelResponse = await acall_model_with_fallback(
                     agent.model,
                     agent.fallback_config,
+                    recover_from_overflow=lambda: _arecompact_after_overflow(
+                        agent, agent_session, run_messages, run_response, _tools
+                    ),
                     messages=run_messages.messages,
                     tools=_tools,
                     tool_choice=agent.tool_choice,
@@ -2387,80 +2458,29 @@ async def _arun_background(
 
     log_info(f"Background run {run_response.run_id} created with PENDING status")
 
-    # 4. Spawn the background task. Execution waits for a concurrency slot
-    # (background_run_slot); the run stays PENDING while waiting in line and
-    # can be cancelled without consuming a slot.
-    async def _background_task() -> None:
-        try:
-            async with background_run_slot(run_id=run_response.run_id):
-                # Transition to RUNNING via the atomic helper (row-locked
-                # patch when the DB supports it, fresh-read + save otherwise).
-                run_response.status = RunStatus.running
-                await apersist_run_transition(agent, "agent", session_id, run_response, user_id=user_id)
+    from agno.run.background import _execute_background, _spawn_background
 
-                # Execute the actual run — _arun handles everything including
-                # session persistence and cleanup
-                await _arun(
-                    agent,
-                    run_response=run_response,
-                    run_context=run_context,
-                    user_id=user_id,
-                    response_format=response_format,
-                    session_id=session_id,
-                    add_history_to_context=add_history_to_context,
-                    add_dependencies_to_context=add_dependencies_to_context,
-                    add_session_state_to_context=add_session_state_to_context,
-                    debug_mode=debug_mode,
-                    background_tasks=background_tasks,
-                    **kwargs,
-                )
-        except RunCancelledException:
-            # Cancelled while waiting for a slot — _arun never started, so
-            # persist CANCELLED and deregister the run here.
-            log_info(f"Background run {run_response.run_id} cancelled while waiting for a slot")
-            try:
-                run_response.status = RunStatus.cancelled
-                await apersist_run_transition(agent, "agent", session_id, run_response, user_id=user_id)
-            except Exception as e:
-                log_error(f"Failed to persist cancelled state for background run {run_response.run_id}: {str(e)}")
-            await acleanup_run(run_context.run_id)
-        except asyncio.CancelledError:
-            # Task-level shutdown (event loop stopping), not run-cancellation:
-            # best-effort persist so pollers are not left with a run stuck at
-            # PENDING/RUNNING forever. The durable queue's drain handles this
-            # properly; this is the non-durable path's honest fallback.
-            from agno.run.concurrency import is_worker_managed
+    async def execute() -> None:
+        await _arun(
+            agent,
+            run_response=run_response,
+            run_context=run_context,
+            user_id=user_id,
+            response_format=response_format,
+            session_id=session_id,
+            add_history_to_context=add_history_to_context,
+            add_dependencies_to_context=add_dependencies_to_context,
+            add_session_state_to_context=add_session_state_to_context,
+            debug_mode=debug_mode,
+            background_tasks=background_tasks,
+            **kwargs,
+        )
 
-            if is_worker_managed(getattr(run_response, "run_id", None) or ""):
-                raise  # worker-claimed: the QueueWorker owns this terminal
-            if run_response.status == RunStatus.paused:
-                # The leg already PAUSED and parked valid, continuable HITL
-                # state (persisted by the leg itself) - a routine deploy's
-                # shutdown must not stamp CANCELLED over it. This in-memory
-                # check is the ONLY protection off-Postgres: adapters without
-                # the atomic primitive reach the whole-session fallback, which
-                # no DB-side guard covers.
-                raise
-            with contextlib.suppress(Exception):
-                run_response.status = RunStatus.cancelled
-                await apersist_run_transition(agent, "agent", session_id, run_response, user_id=user_id)
-            raise
-        except Exception as e:
-            log_error(f"Background run {run_response.run_id} failed: {str(e)}")
-            # Persist ERROR status — only persist the changed run (O(1))
-            try:
-                run_response.status = RunStatus.error
-                error_run = await abuild_full_run_storage_copy(agent, run_response, session_id)
-                await apersist_run_transition(agent, "agent", session_id, error_run, user_id=user_id, full_run=True)
-            except Exception as e:
-                log_error(f"Failed to persist error state for background run {run_response.run_id}: {str(e)}")
-            # Note: acleanup_run is already called by _arun's finally block
+    async def transition(full_run: bool) -> None:
+        storage_run = await abuild_full_run_storage_copy(agent, run_response, session_id) if full_run else run_response
+        await apersist_run_transition(agent, "agent", session_id, storage_run, user_id=user_id, full_run=full_run)
 
-    task = asyncio.create_task(_background_task())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-    # 5. Return immediately with the PENDING response
+    _spawn_background(_execute_background(run_response, execute, transition, slot_factory=background_run_slot))
     return run_response
 
 
@@ -2495,7 +2515,6 @@ async def _arun_background_stream(
     """
     from agno.agent._session import asave_run, asave_session
     from agno.agent._storage import aread_or_create_session, update_metadata
-    from agno.os.event_streams import get_event_stream
 
     run_id = run_response.run_id
     if not run_id:
@@ -2514,146 +2533,53 @@ async def _arun_background_stream(
     await asave_session(agent, session=agent_session)
     await asave_run(agent, run=storage_run, session_id=session_id, user_id=user_id, run_index=run_index)
 
-    # Pre-register with the event buffer so reconnecting clients can attach and
-    # wait while the run is still queued (no events buffered yet).
-    with contextlib.suppress(Exception):
-        # Fail-open: a Redis blip must not strand an accepted run
-        await get_event_stream().register_run(run_id, RunStatus.pending)
+    from agno.run.background import _BackgroundStream, _execute_background, _spawn_background
 
-    log_info(f"Background stream run {run_id} persisted with PENDING status")
+    await aregister_run(run_id)
+    transport = _BackgroundStream(run_response)
+    await transport.register()
 
-    # 2. Create queue for forwarding SSE strings to the caller
-    sse_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    async def execute() -> None:
+        async for event in _arun_stream(
+            agent,
+            run_response=run_response,
+            run_context=run_context,
+            user_id=user_id,
+            response_format=response_format,
+            stream_events=stream_events,
+            yield_run_output=yield_run_output,
+            session_id=session_id,
+            add_history_to_context=add_history_to_context,
+            add_dependencies_to_context=add_dependencies_to_context,
+            add_session_state_to_context=add_session_state_to_context,
+            debug_mode=debug_mode,
+            background_tasks=background_tasks,
+            pre_session=agent_session,
+            **kwargs,
+        ):
+            if not isinstance(event, RunOutput):
+                await transport.publish(event)
 
-    # 3. Spawn detached background task. Execution waits for a concurrency slot
-    # (background_run_slot); the run stays PENDING while waiting in line and
-    # can be cancelled without consuming a slot.
-    async def _background_producer() -> None:
-        event_stream = get_event_stream()
-        from agno.os.utils import format_sse_event_with_index
+    async def transition(full_run: bool) -> None:
+        storage_run = await abuild_full_run_storage_copy(agent, run_response, session_id) if full_run else run_response
+        await apersist_run_transition(agent, "agent", session_id, storage_run, user_id=user_id, full_run=full_run)
 
-        # Wait for a concurrency slot before executing. The run stays PENDING
-        # while queued and can be cancelled without consuming a slot.
-        slot_cm = background_run_slot(run_id=run_id)
-        slot_held = False
-        try:
-            await slot_cm.__aenter__()
-            slot_held = True
-
-            # Transition to RUNNING now that a slot is held (atomic helper)
-            run_response.status = RunStatus.running
-            await apersist_run_transition(agent, "agent", session_id, run_response, user_id=user_id)
-            with contextlib.suppress(Exception):
-                # Fail-open: coordination writes must not kill the run
-                await event_stream.set_run_status(run_id, RunStatus.running)
-
-            async for event in _arun_stream(
-                agent,
-                run_response=run_response,
-                run_context=run_context,
-                user_id=user_id,
-                response_format=response_format,
-                stream_events=stream_events,
-                yield_run_output=yield_run_output,
-                session_id=session_id,
-                add_history_to_context=add_history_to_context,
-                add_dependencies_to_context=add_dependencies_to_context,
-                add_session_state_to_context=add_session_state_to_context,
-                debug_mode=debug_mode,
-                background_tasks=background_tasks,
-                pre_session=agent_session,
-                **kwargs,
-            ):
-                if isinstance(event, RunOutput):
-                    continue
-
-                # Buffer + publish to live tails (the event stream owns the index)
-                event_index: Optional[int] = None
-                try:
-                    event_index = await event_stream.add_event(run_id, event)
-                except Exception:
-                    log_warning(f"Failed to buffer event for run {run_id}")
-
-                # Format as SSE for the primary queue (original client)
-                sse_data = format_sse_event_with_index(event, event_index=event_index, run_id=run_id)
-                try:
-                    await sse_queue.put(sse_data)
-                except Exception:
-                    log_warning(f"Failed to push SSE data to queue for run {run_id}")
-
-        except asyncio.CancelledError:
-            # Task-level shutdown (event loop stopping), not run-cancellation:
-            # best-effort persist so pollers are not left with a run stuck at
-            # PENDING/RUNNING forever (parity with the non-stream producer)
-            from agno.run.concurrency import is_worker_managed
-
-            if is_worker_managed(getattr(run_response, "run_id", None) or ""):
-                raise  # worker-claimed: the QueueWorker owns this terminal
-            if run_response.status == RunStatus.paused:
-                # The leg already PAUSED and parked valid, continuable HITL
-                # state (persisted by the leg itself) - a routine deploy's
-                # shutdown must not stamp CANCELLED over it. This in-memory
-                # check is the ONLY protection off-Postgres: adapters without
-                # the atomic primitive reach the whole-session fallback, which
-                # no DB-side guard covers.
-                raise
-            with contextlib.suppress(Exception):
-                run_response.status = RunStatus.cancelled
-                await apersist_run_transition(agent, "agent", session_id, run_response, user_id=user_id)
-            raise
-        except RunCancelledException:
-            # Cancelled while waiting for a slot — execution never started, so
-            # persist CANCELLED and deregister the run here.
-            log_info(f"Background stream run {run_id} cancelled while waiting for a slot")
-            try:
-                run_response.status = RunStatus.cancelled
-                await apersist_run_transition(agent, "agent", session_id, run_response, user_id=user_id)
-            except Exception:
-                log_error(f"Failed to persist cancelled state for background stream run {run_id}", exc_info=True)
-            await acleanup_run(run_id)
-        except Exception:
-            log_error(f"Background stream run {run_id} failed", exc_info=True)
-            # Persist ERROR status — only persist the changed run (O(1))
-            try:
-                run_response.status = RunStatus.error
-                error_run = await abuild_full_run_storage_copy(agent, run_response, session_id)
-                await apersist_run_transition(agent, "agent", session_id, error_run, user_id=user_id, full_run=True)
-            except Exception:
-                log_error(f"Failed to persist error state for background stream run {run_id}", exc_info=True)
-
-        finally:
-            if slot_held:
-                await slot_cm.__aexit__(None, None, None)
-
-            # Signal primary queue FIRST — unblocks the original client
-            try:
-                await sse_queue.put(None)
-            except Exception:
-                log_warning(f"Failed to signal primary queue for run {run_id} completion")
-
-            # Mark run terminal in the event stream and wake all tails
-            # (shielded to survive task cancellation)
-            try:
-                await asyncio.shield(event_stream.complete_run(run_id, run_response.status or RunStatus.completed))
-            except (Exception, asyncio.CancelledError):
-                log_warning(f"Failed to mark run {run_id} as completed in event stream")
-
-    task = asyncio.create_task(_background_producer())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-    # 4. Yield SSE strings from the queue. Emit SSE keepalive comments on idle
-    # so proxies do not kill the connection while the run waits for a slot (or
-    # during long silent stretches of execution).
-    while True:
-        try:
-            sse_data = await asyncio.wait_for(sse_queue.get(), timeout=SSE_KEEPALIVE_INTERVAL_SECONDS)
-        except asyncio.TimeoutError:
-            yield ": keepalive\n\n"
-            continue
-        if sse_data is None:
-            break
-        yield sse_data
+    _spawn_background(
+        _execute_background(
+            run_response,
+            execute,
+            transition,
+            on_running=transport.running,
+            on_terminal=transport.complete,
+            slot_factory=background_run_slot,
+        )
+    )
+    pump = transport.pump(SSE_KEEPALIVE_INTERVAL_SECONDS)
+    try:
+        async for item in pump:
+            yield item
+    finally:
+        await pump.aclose()
 
 
 async def _arun_stream(
@@ -2756,7 +2682,9 @@ async def _arun_stream(
 
                 # 3. Resolve dependencies
                 if run_context.dependencies is not None:
-                    await aresolve_run_dependencies(agent, run_context=run_context)
+                    await aresolve_run_dependencies(
+                        agent, run_context=run_context, run_input=run_response.input, session=agent_session
+                    )
 
                 await araise_if_cancelled(run_response.run_id)  # type: ignore
 
@@ -2821,6 +2749,17 @@ async def _arun_stream(
                 )
                 if len(run_messages.messages) == 0:
                     log_error("No messages to be sent to the model.")
+
+                # Events raised while assembling messages (compaction). Assembly
+                # is not a generator, so they are collected there and emitted here.
+                if stream_events:
+                    for assembly_event in run_messages.events:
+                        yield handle_event(  # type: ignore
+                            assembly_event,
+                            run_response,
+                            events_to_skip=agent.events_to_skip,  # type: ignore
+                            store_events=agent.store_events,
+                        )
 
                 # 7. Start memory creation as a background task (runs concurrently with the main execution)
                 from agno.agent import _managers
@@ -3531,6 +3470,9 @@ def _truncate_run_to_checkpoint(run_response: RunOutput, message_index: int) -> 
 
     # Update the checkpoint marker to the new truncation index
     run_response.last_checkpoint_at_message_index = message_index
+    # A fork cut before the messages it copied keeps only copied messages, so the work continued from here is its own
+    if run_response.forked_from_message_index is not None and run_response.forked_from_message_index > message_index:
+        run_response.forked_from_message_index = message_index
 
 
 def _fork_run(run_response: RunOutput, message_index: int) -> RunOutput:
@@ -3556,11 +3498,16 @@ def _fork_run(run_response: RunOutput, message_index: int) -> RunOutput:
     # Snap to a pair-safe boundary so fork metadata matches the truncation that
     # _truncate_run_to_checkpoint will actually perform.
     message_index = safe_truncation_index(run_response.messages or [], message_index)
+    # A negative index, or one past the last message, truncates nothing, so the fork copies every message
+    if message_index < 0 or message_index > len(run_response.messages or []):
+        message_index = len(run_response.messages or [])
 
     forked = copy.deepcopy(run_response)
     forked.run_id = str(uuid4())
     forked.forked_from_run_id = run_response.run_id
     forked.forked_from_message_index = message_index
+    # A new run of this session, counted here: only runs copied from the session it was forked from are counted there
+    forked.forked_from_session_id = None
     # Reset lineage-irrelevant accumulators so the fork reports its own work,
     # not the parent's. Without this, token counts and durations double-count,
     # and (with store_events=True) the fork's events list would be the parent's
@@ -3585,7 +3532,9 @@ def _apply_continue_modifiers(
     """Apply ``fork`` and/or ``message_index`` to a loaded run_response.
 
     Returns the resulting RunOutput — the same instance when only truncating,
-    a new instance when forking. Called from continue_run_dispatch /
+    a new instance when forking. A run copied into a forked session and continued
+    in place has its copied lineage and metrics reset, so only its new work is
+    counted. Called from continue_run_dispatch /
     acontinue_run_dispatch after a run is loaded and before validation, so the
     rest of the dispatch operates on the modified state.
     """
@@ -3594,6 +3543,13 @@ def _apply_continue_modifiers(
         return _fork_run(run_response, idx)
     if message_index is not None:
         _truncate_run_to_checkpoint(run_response, message_index)
+    # A run copied into a forked session is counted in the session it was made in, so only the work continued
+    # here is counted: its own metrics, and its messages from this point on
+    if run_response.forked_from_session_id:
+        run_response.forked_from_session_id = None
+        run_response.forked_from_message_index = len(run_response.messages or [])
+        run_response.metrics = RunMetrics()
+        run_response.metrics.start_timer()
     return run_response
 
 
@@ -3789,6 +3745,33 @@ def _sync_requirements_with_tools(run_response: RunOutput, updated_tools: List[A
                 req.tool_execution = updated_tools_map[req.tool_execution.tool_call_id]
 
 
+def _apply_requirement_tools(run_response: RunOutput, requirements: List[Any]) -> None:
+    """Set the continue requirements on the run and merge their tool executions into run_response.tools.
+
+    A call that already ran keeps the run's own copy. A requirement can carry an
+    out-of-date copy of that call (confirmed, no result), for example after an
+    earlier pause was resolved from the approvals table; swapping it in would
+    execute the call a second time.
+    """
+    run_response.requirements = requirements
+    updated_tools = [req.tool_execution for req in requirements if req.tool_execution is not None]
+    if updated_tools and run_response.tools:
+        # Checked per tool, not per tool_call_id: ids can repeat across turns (some
+        # providers send none and a fallback like call_{i} is used), and a new call
+        # sharing an executed call's id must still take its requirement.
+        updated_tools_map = {tool.tool_call_id: tool for tool in updated_tools}
+        # The toolkit is the run's record of which toolkit owns the call, not a client decision
+        for tool in run_response.tools:
+            if tool.result is None and tool.tool_call_id in updated_tools_map:
+                updated_tools_map[tool.tool_call_id].toolkit = tool.toolkit
+        run_response.tools = [
+            updated_tools_map.get(tool.tool_call_id, tool) if tool.result is None else tool
+            for tool in run_response.tools
+        ]
+    else:
+        run_response.tools = updated_tools
+
+
 def continue_run_dispatch(
     agent: Agent,
     run_response: Optional[RunOutput] = None,
@@ -3865,8 +3848,8 @@ def continue_run_dispatch(
 
         background_tasks: BackgroundTasks = background_tasks  # type: ignore
 
-    session_id = run_response.session_id if run_response else session_id
-    run_id: str = run_response.run_id if run_response else run_id  # type: ignore
+    session_id = run_response.session_id if run_response is not None else session_id
+    run_id: str = run_response.run_id if run_response is not None else run_id  # type: ignore
 
     session_id, user_id = initialize_session(
         agent,
@@ -3938,10 +3921,6 @@ def continue_run_dispatch(
         user_id=user_id,
     )
 
-    # Resolve dependencies
-    if run_context.dependencies is not None:
-        resolve_run_dependencies(agent, run_context=run_context)
-
     # Run can be continued from previous run response or from passed run_response context
     if run_response is not None:
         if run_response.status == RunStatus.cancelled:
@@ -3997,8 +3976,7 @@ def continue_run_dispatch(
                 )
     elif run_id is not None:
         # The run is continued from a run_id.
-        runs = agent_session.runs or []
-        run_response = next((r for r in runs if r.run_id == run_id), None)  # type: ignore
+        run_response = cast(Optional[RunOutput], _stored_run)
         if run_response is None:
             raise RunNotFoundError(f"No runs found for run ID {run_id}")
         if run_response.status == RunStatus.cancelled:
@@ -4093,6 +4071,20 @@ def continue_run_dispatch(
     else:
         raise ValueError("Either run_response or run_id must be provided.")
 
+    if run_context.session_state is None:
+        run_context.session_state = {}
+    _initialize_session_state(
+        run_context.session_state, user_id=user_id, session_id=session_id, run_id=run_context.run_id
+    )
+    # Resolve dependencies
+    if run_context.dependencies is not None:
+        resolve_run_dependencies(
+            agent,
+            run_context=run_context,
+            run_input=_stored_run.input if isinstance(_stored_run, RunOutput) else None,
+            session=agent_session,
+        )
+
     # If the caller supplied a new user-message string (unified /continue body
     # field ``input``), append it to run_response.messages before building
     # run_messages. The new message flows through into the model loop.
@@ -4132,6 +4124,7 @@ def continue_run_dispatch(
         session=agent_session,
         add_history_to_context=agent.add_history_to_context,
         run_context=run_context,
+        run_response=run_response,
     )
 
     # Reset the run state
@@ -4199,6 +4192,7 @@ def _continue_run(
     # Register run for cancellation tracking
     from agno.agent._hooks import execute_post_hooks
     from agno.agent._init import disconnect_connectable_tools
+    from agno.agent._messages import _recompact_after_overflow
     from agno.agent._response import (
         convert_response_to_structured_format,
         generate_followups,
@@ -4211,7 +4205,9 @@ def _continue_run(
 
     register_run(run_response.run_id)  # type: ignore
 
-    agent.model = cast(Model, agent.model)
+    # Resume the run metrics timer: the run's duration runs from its start to its end, the wait included
+    run_response.metrics = run_response.metrics or RunMetrics()
+    run_response.metrics.resume_timer(run_response.created_at)
 
     handle_event(
         create_run_continued_event(run_response),
@@ -4220,21 +4216,19 @@ def _continue_run(
         store_events=agent.store_events,
     )
 
-    # 1. Handle the updated tools
-    handle_tool_call_updates(agent, run_response=run_response, run_messages=run_messages, tools=tools)
-    if _run_response_is_paused(run_response):
-        try:
-            return handle_agent_run_paused(
-                agent, run_response=run_response, session=session, run_context=run_context, user_id=user_id
-            )
-        finally:
-            disconnect_connectable_tools(agent)
-            cleanup_run(run_response.run_id)  # type: ignore
+    agent.model = cast(Model, agent.model)
 
     try:
         num_attempts = agent.retries + 1
         for attempt in range(num_attempts):
             try:
+                # 1. Handle the updated tools
+                handle_tool_call_updates(agent, run_response=run_response, run_messages=run_messages, tools=tools)
+                if _run_response_is_paused(run_response):
+                    return handle_agent_run_paused(
+                        agent, run_response=run_response, session=session, run_context=run_context, user_id=user_id
+                    )
+
                 # Check for cancellation before model call
                 raise_if_cancelled(run_response.run_id)  # type: ignore
 
@@ -4243,6 +4237,9 @@ def _continue_run(
                 model_response: ModelResponse = call_model_with_fallback(
                     agent.model,
                     agent.fallback_config,
+                    recover_from_overflow=lambda: _recompact_after_overflow(
+                        agent, session, run_messages, run_response, tools
+                    ),
                     messages=run_messages.messages,
                     response_format=response_format,
                     tools=tools,
@@ -4301,7 +4298,7 @@ def _continue_run(
                 if agent.post_hooks is not None:
                     post_hook_iterator = execute_post_hooks(
                         agent,
-                        hooks=agent.post_hooks,  # type: ignore
+                        hooks=continue_post_hooks(agent.post_hooks),
                         run_output=run_response,
                         run_context=run_context,
                         session=session,
@@ -4448,6 +4445,10 @@ def _continue_run_stream(
 
     register_run(run_response.run_id)  # type: ignore
 
+    # Resume the run metrics timer: the run's duration runs from its start to its end, the wait included
+    run_response.metrics = run_response.metrics or RunMetrics()
+    run_response.metrics.resume_timer(run_response.created_at)
+
     # Set up retry logic
     num_attempts = agent.retries + 1
     try:
@@ -4455,7 +4456,9 @@ def _continue_run_stream(
             try:
                 # 1. Resolve dependencies
                 if run_context.dependencies is not None:
-                    resolve_run_dependencies(agent, run_context=run_context)
+                    resolve_run_dependencies(
+                        agent, run_context=run_context, run_input=run_response.input, session=session
+                    )
 
                 run_continued_event = cast(
                     RunOutputEvent,
@@ -4557,7 +4560,7 @@ def _continue_run_stream(
                 if agent.post_hooks is not None:
                     yield from execute_post_hooks(
                         agent,
-                        hooks=agent.post_hooks,  # type: ignore
+                        hooks=continue_post_hooks(agent.post_hooks),
                         run_output=run_response,
                         session=session,
                         run_context=run_context,
@@ -4804,8 +4807,8 @@ def acontinue_run_dispatch(  # type: ignore
 
         background_tasks: BackgroundTasks = background_tasks  # type: ignore
 
-    session_id = run_response.session_id if run_response else session_id
-    run_id: str = run_response.run_id if run_response else run_id  # type: ignore
+    session_id = run_response.session_id if run_response is not None else session_id
+    run_id: str = run_response.run_id if run_response is not None else run_id  # type: ignore
 
     session_id, user_id = initialize_session(
         agent,
@@ -5141,6 +5144,10 @@ async def _acontinue_run_background_stream(
                     cancelled_run = cast(Optional[RunOutput], lookup_session.get_run(_run_id))
                 if cancelled_run is not None:
                     cancelled_run.status = RunStatus.cancelled
+                    # A continuation only ever resumes a run that paused for
+                    # HITL: it has output and requirements, so the stage is
+                    # the status it held, not "never started"
+                    cancelled_run.cancellation_stage = CancellationStage.paused
                     await apersist_run_transition(agent, "agent", session_id, cancelled_run, user_id=user_id)
             except Exception:
                 log_error(
@@ -5257,7 +5264,7 @@ async def _acontinue_run(
     """
     from agno.agent._hooks import aexecute_post_hooks
     from agno.agent._init import disconnect_connectable_tools, disconnect_mcp_tools
-    from agno.agent._messages import aget_continue_run_messages
+    from agno.agent._messages import _arecompact_after_overflow, aget_continue_run_messages
     from agno.agent._response import (
         agenerate_followups,
         agenerate_response_with_output_model,
@@ -5295,17 +5302,23 @@ async def _acontinue_run(
                     if user_id is not None:
                         run_context.user_id = user_id
 
+                dependency_run = (
+                    run_response
+                    if run_response is not None
+                    else next((r for r in agent_session.runs or [] if r.run_id == run_id), None)
+                )
                 # A resumed run keeps its runtime-owned metadata (dispatch
                 # lineage, hop count, version stamp); on the async path the
                 # session may only be readable here, so the restore happens at
                 # the load point. Idempotent with the dispatch-time restore.
                 _restore_continue_context_metadata(
-                    run_context, run_response=run_response, run_id=run_id, session=agent_session
+                    run_context,
+                    run_response=cast(Optional[RunOutput], dependency_run),
+                    run_id=run_id,
+                    session=agent_session,
                 )
 
                 # 2. Resolve dependencies
-                if run_context.dependencies is not None:
-                    await aresolve_run_dependencies(agent, run_context=run_context)
 
                 # 3. Update metadata and session state
                 update_metadata(agent, session=agent_session)
@@ -5368,8 +5381,7 @@ async def _acontinue_run(
                             )
                 elif run_id is not None:
                     # The run is continued from a run_id.
-                    runs = agent_session.runs or []
-                    run_response = next((r for r in runs if r.run_id == run_id), None)  # type: ignore
+                    run_response = cast(Optional[RunOutput], dependency_run)
                     if run_response is None:
                         raise RunNotFoundError(f"No runs found for run ID {run_id}")
                     if run_response.status == RunStatus.cancelled:
@@ -5454,6 +5466,14 @@ async def _acontinue_run(
                 # If the caller supplied a new user-message string (unified /continue
                 # body field ``input``), append it to run_response.messages before
                 # building run_messages.
+                if run_context.dependencies is not None:
+                    await aresolve_run_dependencies(
+                        agent,
+                        run_context=run_context,
+                        run_input=dependency_run.input if isinstance(dependency_run, RunOutput) else None,
+                        session=agent_session,
+                    )
+
                 if input:
                     _maybe_append_input_message(run_response, input, agent)
                     input_messages = run_response.messages or []
@@ -5485,7 +5505,12 @@ async def _acontinue_run(
                     input=input_messages,
                     session=agent_session,
                     add_history_to_context=agent.add_history_to_context,
+                    run_response=run_response,
                 )
+
+                # Resume the run metrics timer: the run's duration runs from its start to its end, the wait included
+                run_response.metrics = run_response.metrics or RunMetrics()
+                run_response.metrics.resume_timer(run_response.created_at)
 
                 # Reset the run state
                 run_response.status = RunStatus.running
@@ -5517,6 +5542,9 @@ async def _acontinue_run(
                 model_response: ModelResponse = await acall_model_with_fallback(
                     agent.model,
                     agent.fallback_config,
+                    recover_from_overflow=lambda: _arecompact_after_overflow(
+                        agent, agent_session, run_messages, run_response, _tools
+                    ),
                     messages=run_messages.messages,
                     response_format=response_format,
                     tools=_tools,
@@ -5586,7 +5614,7 @@ async def _acontinue_run(
                 if agent.post_hooks is not None:
                     async for _ in aexecute_post_hooks(
                         agent,
-                        hooks=agent.post_hooks,  # type: ignore
+                        hooks=continue_post_hooks(agent.post_hooks, async_mode=True),
                         run_output=run_response,
                         run_context=run_context,
                         session=agent_session,
@@ -5829,12 +5857,20 @@ async def _acontinue_run_stream(
                     if user_id is not None:
                         run_context.user_id = user_id
 
+                dependency_run = (
+                    run_response
+                    if run_response is not None
+                    else next((r for r in agent_session.runs or [] if r.run_id == run_id), None)
+                )
                 # A resumed run keeps its runtime-owned metadata (dispatch
                 # lineage, hop count, version stamp); on the async path the
                 # session may only be readable here, so the restore happens at
                 # the load point. Idempotent with the dispatch-time restore.
                 _restore_continue_context_metadata(
-                    run_context, run_response=run_response, run_id=run_id, session=agent_session
+                    run_context,
+                    run_response=cast(Optional[RunOutput], dependency_run),
+                    run_id=run_id,
+                    session=agent_session,
                 )
 
                 # 2. Update session state and metadata
@@ -5854,8 +5890,6 @@ async def _acontinue_run_stream(
                 )
 
                 # 3. Resolve dependencies
-                if run_context.dependencies is not None:
-                    await aresolve_run_dependencies(agent, run_context=run_context)
 
                 # 4. Prepare run response
                 if run_response is not None:
@@ -5903,8 +5937,7 @@ async def _acontinue_run_stream(
 
                 elif run_id is not None:
                     # The run is continued from a run_id.
-                    runs = agent_session.runs or []
-                    run_response = next((r for r in runs if r.run_id == run_id), None)  # type: ignore
+                    run_response = cast(Optional[RunOutput], dependency_run)
                     if run_response is None:
                         raise RunNotFoundError(f"No runs found for run ID {run_id}")
                     if run_response.status == RunStatus.cancelled:
@@ -5989,6 +6022,14 @@ async def _acontinue_run_stream(
                 # If the caller supplied a new user-message string (unified /continue
                 # body field ``input``), append it to run_response.messages before
                 # building run_messages.
+                if run_context.dependencies is not None:
+                    await aresolve_run_dependencies(
+                        agent,
+                        run_context=run_context,
+                        run_input=dependency_run.input if isinstance(dependency_run, RunOutput) else None,
+                        session=agent_session,
+                    )
+
                 if input:
                     _maybe_append_input_message(run_response, input, agent)
                     input_messages = run_response.messages or []
@@ -6020,7 +6061,12 @@ async def _acontinue_run_stream(
                     input=input_messages,
                     session=agent_session,
                     add_history_to_context=agent.add_history_to_context,
+                    run_response=run_response,
                 )
+
+                # Resume the run metrics timer: the run's duration runs from its start to its end, the wait included
+                run_response.metrics = run_response.metrics or RunMetrics()
+                run_response.metrics.resume_timer(run_response.created_at)
 
                 # Reset the run state
                 run_response.status = RunStatus.running
@@ -6174,7 +6220,7 @@ async def _acontinue_run_stream(
                 if agent.post_hooks is not None:
                     async for event in aexecute_post_hooks(
                         agent,
-                        hooks=agent.post_hooks,  # type: ignore
+                        hooks=continue_post_hooks(agent.post_hooks, async_mode=True),
                         run_output=run_response,
                         run_context=run_context,
                         session=agent_session,
@@ -6563,6 +6609,12 @@ def _handle_run_cancellation(
     """Prepare a run response for cancellation: set status, preserve content and messages."""
     log_debug(f"Run {run_response.run_id} was cancelled")
     run_response.status = RunStatus.cancelled
+    # Only a run cancellation is a stage. Callers also route task-level
+    # interrupts here (event-loop shutdown, a disconnected streaming task) as
+    # a KeyboardInterrupt; those are neither a user cancel nor a never-started
+    # run and stay unknown.
+    if isinstance(error, RunCancelledException):
+        run_response.cancellation_stage = CancellationStage.executing
     if run_response.messages is None and run_messages is not None:
         run_response.messages = [msg for msg in run_messages.messages if msg.add_to_agent_memory]
     # Stop the timer for the Run duration
@@ -6682,7 +6734,7 @@ def persist_run_in_session(
     run_index = resolve_run_index(session, storage_copy)
 
     # Calculate session metrics
-    update_session_metrics(agent, session=session, run_response=run_response)
+    update_session_metrics(agent, session=session)
 
     # Update session state before saving the session
     if run_context is not None and run_context.session_state is not None:
@@ -6720,7 +6772,7 @@ async def apersist_run_in_session(
 
     session.upsert_run(run=storage_copy)
     run_index = resolve_run_index(session, storage_copy)
-    update_session_metrics(agent, session=session, run_response=run_response)
+    update_session_metrics(agent, session=session)
 
     if run_context is not None and run_context.session_state is not None:
         if session.session_data is not None:
@@ -7109,6 +7161,8 @@ def _build_forked_session(source_session: AgentSession, new_user_id: Optional[st
 
     new_session_data = copy.deepcopy(source_session.session_data) or {}
     new_session_data["forked_from_session_id"] = source_session.session_id
+    # A compaction's usage stays counted in the session it was made in, like the runs this session copied
+    new_session_data.pop("compaction_metrics", None)
 
     return AgentSession(
         session_id=new_session_id,

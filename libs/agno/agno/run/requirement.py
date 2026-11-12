@@ -330,16 +330,6 @@ class RunRequirement:
         requirement.routed_member_run_id = data.get("routed_member_run_id")
         requirement.routed_member_is_team_level = bool(data.get("routed_member_is_team_level", False))
 
-        if requirement.tool_execution is not None:
-            if requirement.confirmation is not None:
-                requirement.tool_execution.confirmed = requirement.confirmation
-                requirement.tool_execution.confirmation_note = requirement.confirmation_note
-                if requirement.approval_metadata is not None:
-                    requirement.tool_execution.resume_metadata = requirement.approval_metadata
-            if requirement.external_execution_result_provided:
-                requirement.tool_execution.result = requirement.external_execution_result
-                requirement.tool_execution.external_execution_result_provided = True
-
         # A top-level resolution must reach tool_execution: the continue paths
         # rebuild run tools from tool_execution alone, and dispatch reads only
         # tool_execution.confirmed - a bare {"confirmation": true} payload would
@@ -350,8 +340,15 @@ class RunRequirement:
                 requirement.tool_execution.confirmed = requirement.confirmation
                 if requirement.confirmation is False and requirement.confirmation_note is not None:
                     requirement.tool_execution.confirmation_note = requirement.confirmation_note
-            if requirement.external_execution_result is not None and requirement.tool_execution.result is None:
-                requirement.tool_execution.result = requirement.external_execution_result
+            if requirement.approval_metadata is not None and requirement.tool_execution.resume_metadata is None:
+                requirement.tool_execution.resume_metadata = requirement.approval_metadata
+            if requirement.external_execution_result_provided:
+                if (
+                    not requirement.tool_execution.external_execution_result_provided
+                    and requirement.tool_execution.result is None
+                ):
+                    requirement.tool_execution.result = requirement.external_execution_result
+                requirement.tool_execution.external_execution_result_provided = True
 
         # Handle user_input_schema
         schema_raw = data.get("user_input_schema")
@@ -363,10 +360,6 @@ class RunRequirement:
                 elif isinstance(item, dict):
                     rebuilt_schema.append(UserInputField.from_dict(item))
             requirement.user_input_schema = rebuilt_schema
-            if requirement.tool_execution is not None:
-                requirement.tool_execution.user_input_schema = requirement.user_input_schema
-                if requirement.user_input_schema and all(f.value is not None for f in requirement.user_input_schema):
-                    requirement.tool_execution.answered = True
 
         # Handle user_feedback_schema
         feedback_raw = data.get("user_feedback_schema")
@@ -378,12 +371,6 @@ class RunRequirement:
                 elif isinstance(item, dict):
                     rebuilt_feedback.append(UserFeedbackQuestion.from_dict(item))
             requirement.user_feedback_schema = rebuilt_feedback
-            if requirement.tool_execution is not None:
-                requirement.tool_execution.user_feedback_schema = requirement.user_feedback_schema
-                if requirement.user_feedback_schema and all(
-                    q.selected_options is not None for q in requirement.user_feedback_schema
-                ):
-                    requirement.tool_execution.answered = True
 
         # The same rule applies to the schema lanes: to_dict ships each schema
         # both at the requirement level and inside tool_execution, but dispatch
