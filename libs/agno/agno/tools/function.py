@@ -3094,7 +3094,11 @@ class FunctionCall(BaseModel):
 
                 hook_args = self._build_hook_args(hook, name, next_func, args)
 
-                return await self._safe_hook_call_async(hook, hook_args)
+                result = await self._safe_hook_call_async(hook, hook_args)
+                # An async hook may return next_func(...) without awaiting that continuation.
+                if isawaitable(result):
+                    result = await result
+                return result
 
             return wrapper
 

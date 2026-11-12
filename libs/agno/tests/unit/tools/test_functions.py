@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel, BeforeValidator, ValidationError
 
 import agno.tools.function as function_module
+from agno.exceptions import ToolApprovalRequired, ToolCallDeferred
 from agno.models.message import Message
 from agno.run.base import RunContext
 from agno.tools import Toolkit
@@ -907,6 +908,67 @@ async def test_function_call_async_awaits_continuation_returned_by_async_hook(as
     assert result.error is None
     assert result.result == "processed-value1"
     assert tool_calls == ["value1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_tool", [False, True], ids=["sync-tool", "async-tool"])
+@pytest.mark.parametrize("signal", [ValueError, ToolApprovalRequired, ToolCallDeferred])
+async def test_returned_async_hook_continuation_preserves_errors_and_pauses(async_tool, signal):
+    calls = []
+
+    async def outer(function_call, arguments):
+        return function_call(**arguments)
+
+    def inner(function_call, arguments):
+        return function_call(**arguments)
+
+    def sync_entrypoint(value: str) -> str:
+        calls.append(value)
+        raise signal("guarded continuation")
+
+    async def async_entrypoint(value: str) -> str:
+        return sync_entrypoint(value)
+
+    function = tool(tool_hooks=[outer, inner])(async_entrypoint if async_tool else sync_entrypoint)
+    function.process_entrypoint()
+    call = FunctionCall(function=function, arguments={"value": "once"})
+    if signal is ValueError:
+        result = await call.aexecute()
+        assert result.status == "failure"
+        assert "guarded continuation" in result.error
+        assert result.result is None
+    else:
+        with pytest.raises(signal):
+            await call.aexecute()
+    assert calls == ["once"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_tool", [False, True], ids=["sync-generator", "async-generator"])
+async def test_returned_async_hook_continuation_preserves_lazy_generator(async_tool):
+    yielded = []
+
+    async def hook(function_call, arguments):
+        return function_call(**arguments)
+
+    def sync_entrypoint(count: int):
+        for value in range(count):
+            yielded.append(value)
+            yield value
+
+    async def async_entrypoint(count: int):
+        for value in range(count):
+            yielded.append(value)
+            yield value
+
+    function = tool(tool_hooks=[hook])(async_entrypoint if async_tool else sync_entrypoint)
+    function.process_entrypoint()
+    result = await FunctionCall(function=function, arguments={"count": 2}).aexecute()
+    assert result.status == "success"
+    assert isasyncgen(result.result)
+    assert yielded == []
+    assert [value async for value in result.result] == [0, 1]
+    assert yielded == [0, 1]
 
 
 @pytest.mark.asyncio
