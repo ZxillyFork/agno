@@ -11,11 +11,58 @@ from agno.utils.log import log_debug, log_warning
 
 
 def _approval_belongs_to_run(approval: Any, run_response: Any) -> bool:
-    return bool(
-        isinstance(approval, dict)
-        and approval.get("run_id") == getattr(run_response, "run_id", None)
-        and approval.get("approval_type", "required") == "required"
-    )
+    if not isinstance(approval, dict) or approval.get("approval_type", "required") != "required":
+        return False
+    if approval.get("run_id") == getattr(run_response, "run_id", None):
+        return True
+
+    # A propagated member approval belongs to its original run. Reissuing it
+    # under each parent replaces the returned id while leaving the real tool's
+    # record pending. Only the actual run tree can establish that ownership;
+    # caller-supplied routing fields alone must not admit another run's record.
+    session_id = getattr(run_response, "session_id", None)
+    if not session_id or approval.get("session_id") != session_id:
+        return False
+    candidates = [
+        req
+        for req in getattr(run_response, "requirements", None) or []
+        if getattr(req, "member_run_id", None) == approval.get("run_id")
+        and getattr(getattr(req, "tool_execution", None), "approval_id", None) == approval.get("id")
+    ]
+    members = list(getattr(run_response, "member_responses", None) or [])
+    while members:
+        owner = members.pop()
+        members.extend(getattr(owner, "member_responses", None) or [])
+        if getattr(owner, "run_id", None) != approval.get("run_id") or getattr(owner, "session_id", None) != session_id:
+            continue
+        owner_id = getattr(owner, "agent_id", None) or getattr(owner, "team_id", None)
+        for requirement in candidates:
+            tool = requirement.tool_execution
+            if getattr(requirement, "member_agent_id", None) != owner_id or not getattr(tool, "tool_call_id", None):
+                continue
+            identity = (tool.tool_call_id, tool.tool_name, tool.tool_args)
+            if not any(
+                (
+                    getattr(item, "tool_call_id", None),
+                    getattr(item, "tool_name", None),
+                    getattr(item, "tool_args", None),
+                )
+                == identity
+                and getattr(item, "approval_id", None) == approval.get("id")
+                for item in getattr(owner, "tools", None) or []
+            ):
+                continue
+            for recorded in approval.get("requirements") or []:
+                if not isinstance(recorded, dict) or recorded.get("id") != getattr(requirement, "id", None):
+                    continue
+                stored_tool = recorded.get("tool_execution")
+                if (
+                    isinstance(stored_tool, dict)
+                    and (stored_tool.get("tool_call_id"), stored_tool.get("tool_name"), stored_tool.get("tool_args"))
+                    == identity
+                ):
+                    return True
+    return False
 
 
 def _get_existing_approval_for_run(db: Any, approval_id: str, run_response: Any) -> Optional[Dict[str, Any]]:

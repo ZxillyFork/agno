@@ -6278,3 +6278,122 @@ def test_sync_team_tool_resume_records_one_continued_event(tmp_path):
 
     assert completed.status == RunStatus.completed
     assert sum(event.event == "TeamRunContinued" for event in completed.events or []) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("stream", [False, True], ids=["response", "stream"])
+@pytest.mark.parametrize("nested", [False, True], ids=["flat", "nested"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+async def test_mixed_team_pause_preserves_member_approval_owner(
+    tmp_path, monkeypatch, request, use_async, stream, nested, dynamic
+):
+    from agno.exceptions import ToolApprovalRequired
+    from agno.run import RunContext
+
+    @tool(requires_confirmation=not dynamic)
+    def member_action(to: str, run_context: RunContext) -> str:
+        if dynamic and not run_context.tool_call_approved:
+            raise ToolApprovalRequired(metadata={"destination": to})
+        _EXECUTED.append(to)
+        return f"Email sent to {to}"
+
+    member_action.name = "send_email"
+    member_action.approval_type = "required"
+    monkeypatch.setattr(f"{__name__}.send_email", member_action)
+    _EXECUTED.clear()
+    db_file = str(tmp_path / "mixed_member_approval.db")
+    session_id = "mixed-member-approval"
+    db = SqliteDb(db_file=db_file)
+    request.addfinalizer(db.close)
+    outer = _build_subteam_own_tool(db, resuming=False, mixed=True)
+    team = outer if nested else outer.members[0]
+    paused = (
+        await team.arun("Publish", session_id=session_id) if use_async else team.run("Publish", session_id=session_id)
+    )
+    assert paused.is_paused
+    requirements = _wire_requirements(paused.requirements)
+    for requirement in requirements:
+        approval_id = requirement.tool_execution.approval_id
+        if approval_id:
+            db.update_approval(approval_id, status="approved", resolution_data=None)
+
+    fresh_db = SqliteDb(db_file=db_file)
+    request.addfinalizer(fresh_db.close)
+    fresh_outer = _build_subteam_own_tool(fresh_db, resuming=True, mixed=True)
+    fresh = fresh_outer if nested else fresh_outer.members[0]
+    options = dict(run_id=paused.run_id, session_id=session_id, requirements=requirements)
+    if stream:
+        options.update(stream=True, yield_run_output=True)
+        if use_async:
+            events = [event async for event in fresh.acontinue_run(**options)]
+        else:
+            events = list(fresh.continue_run(**options))
+        completed = next(event for event in reversed(events) if isinstance(event, TeamRunOutput))
+    else:
+        completed = await fresh.acontinue_run(**options) if use_async else fresh.continue_run(**options)
+    assert completed.status == RunStatus.completed
+    assert sorted(_EXECUTED) == ["a@example.com", "pub:release"]
+    approvals, count = db.get_approvals(approval_type="required")
+    assert count == 1
+    member_requirement = next(r for r in requirements if r.tool_execution.tool_name == "send_email")
+    assert approvals[0]["run_id"] == member_requirement.member_run_id
+    assert approvals[0]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "tamper", ["unrelated_run", "routed_only", "other_session", "other_tool", "missing_member_tree"]
+)
+async def test_member_approval_reuse_requires_stored_lineage(tmp_path, monkeypatch, request, use_async, tamper):
+    from copy import deepcopy
+
+    from agno.run.approval import acreate_approval_from_pause, create_approval_from_pause
+
+    @tool(requires_confirmation=True)
+    def member_action(to: str) -> str:
+        _EXECUTED.append(to)
+        return to
+
+    member_action.name = "send_email"
+    member_action.approval_type = "required"
+    monkeypatch.setattr(f"{__name__}.send_email", member_action)
+    _EXECUTED.clear()
+    db = SqliteDb(db_file=str(tmp_path / "member_lineage.db"))
+    request.addfinalizer(db.close)
+    team = _build_subteam_own_tool(db, resuming=False, mixed=True).members[0]
+    paused = team.run("Publish", session_id="member-lineage")
+    restored = TeamRunOutput.from_dict(paused.to_dict())
+    requirement = next(r for r in restored.requirements if r.tool_execution.tool_name == "send_email")
+    owner = next(r for r in restored.member_responses if r.run_id == requirement.member_run_id)
+    original = db.get_approval(requirement.tool_execution.approval_id)
+    foreign = deepcopy(original)
+    foreign["id"] = "foreign-approval"
+    foreign["status"] = "approved"
+    requirement.tool_execution.approval_id = foreign["id"]
+    for owned_tool in owner.tools:
+        if owned_tool.tool_call_id == requirement.tool_execution.tool_call_id:
+            owned_tool.approval_id = foreign["id"]
+    if tamper in ("unrelated_run", "routed_only"):
+        foreign["run_id"] = "unrelated-run"
+        requirement.routed_member_run_id = "unrelated-run"
+        requirement.routed_member_agent_id = owner.agent_id
+        if tamper == "unrelated_run":
+            requirement.member_run_id = "unrelated-run"
+    elif tamper == "other_session":
+        foreign["session_id"] = "another-session"
+    elif tamper == "other_tool":
+        foreign["requirements"][0]["tool_execution"]["tool_name"] = "different_tool"
+    else:
+        restored.member_responses = []
+    db.create_approval(foreign)
+
+    if use_async:
+        approval_id = await acreate_approval_from_pause(db, restored)
+    else:
+        approval_id = create_approval_from_pause(db, restored)
+    assert approval_id is not None and approval_id != foreign["id"]
+    assert db.get_approval(approval_id)["status"] == "pending"
+    assert requirement.tool_execution.approval_id == approval_id
+    assert _EXECUTED == []
