@@ -1644,6 +1644,96 @@ async def test_async_function_task_phase_cleans_up_when_iterator_is_cancelled():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sync_position", ["none", "tail", "paused-tail", "prefix"])
+async def test_closing_tool_output_drains_parallel_tasks_before_returning(sync_position):
+    model = DummyModel(id="dummy-model")
+    generator_closed = asyncio.Event()
+    sibling_closed = asyncio.Event()
+    never = asyncio.Event()
+    tasks = set()
+    tail_calls = []
+
+    @tool(show_result=True)
+    async def progress():
+        tasks.add(asyncio.current_task())
+        try:
+            yield "partial"
+            await never.wait()
+        finally:
+            generator_closed.set()
+
+    @tool
+    async def sibling():
+        tasks.add(asyncio.current_task())
+        try:
+            await never.wait()
+        finally:
+            sibling_closed.set()
+
+    @tool
+    def tail():
+        tail_calls.append("ran")
+        return "tail"
+
+    tail.requires_confirmation = sync_position == "paused-tail"
+    functions = [progress, sibling]
+    if sync_position == "prefix":
+        functions.insert(0, tail)
+    elif sync_position != "none":
+        functions.append(tail)
+    stream = model.arun_function_calls(
+        [FunctionCall(function=function, arguments={}, call_id=function.name) for function in functions], []
+    )
+
+    async def consume_and_close():
+        async for response in stream:
+            if isinstance(response, ModelResponse) and response.content == "partial":
+                break
+        await stream.aclose()
+        assert generator_closed.is_set(), "tool generator survived iterator close"
+        assert sibling_closed.is_set(), "parallel tool survived iterator close"
+        assert tail_calls == (["ran"] if sync_position == "prefix" else [])
+
+    try:
+        await asyncio.wait_for(consume_and_close(), timeout=2)
+    finally:
+        await stream.aclose()
+        for task in tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[task for task in tasks if task is not None], return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_closing_running_sync_tool_settles_its_bridge_task():
+    model = DummyModel(id="dummy-model")
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    before = asyncio.all_tasks()
+
+    @tool
+    def blocked():
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(timeout=5)
+        return "released"
+
+    stream = model.arun_function_calls([FunctionCall(function=blocked, arguments={}, call_id="blocked")], [])
+    try:
+        assert (await stream.__anext__()).event == ModelResponseEvent.tool_call_started.value
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        bridge_tasks = asyncio.all_tasks() - before
+        assert bridge_tasks
+        await stream.aclose()
+        assert all(task.done() for task in bridge_tasks), "sync bridge task survived iterator close"
+        assert not release.is_set()
+    finally:
+        release.set()
+        await stream.aclose()
+        await loop.shutdown_default_executor()
+
+
+@pytest.mark.asyncio
 async def test_async_dynamic_pause_does_not_start_later_sync_sibling():
     model = DummyModel(id="dummy-model")
     side_effects = []

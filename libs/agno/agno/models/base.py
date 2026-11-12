@@ -2,6 +2,7 @@ import asyncio
 import collections.abc
 import json
 from abc import ABC, abstractmethod
+from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from hashlib import md5
@@ -2114,22 +2115,25 @@ class Model(ABC):
                     tool_call_paused = False
 
                     # Execute function calls
-                    async for function_call_response in self.arun_function_calls(
-                        function_calls=function_calls_to_run,
-                        function_call_results=function_call_results,
-                        current_function_call_count=function_call_count,
-                        function_call_limit=tool_call_limit,
-                        result_store=result_store,
-                        run_id=run_response.run_id if run_response else None,
-                    ):
-                        if (
-                            isinstance(function_call_response, ModelResponse)
-                            and function_call_response.event == ModelResponseEvent.tool_call_paused.value
-                        ):
-                            tool_call_paused = True
-                        if cache_streaming_response and isinstance(function_call_response, ModelResponse):
-                            streaming_responses.append(function_call_response)
-                        yield function_call_response
+                    async with aclosing(
+                        self.arun_function_calls(
+                            function_calls=function_calls_to_run,
+                            function_call_results=function_call_results,
+                            current_function_call_count=function_call_count,
+                            function_call_limit=tool_call_limit,
+                            result_store=result_store,
+                            run_id=run_response.run_id if run_response else None,
+                        )
+                    ) as tool_responses:
+                        async for function_call_response in tool_responses:
+                            if (
+                                isinstance(function_call_response, ModelResponse)
+                                and function_call_response.event == ModelResponseEvent.tool_call_paused.value
+                            ):
+                                tool_call_paused = True
+                            if cache_streaming_response and isinstance(function_call_response, ModelResponse):
+                                streaming_responses.append(function_call_response)
+                            yield function_call_response
 
                     # Add a function call for each successful execution
                     function_call_count += self._limit_charge_for(function_call_results, result_store)
@@ -2973,7 +2977,7 @@ class Model(ABC):
         skip_pause_check: bool = False,
         result_store: Optional["ResultStore"] = None,
         run_id: Optional[str] = None,
-    ) -> AsyncIterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
+    ) -> AsyncGenerator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent], None]:
         # Additional messages from function calls that will be added to the function call results
         if additional_input is None:
             additional_input = []
@@ -3034,7 +3038,7 @@ class Model(ABC):
 
             async def _yield_sync_function_call(
                 fc: FunctionCall,
-            ) -> AsyncIterator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]]:
+            ) -> AsyncGenerator[Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent], None]:
                 loop = asyncio.get_running_loop()
                 queue: asyncio.Queue[Any] = asyncio.Queue()
                 done_marker = object()
@@ -3077,49 +3081,54 @@ class Model(ABC):
                         yield item
                     completed_results = await sync_future
                     function_call_results.extend(completed_results)
-                except (asyncio.CancelledError, RunCancelledException):
-                    sync_future.cancel()
-                    raise
+                finally:
+                    if not sync_future.done():
+                        sync_future.cancel()
+                    await asyncio.gather(sync_future, return_exceptions=True)
 
             thread_call_object_ids = {id(fc) for fc in thread_function_calls}
             pending_non_thread_function_calls: List[FunctionCall] = []
 
-            async def _flush_pending_non_thread_function_calls() -> AsyncIterator[
-                Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent]
+            async def _flush_pending_non_thread_function_calls() -> AsyncGenerator[
+                Union[ModelResponse, RunOutputEvent, TeamRunOutputEvent], None
             ]:
                 if not pending_non_thread_function_calls:
                     return
 
                 batch = list(pending_non_thread_function_calls)
                 pending_non_thread_function_calls.clear()
-                async for response in self.arun_function_calls(
-                    batch,
-                    function_call_results,
-                    skip_pause_check=True,
-                    result_store=result_store,
-                    run_id=run_id,
-                ):
-                    yield response
-                    if (
-                        isinstance(response, ModelResponse)
-                        and response.event == ModelResponseEvent.tool_call_paused.value
-                    ):
-                        return
+                async with aclosing(
+                    self.arun_function_calls(
+                        batch,
+                        function_call_results,
+                        skip_pause_check=True,
+                        result_store=result_store,
+                        run_id=run_id,
+                    )
+                ) as batch_responses:
+                    async for response in batch_responses:
+                        yield response
+                        if (
+                            isinstance(response, ModelResponse)
+                            and response.event == ModelResponseEvent.tool_call_paused.value
+                        ):
+                            return
                 return
 
             for fc in function_calls_to_run:
                 response_key = fc.call_id or fc.function.name or str(id(fc))
                 static_pause_pair = static_pause_responses.get(response_key)
                 if static_pause_pair is not None:
-                    async for response in _flush_pending_non_thread_function_calls():
-                        yield response
-                        if (
-                            isinstance(response, ModelResponse)
-                            and response.event == ModelResponseEvent.tool_call_paused.value
-                        ):
-                            if additional_input:
-                                function_call_results.extend(additional_input)
-                            return
+                    async with aclosing(_flush_pending_non_thread_function_calls()) as pending_responses:
+                        async for response in pending_responses:
+                            yield response
+                            if (
+                                isinstance(response, ModelResponse)
+                                and response.event == ModelResponseEvent.tool_call_paused.value
+                            ):
+                                if additional_input:
+                                    function_call_results.extend(additional_input)
+                                return
                     started_response, paused_response = static_pause_pair
                     yield started_response
                     yield paused_response
@@ -3131,7 +3140,30 @@ class Model(ABC):
                     pending_non_thread_function_calls.append(fc)
                     continue
 
-                async for response in _flush_pending_non_thread_function_calls():
+                async with aclosing(_flush_pending_non_thread_function_calls()) as pending_responses:
+                    async for response in pending_responses:
+                        yield response
+                        if (
+                            isinstance(response, ModelResponse)
+                            and response.event == ModelResponseEvent.tool_call_paused.value
+                        ):
+                            if additional_input:
+                                function_call_results.extend(additional_input)
+                            return
+
+                async with aclosing(_yield_sync_function_call(fc)) as sync_responses:
+                    async for response in sync_responses:
+                        yield response
+                        if (
+                            isinstance(response, ModelResponse)
+                            and response.event == ModelResponseEvent.tool_call_paused.value
+                        ):
+                            if additional_input:
+                                function_call_results.extend(additional_input)
+                            return
+
+            async with aclosing(_flush_pending_non_thread_function_calls()) as pending_responses:
+                async for response in pending_responses:
                     yield response
                     if (
                         isinstance(response, ModelResponse)
@@ -3140,23 +3172,6 @@ class Model(ABC):
                         if additional_input:
                             function_call_results.extend(additional_input)
                         return
-
-                async for response in _yield_sync_function_call(fc):
-                    yield response
-                    if (
-                        isinstance(response, ModelResponse)
-                        and response.event == ModelResponseEvent.tool_call_paused.value
-                    ):
-                        if additional_input:
-                            function_call_results.extend(additional_input)
-                        return
-
-            async for response in _flush_pending_non_thread_function_calls():
-                yield response
-                if isinstance(response, ModelResponse) and response.event == ModelResponseEvent.tool_call_paused.value:
-                    if additional_input:
-                        function_call_results.extend(additional_input)
-                    return
 
             if additional_input:
                 function_call_results.extend(additional_input)
